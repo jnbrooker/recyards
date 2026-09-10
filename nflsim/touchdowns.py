@@ -180,7 +180,7 @@ def summarize(sim: dict, line: float = 0.5) -> dict:
     t = sim["total"]
     p_over = float((t > line).mean())        # e.g. line 0.5 -> P(anytime TD)
     maxk = int(min(t.max(), 4))
-    dist = {k: float((t == k).mean()) for k in range(maxk)}
+    dist = {str(k): float((t == k).mean()) for k in range(maxk)}
     dist[f"{maxk}+"] = float((t >= maxk).mean())
     return dict(
         mean=float(t.mean()), exp_rec=float(sim["rec_tds"].mean()),

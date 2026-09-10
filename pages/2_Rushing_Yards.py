@@ -1,6 +1,11 @@
 """Rushing Yards simulator page — the same dashboard as the receiving page,
 feature-for-feature, applied to the ground game. Same line-checking, fair odds,
-split distribution chart, cumulative curve, inputs & percentile tables."""
+split distribution chart, cumulative curve, inputs & percentile tables.
+
+Run defense is modelled on six factors: front (yards before contact) and
+tackling (yards after contact) and broken tackles allowed from PFR, plus stuff
+rate, explosive-run rate and overall efficiency (success rate / EPA) allowed
+from play-by-play."""
 
 import numpy as np
 import pandas as pd
@@ -24,12 +29,18 @@ def get_pfr(seasons):
     return pfr, agg, lg
 
 
+@st.cache_data(show_spinner="Loading play-by-play run-defense data…")
+def get_pbp(seasons):
+    return D.load_pbp(tuple(sorted(seasons)))
+
+
 @st.cache_data(show_spinner=False)
 def get_derived(seasons):
     wk = get_weekly(seasons)
     pfr, _, _ = get_pfr(seasons)
+    pbp = get_pbp(seasons)
     return (D.list_players(wk, stat="carries", min_vol=40), D.list_defenses(wk),
-            R.team_rush_volume(wk), R.rush_defense_profiles(wk, pfr))
+            R.team_rush_volume(wk), R.rush_defense_profiles(wk, pfr, pbp))
 
 
 st.sidebar.header("Setup")
@@ -94,11 +105,24 @@ c3.metric("Most likely (median)", f"{s['median']:.0f}")
 c4.metric("Carries / broken tkl", f"{s['mean_carries']:.1f} / {s['mean_broken']:.1f}")
 
 if use_def and dprof is not None:
-    st.info(f"**{opp} run defense:** {R.rush_scheme_label(dprof)}.  "
-            f"Allows {dprof['ybc_allowed']:.2f} yds before contact / "
-            f"{dprof['yac_allowed']:.2f} after (league {dprof['lg_ybc']:.2f} / {dprof['lg_yac']:.2f}).  "
-            f"Adjustments → front ×{sim['adj']['m_ybc']:.2f}, "
-            f"tackling ×{sim['adj']['m_yac']:.2f}, broken-tkl ×{sim['adj']['m_brk']:.2f}.")
+    adj = sim["adj"]
+    msg = (f"**{opp} run defense:** {R.rush_scheme_label(dprof)}.  \n"
+           f"Allows {dprof.get('ybc_allowed', float('nan')):.2f} yds before contact / "
+           f"{dprof.get('yac_allowed', float('nan')):.2f} after "
+           f"(league {dprof.get('lg_ybc', float('nan')):.2f} / {dprof.get('lg_yac', float('nan')):.2f}).  \n"
+           f"Front ×{adj['m_ybc']:.2f} · tackling ×{adj['m_yac']:.2f} · "
+           f"broken-tkl ×{adj['m_brk']:.2f}")
+    if dprof.get("has_pbp"):
+        msg += (f" · stuff ×{adj['m_stuff']:.2f} · explosive ×{adj['m_expl']:.2f} · "
+                f"efficiency ×{adj['m_eff']:.2f}.  \n"
+                f"Play-by-play ({dprof.get('def_runs', 0)} runs faced): "
+                f"stuffs {dprof['stuff_allowed']:.0%} of runs (league {dprof['lg_stuff']:.0%}), "
+                f"10+ yd runs {dprof['expl_allowed']:.0%} (league {dprof['lg_expl']:.0%}), "
+                f"EPA/rush {dprof['epa_allowed']:+.3f}.")
+    else:
+        msg += ".  \n_No play-by-play profile for this defense in the selected seasons — "
+        msg += "stuff / explosive / efficiency left at league average._"
+    st.info(msg)
 elif not use_def:
     st.info("Defense adjustment is **off** — this is the player's baseline "
             "distribution against a league-average run defense.")
@@ -130,7 +154,7 @@ fig.update_layout(
     yaxis_tickformat=".1%", bargap=0.02, height=440,
     legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
     margin=dict(t=70, b=40, l=60, r=20))
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width="stretch")
 
 with st.expander("Chance of clearing any line (cumulative view)"):
     xs = np.arange(0, int(cutoff) + 5, 5)
@@ -143,7 +167,7 @@ with st.expander("Chance of clearing any line (cumulative view)"):
     cfig.update_layout(xaxis_title="Yards line", yaxis_title="Chance of going over",
                        yaxis_tickformat=".0%", height=340,
                        margin=dict(t=20, b=40, l=60, r=20))
-    st.plotly_chart(cfig, use_container_width=True)
+    st.plotly_chart(cfig, width="stretch")
 
 left, right = st.columns(2)
 with left:
@@ -155,19 +179,22 @@ with left:
                    f"{pri['brk_rate']:.1%}", f"{pri['mu_ypc']:.2f}", str(pri["games"])],
         "Std (variance)": [f"±{pri['sd_share']:.1%}", f"±{pri['sd_ybc']:.2f}", f"±{pri['sd_yac']:.2f}",
                            "—", "—", "—"],
-    }), hide_index=True, use_container_width=True)
-    st.caption(f"Advanced inputs: {pri['adv_source']}.")
+    }), hide_index=True, width="stretch")
+    st.caption(f"Advanced inputs: {pri['adv_source']}.  "
+               f"Simulated per game: ~{s['mean_stuffs']:.1f} stuffed runs, "
+               f"~{s['mean_explosives']:.1f} explosive (10+) runs.")
 with right:
     st.subheader("Outcome percentiles")
     st.dataframe(pd.DataFrame({
         "Percentile": ["10th (floor)", "25th", "Median", "75th", "90th (ceiling)"],
         "Yards": [f"{s['p10']:.0f}", f"{s['p25']:.0f}", f"{s['median']:.0f}",
                   f"{s['p75']:.0f}", f"{s['p90']:.0f}"],
-    }), hide_index=True, use_container_width=True)
+    }), hide_index=True, width="stretch")
     st.metric("Fair prop odds",
               f"Over {s['fair_over_odds']}  /  Under {s['fair_under_odds']}")
 
 st.caption("Model is for research/entertainment. Priors come from nflverse "
-           "regular-season data; per-carry yards are a shifted Gamma (breakaways "
-           "and tackles-for-loss included); run-defense adjustments are shrunk "
-           "toward league average.")
+           "regular-season data; each carry resolves into a stuffed, normal or "
+           "explosive run whose rates and yards are shrunk toward league average "
+           "by the opponent's run defense (front, tackling, broken tackles, stuff "
+           "rate, explosive rate and efficiency).")

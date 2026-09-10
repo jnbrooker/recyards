@@ -110,7 +110,7 @@ fig.update_layout(
     xaxis_title="Touchdowns in the game (rushing + receiving)",
     yaxis_title="Probability", yaxis_tickformat=".0%", bargap=0.25, height=440,
     margin=dict(t=70, b=40, l=60, r=20), showlegend=False)
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width="stretch")
 
 with st.expander("Chance of scoring at least N touchdowns (cumulative view)"):
     t = sim["total"]
@@ -122,7 +122,7 @@ with st.expander("Chance of scoring at least N touchdowns (cumulative view)"):
     cfig.update_layout(xaxis_title="At least N touchdowns", yaxis_title="Chance",
                        yaxis_tickformat=".0%", height=320,
                        margin=dict(t=20, b=40, l=60, r=20))
-    st.plotly_chart(cfig, use_container_width=True)
+    st.plotly_chart(cfig, width="stretch")
 
 left, right = st.columns(2)
 with left:
@@ -134,14 +134,14 @@ with left:
                    f"{pri['mu_car']:.1f}", f"{pri['p_rush_td']:.1%}", str(pri["games"])],
         "Raw (unregressed)": ["—", f"{pri['raw_rec_td_per_rec']:.1%}", "—",
                               f"{pri['raw_rush_td_per_car']:.1%}", "—"],
-    }), hide_index=True, use_container_width=True)
+    }), hide_index=True, width="stretch")
     st.caption("TD rates are regressed toward the positional league average.")
 with right:
     st.subheader("Outcome probabilities")
     st.dataframe(pd.DataFrame({
         "Outcome": [f"{k} TD" for k in dist.keys()],
         "Chance": [f"{v:.1%}" for v in dist.values()],
-    }), hide_index=True, use_container_width=True)
+    }), hide_index=True, width="stretch")
     st.metric(f"Fair odds — {'anytime' if line == 0.5 else f'over {line:g}'}",
               f"Over {s['fair_over_odds']}  /  Under {s['fair_under_odds']}")
 

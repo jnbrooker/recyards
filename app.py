@@ -163,7 +163,7 @@ fig.update_layout(
     legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
     margin=dict(t=70, b=40, l=60, r=20),
 )
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width="stretch")
 
 # ---------------------------------------------------------------------------
 # Cumulative "chance of at least X yards" curve
@@ -180,7 +180,7 @@ with st.expander("Chance of clearing any line (cumulative view)"):
     cfig.update_layout(xaxis_title="Yards line", yaxis_title="Chance of going over",
                        yaxis_tickformat=".0%", height=340,
                        margin=dict(t=20, b=40, l=60, r=20))
-    st.plotly_chart(cfig, use_container_width=True)
+    st.plotly_chart(cfig, width="stretch")
 
 # ---------------------------------------------------------------------------
 # Detail tables
@@ -196,7 +196,7 @@ with left:
                    f"{pri['mu_adot']:.1f}", f"{pri['yac_per_rec']:.1f}", str(pri["games"])],
         "Std (variance)": [f"±{pri['sd_ts']:.1%}", f"±{pri['sd_catch']:.1%}",
                            f"±{pri['sd_adot']:.1f}", "—", "—"],
-    }), hide_index=True, use_container_width=True)
+    }), hide_index=True, width="stretch")
 
 with right:
     st.subheader("Outcome percentiles")
@@ -204,7 +204,7 @@ with right:
         "Percentile": ["10th (floor)", "25th", "Median", "75th", "90th (ceiling)"],
         "Yards": [f"{s['p10']:.0f}", f"{s['p25']:.0f}", f"{s['median']:.0f}",
                   f"{s['p75']:.0f}", f"{s['p90']:.0f}"],
-    }), hide_index=True, use_container_width=True)
+    }), hide_index=True, width="stretch")
     st.metric("Fair prop odds",
               f"Over {s['fair_over_odds']}  /  Under {s['fair_under_odds']}")
 

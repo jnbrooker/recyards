@@ -25,9 +25,10 @@ st.markdown(
     "- **Receiving Yards** — targets → catches → yards, vs a defense.\n"
     "- **Rushing Yards** — carries → yards before/after contact + broken tackles, vs a run defense.\n"
     "- **Touchdowns** — rushing + receiving, opportunity × conversion (goal-line role).\n"
-    "- *QB Sacks / Interceptions* — coming next (offense-side rates).\n"
-    "- *Game Simulation* — upload/auto-pull two depth charts → simulated box "
-    "score, score distribution and win probability."
+    "- **QB Sacks** — sacks taken per dropback vs the opponent's pass rush, scaled by NGS time to throw.\n"
+    "- **Interceptions** — INTs thrown per attempt, heavily regressed, vs the opponent's secondary.\n"
+    "- **Team Strength** — opponent-adjusted points per drive, pace and home field; the base the game model is built on.\n"
+    "- **Game Simulation** — two depth charts in, a simulated box score, score distribution and win probability out.\n"
 )
 
 st.subheader("How it works")
