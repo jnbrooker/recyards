@@ -302,9 +302,45 @@ rating if the box-score yardage needs its own anchor.*
    pbp has `yardline_100`, but the TD weights are still share × TD rate. Each
    player's share of his team's carries/targets inside the 10 is the direct
    signal, and anytime-TD is the biggest player market.
-3. **Within-season recency.** Season-level weights only. A half-life of ~6 games
-   inside the current season tracks form and role changes (a WR whose share
-   jumped after a trade) far better than a flat season weight.
+3. **Recency weighting — make it consistent, then add within-season decay.**
+   *(Audited 2026-09-11; not yet done. Everything needed to pick it up is here.)*
+
+   **The curve today.** `data.season_weight(season, latest)` weights each GAME by
+   its season's age: current 1.0, one back 0.7, two back 0.45, older 0.3. With
+   the default three-season window the current season's share of the weight is
+   5% after 1 game, 17% after 4, 29% after 8, 38% after 12, 47% after 17 — it
+   never reaches half. (Two-season window: 40% by week 8, 59% by week 17.)
+
+   **The defect: the curve is applied inconsistently.**
+   - *Weighted* (uses `season_w` / `D.wmean`): team ratings and pace
+     (`teams.team_ratings`), target and carry shares (`roster._player_row`,
+     `rushing.player_rush_priors`), per-game volume means (`qb.qb_priors`
+     `mu_att`/`mu_db`, `touchdowns.player_td_priors` `mu_rec`/`mu_car`), rushing
+     YPC, NGS time-to-throw.
+   - *Unweighted — every game counts equally*: sack and INT rates
+     (`qb.qb_priors` sums, `qb.league_pass_rates`), catch rate / yards per target
+     / TD-per-touch rates (`roster._player_row`, `roster._league_rates`,
+     `touchdowns.player_td_priors` rate sums), every defensive profile
+     (`data.def_pass_rates`, `rushing._pfr_defense`, `data.rush_defense_pbp`,
+     `touchdowns.td_defense_profiles`), team volume distributions
+     (`game.team_pass_volume`, `rushing.team_rush_volume`, `roster.team_volumes`),
+     league baselines. So a player's *role* tracks the season while his
+     *efficiency* and the *defence he faces* stay mostly last year's until late.
+
+   **The plan, in order.**
+   1. Replace every unweighted `.sum()` in a rate estimate with a `season_w`-
+      weighted sum (`(x * w).sum() / (n * w).sum()`); the regression pseudo-counts
+      (`SACK_PRIOR_N`, `CATCH_PRIOR_N`, …) then act on weighted totals, which is
+      what they should do. Defensive profiles and team volumes likewise.
+   2. Add within-season decay: `game_weight = season_weight × 0.5 ** (games_ago
+      / HALF_LIFE)` with `HALF_LIFE ≈ 6` games, computed in `data.load_weekly`
+      and `data.load_drives` as a single `w` column so every consumer picks it
+      up for free. `games_ago` is per team (weeks since that game, bye-aware).
+   3. Expose one control — "how much to trust this season" — on the pages in
+      place of the hidden three-season multiselect, mapping to the half-life and
+      the season curve.
+   4. Then run the backtest harness (#1) with and without the change: recency
+      should help player props most and team ratings least.
 4. **Snap counts as the role signal.** Depth-chart rank is coarse; nflverse's
    `snap_counts` release (offense snap %) predicts targets much better and
    would replace the rank prior for anyone with a few games of snaps.
