@@ -16,9 +16,39 @@ sacks and INTs all read from the same weekly release.
 
 from __future__ import annotations
 
+import datetime as _dt
 import functools
+import time as _time
+import urllib.request
 import numpy as np
 import pandas as pd
+
+# ---------------------------------------------------------------------------
+# Caching: nflverse republishes the weekly feeds within hours of games, the
+# depth charts and injury reports daily. A plain lru_cache would pin the first
+# download for the life of the process, so every loader uses a cache keyed on a
+# time bucket instead — after REFRESH_HOURS the next call re-downloads. This is
+# what lets a long-running app pick up a new week without a restart.
+# ---------------------------------------------------------------------------
+
+REFRESH_HOURS = 6.0
+
+
+def ttl_cache(maxsize: int = 8):
+    """lru_cache that forgets everything every REFRESH_HOURS."""
+    def deco(fn):
+        @functools.lru_cache(maxsize=maxsize)
+        def inner(_bucket, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            bucket = int(_time.time() // (REFRESH_HOURS * 3600))
+            return inner(bucket, *args, **kwargs)
+
+        wrapper.cache_clear = inner.cache_clear
+        return wrapper
+    return deco
 
 # ---------------------------------------------------------------------------
 # Config
@@ -108,7 +138,7 @@ def _load_one_season(year: int) -> pd.DataFrame | None:
     return None
 
 
-@functools.lru_cache(maxsize=8)
+@ttl_cache(maxsize=8)
 def load_weekly(seasons: tuple[int, ...]) -> pd.DataFrame:
     """Regular-season weekly offensive lines for the given seasons (cached).
 
@@ -153,6 +183,47 @@ def load_weekly(seasons: tuple[int, ...]) -> pd.DataFrame:
     df.attrs["loaded_seasons"] = sorted(loaded)
     df.attrs["missing_seasons"] = sorted(missing)
     return df
+
+
+def _url_exists(url: str, timeout: float = 6.0) -> bool:
+    try:
+        req = urllib.request.Request(url, method="HEAD",
+                                     headers={"User-Agent": "nflsim"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return 200 <= r.status < 300
+    except Exception:
+        return False
+
+
+@ttl_cache(maxsize=4)
+def available_seasons(candidates: tuple[int, ...]) -> tuple[int, ...]:
+    """Which of `candidates` have a published weekly stats file right now.
+
+    A HEAD request per season, cached for REFRESH_HOURS, so the app can decide
+    its default season window from what nflverse has actually released — the
+    new season appears in the defaults the week its first file lands.
+    """
+    out = []
+    for yr in candidates:
+        if any(_url_exists(t.format(year=int(yr))) for t in _WEEKLY_URLS):
+            out.append(int(yr))
+    return tuple(out)
+
+
+def season_choices(n_options: int = 5, n_default: int = 3,
+                   today: _dt.date | None = None) -> tuple[list[int], list[int]]:
+    """(options, defaults) for a season picker.
+
+    Options run back from the current calendar year. Defaults are the most
+    recent `n_default` seasons that have data — so in-season the current year
+    is included automatically (and weighted most heavily by `season_weight`),
+    and in the off-season the picker falls back to the last completed ones.
+    """
+    today = today or _dt.date.today()
+    options = list(range(today.year, today.year - n_options, -1))
+    have = available_seasons(tuple(options))
+    defaults = [s for s in options if s in have][:n_default]
+    return options, (defaults or options[1:1 + n_default])
 
 
 def list_defenses(wk: pd.DataFrame) -> list[str]:
@@ -212,7 +283,7 @@ SKILL_POSITIONS = ["QB", "RB", "FB", "WR", "TE"]
 _OFFENSE_GROUPS = ("3WR 1TE", "OFF", "Offense")
 
 
-@functools.lru_cache(maxsize=8)
+@ttl_cache(maxsize=8)
 def load_depth_charts(seasons: tuple[int, ...]) -> pd.DataFrame:
     """Offensive skill-position depth charts, normalised across feed versions.
 
@@ -302,13 +373,13 @@ def players_ruled_out(inj: pd.DataFrame, team: str, season: int | None = None,
     return set(t[idcol].dropna().astype(str))
 
 
-@functools.lru_cache(maxsize=8)
+@ttl_cache(maxsize=8)
 def load_injuries(seasons: tuple[int, ...]) -> pd.DataFrame:
     """Weekly injury reports (direct parquet). report_status in {Out, Doubtful, Questionable}."""
     return _read_seasons(_INJURY_URL, seasons)
 
 
-@functools.lru_cache(maxsize=4)
+@ttl_cache(maxsize=4)
 def _pfr_id_crosswalk() -> pd.DataFrame:
     """gsis_id <-> pfr_id map (dynastyprocess), so PFR stats can join to players."""
     try:
@@ -319,7 +390,7 @@ def _pfr_id_crosswalk() -> pd.DataFrame:
         return pd.DataFrame(columns=["gsis_id", "pfr_id"])
 
 
-@functools.lru_cache(maxsize=8)
+@ttl_cache(maxsize=8)
 def load_pfr_rush(seasons: tuple[int, ...]) -> pd.DataFrame:
     """PFR advanced weekly rushing (direct parquet): yards before/after contact and
     broken tackles per game, keyed to gsis_id. Empty frame if unavailable — callers
@@ -337,6 +408,68 @@ def load_pfr_rush(seasons: tuple[int, ...]) -> pd.DataFrame:
     else:
         d["gsis_id"] = np.nan
     return d
+
+
+# ---------------------------------------------------------------------------
+# Schedule (for picking a real game to simulate)
+# ---------------------------------------------------------------------------
+# One all-seasons CSV. Besides the fixture list it carries closing market lines
+# (`spread_line`, positive = home favoured; `total_line`), roof and weather —
+# useful as COMPARATORS beside the model. Nothing here is ever fed into a
+# rating; the model stays self-contained.
+
+_SCHEDULE_URL = ("https://github.com/nflverse/nflverse-data/releases/download/"
+                 "schedules/games.csv")
+
+_SCHED_KEEP = ["game_id", "season", "game_type", "week", "gameday", "weekday",
+               "gametime", "away_team", "home_team", "away_score", "home_score",
+               "spread_line", "total_line", "roof", "surface", "temp", "wind",
+               "away_qb_name", "home_qb_name", "div_game", "stadium"]
+
+
+@ttl_cache(maxsize=4)
+def load_schedule(seasons: tuple[int, ...]) -> pd.DataFrame:
+    """Regular-season fixtures for the given seasons, one row per game.
+
+    `played` is True once a final score exists. Empty frame if unavailable.
+    """
+    try:
+        d = pd.read_csv(_SCHEDULE_URL, low_memory=False)
+    except Exception:
+        return pd.DataFrame()
+    d = d[d["season"].isin([int(s) for s in seasons])]
+    if "game_type" in d.columns:
+        d = d[d["game_type"] == "REG"]
+    d = d[[c for c in _SCHED_KEEP if c in d.columns]].copy()
+    for c in ("away_score", "home_score", "spread_line", "total_line", "temp", "wind"):
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    d["played"] = d["home_score"].notna() & d["away_score"].notna()
+    d["kickoff"] = pd.to_datetime(d["gameday"].astype(str) + " " + d["gametime"].astype(str),
+                                  errors="coerce")
+    return d.sort_values(["season", "week", "kickoff"]).reset_index(drop=True)
+
+
+def current_week(sched: pd.DataFrame, season: int | None = None) -> int:
+    """The week to default to: the first week of the (latest) season that still
+    has an unplayed game, or the final week once the season is done."""
+    if sched is None or sched.empty:
+        return 1
+    s = sched[sched["season"] == (int(season) if season is not None else sched["season"].max())]
+    if s.empty:
+        return 1
+    open_weeks = s.loc[~s["played"], "week"]
+    return int(open_weeks.min()) if len(open_weeks) else int(s["week"].max())
+
+
+def game_label(row) -> str:
+    """'CHI @ CAR — Sun 13 Sep 13:00' with the final score once played."""
+    when = row["kickoff"]
+    when_txt = when.strftime("%a %d %b %H:%M") if pd.notna(when) else str(row.get("gameday", ""))
+    s = f"{row['away_team']} @ {row['home_team']} — {when_txt}"
+    if bool(row.get("played")):
+        s += f"  (final {int(row['away_score'])}-{int(row['home_score'])})"
+    return s
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +549,7 @@ EXPL15_MIN = 15      # yards_gained >= 15 → chunk/breakaway
 MIN_DEF_RUNS = 50    # designed runs a defense must have faced to get a profile
 
 
-@functools.lru_cache(maxsize=4)
+@ttl_cache(maxsize=4)
 def load_pbp_raw(seasons: tuple[int, ...]) -> pd.DataFrame:
     """Regular-season plays from the nflverse pbp feed, trimmed to `_PBP_KEEP`
     (cached). Shared by `load_pbp` (runs) and `load_drives` (game engine) so a
@@ -685,7 +818,7 @@ _NGS_URL = ("https://github.com/nflverse/nflverse-data/releases/download/"
 LG_TIME_TO_THROW = 2.75   # league-ish avg seconds to throw (fallback anchor)
 
 
-@functools.lru_cache(maxsize=4)
+@ttl_cache(maxsize=4)
 def load_ngs_pass(seasons: tuple[int, ...]) -> pd.DataFrame:
     """Season-level NGS passing rows (week 0) for the requested seasons.
     Empty frame if unavailable — the sack model then skips the time-to-throw

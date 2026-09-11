@@ -12,40 +12,58 @@ import streamlit as st
 import plotly.graph_objects as go
 
 from nflsim import data as D, game as G, teams as T
+from nflsim import ui as UI
 
 st.set_page_config(page_title="Game Simulation", page_icon="🏈", layout="wide")
 
 
-@st.cache_data(show_spinner="Loading play-by-play, depth charts and injuries…")
+@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Loading play-by-play, depth charts and injuries…")
 def get_context(seasons):
     return G.prepare(tuple(sorted(seasons)))
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner=False)
+def get_schedule(season):
+    return D.load_schedule((int(season),))
+
+
+@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner=False)
 def get_roster(seasons, team, use_injuries):
     ctx = get_context(seasons)
     return G.roster_for(ctx, team, use_injuries=use_injuries)
 
 
 st.sidebar.header("Setup")
-ALL_SEASONS = [2026, 2025, 2024, 2023, 2022]
-seasons = st.sidebar.multiselect("Seasons used to build priors", ALL_SEASONS,
-                                 default=[2025, 2024],
-                                 help="How teams and players have played. Depth "
-                                      "charts always come from the current season.")
-if not seasons:
-    st.sidebar.error("Pick at least one season."); st.stop()
+seasons = UI.season_picker("Seasons used to build priors")
 
 ctx = get_context(tuple(seasons))
 ratings = ctx["ratings"]
 teams = list(ratings["off"].index)
 
 st.sidebar.divider()
-home = st.sidebar.selectbox("Home team", teams,
-                            index=teams.index("BAL") if "BAL" in teams else 0)
-away = st.sidebar.selectbox("Away team", teams,
-                            index=teams.index("SF") if "SF" in teams else 1)
-neutral = st.sidebar.toggle("Neutral site", value=False)
+sched = get_schedule(ctx["depth_seasons"][-1])
+from_sched = st.sidebar.toggle("Pick a game from the schedule", value=not sched.empty,
+                               disabled=sched.empty)
+game_row = None
+if from_sched:
+    weeks = sorted(sched["week"].unique().tolist())
+    cur = D.current_week(sched)
+    week = st.sidebar.selectbox("Week", weeks, index=weeks.index(cur) if cur in weeks else 0)
+    wg = sched[sched["week"] == week].reset_index(drop=True)
+    labels = [D.game_label(r) for _, r in wg.iterrows()]
+    unplayed = [i for i, r in wg.iterrows() if not bool(r["played"])]
+    pick = st.sidebar.selectbox("Game", labels, index=unplayed[0] if unplayed else 0,
+                                help="Kickoff times are local to the venue. Played "
+                                     "games show the final, so you can compare.")
+    game_row = wg.iloc[labels.index(pick)]
+    home, away = game_row["home_team"], game_row["away_team"]
+    neutral = False
+else:
+    home = st.sidebar.selectbox("Home team", teams,
+                                index=teams.index("BAL") if "BAL" in teams else 0)
+    away = st.sidebar.selectbox("Away team", teams,
+                                index=teams.index("SF") if "SF" in teams else 1)
+    neutral = st.sidebar.toggle("Neutral site", value=False)
 use_inj = st.sidebar.toggle("Drop players ruled out", value=True,
                             help="Uses the latest injury report of the current "
                                  "season (Out and Doubtful).")
@@ -88,6 +106,28 @@ st.info(
        if neutral else
        f"Home field is worth {ratings['hfa']:+.2f} points of margin here.")
 )
+
+if game_row is not None:
+    bits = []
+    if pd.notna(game_row.get("spread_line")) and pd.notna(game_row.get("total_line")):
+        sp = float(game_row["spread_line"])
+        fav_txt = f"{home} -{sp:g}" if sp > 0 else f"{away} -{-sp:g}" if sp < 0 else "pick"
+        bits.append(f"**Closing market:** {fav_txt}, total {game_row['total_line']:g} — "
+                    f"model says {fav} by {abs(s['mean_margin']):.1f}, total "
+                    f"{s['mean_total']:.1f}. Shown for comparison only; the model "
+                    "never reads the line.")
+    if bool(game_row.get("played")):
+        bits.append(f"**Final:** {away} {int(game_row['away_score'])} — "
+                    f"{home} {int(game_row['home_score'])}.")
+    if pd.notna(game_row.get("roof")):
+        wx = f"{game_row['roof']}"
+        if pd.notna(game_row.get("wind")):
+            wx += f", wind {game_row['wind']:.0f} mph"
+        if pd.notna(game_row.get("temp")):
+            wx += f", {game_row['temp']:.0f}°F"
+        bits.append(f"Venue: {wx}.")
+    if bits:
+        st.caption(("  " + chr(10)).join(bits))
 
 # --- score distribution ----------------------------------------------------
 st.subheader("How the game finishes")

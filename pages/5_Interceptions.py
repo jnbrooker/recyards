@@ -9,29 +9,35 @@ import streamlit as st
 import plotly.graph_objects as go
 
 from nflsim import data as D, qb as Q
+from nflsim import roster as RO, ui as UI
 
 st.set_page_config(page_title="Interceptions Simulator", page_icon="🏈", layout="wide")
 
 
-@st.cache_data(show_spinner="Downloading NFL data…")
+@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Downloading NFL data…")
 def get_weekly(seasons):
     return D.load_weekly(tuple(sorted(seasons)))
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner=False)
 def get_derived(seasons):
     wk = get_weekly(seasons)
     qbs = D.list_players(wk[wk["position"] == "QB"], stat="attempts", min_vol=120)
     return qbs, D.list_defenses(wk), Q.league_pass_rates(wk), D.def_pass_rates(wk)
 
 
+@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Loading live depth charts and injury reports…")
+def get_rosters(seasons, use_injuries):
+    return UI.cached_rosters(tuple(sorted(seasons)), use_injuries)
+
+
+@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner=False)
+def get_live_team_vol(seasons):
+    return UI.cached_live(tuple(sorted(seasons)))["team_vol"]
+
+
 st.sidebar.header("Setup")
-ALL_SEASONS = [2026, 2025, 2024, 2023, 2022]
-seasons = st.sidebar.multiselect("Seasons used to build priors", ALL_SEASONS,
-                                 default=[2025, 2024],
-                                 help="Recent seasons are weighted more heavily.")
-if not seasons:
-    st.sidebar.error("Pick at least one season."); st.stop()
+seasons = UI.season_picker("Seasons used to build priors")
 try:
     wk = get_weekly(tuple(seasons))
 except ValueError as e:
@@ -45,9 +51,26 @@ if skipped:
 
 qbs, defenses, lg, def_profiles = get_derived(tuple(seasons))
 
-player_label = st.sidebar.selectbox("Quarterback", qbs["label"].tolist(),
-                                    help="QBs with 120+ attempts in the selected seasons.")
-player_row = qbs[qbs["label"] == player_label].iloc[0]
+use_live = st.sidebar.toggle(
+    "Pick from live depth charts", value=True,
+    help="Current-season depth chart and injury report. The player's usage share is "
+         "redistributed when teammates are ruled out, and team volume follows his "
+         "CURRENT team, not the one in his history.")
+live_row = None
+if use_live:
+    use_inj = st.sidebar.toggle("Drop players ruled out", value=True)
+    rosters = get_rosters(tuple(seasons), use_inj)
+    if rosters.empty:
+        st.sidebar.error("Depth charts did not load — using history only."); use_live = False
+    else:
+        live_row = UI.pick_player(rosters, ['QB'], key='qb')
+        player_id = live_row["player_id"]
+if not use_live:
+    player_label = st.sidebar.selectbox("Quarterback", qbs["label"].tolist(),
+                                        help="QBs with 120+ attempts in the selected seasons.")
+    player_row = qbs[qbs["label"] == player_label].iloc[0]
+    player_id = player_row["player_id"]
+
 opp = st.sidebar.selectbox("Opponent defense", defenses,
                            index=defenses.index("SF") if "SF" in defenses else 0)
 line = st.sidebar.number_input("Interceptions line", 0.5, 4.5, 0.5, 1.0,
@@ -59,12 +82,22 @@ shrink = st.sidebar.slider("Defense adjustment strength", 0.0, 1.0,
                            help="INT-allowed splits are very noisy, so this defaults low.")
 n_sims = st.sidebar.select_slider("Simulations", [10000, 20000, 40000, 100000], value=40000)
 
-pri = Q.qb_priors(wk, player_row["player_id"], lg)
+try:
+    pri = Q.qb_priors(wk, player_id, lg)
+except ValueError:
+    if live_row is None:
+        raise
+    st.error(f"{live_row['name']} has no passing history in the selected seasons."); st.stop()
+if live_row is not None:
+    pri["team"] = live_row["team"]
 dprof = def_profiles.get(opp) if use_def else None
 sim = Q.simulate_ints(pri, dprof, lg, n_sims=n_sims, def_shrink=shrink, seed=7)
 s = Q.summarize(sim, line)
 
 st.title("🏈 Interceptions Simulator")
+if live_row is not None:
+    UI.status_warning(live_row)
+    st.caption(f"**{live_row['team']} QB{int(live_row['depth'])}**" + (f" · history is from **{live_row['prev_team']}**" if live_row.get("prev_team") and live_row["prev_team"] != live_row["team"] else ""))
 st.caption(f"**{pri['name']}** (QB, {pri['team']}) vs **{opp}** secondary — "
            f"INTs thrown, {pri['games']} games of history, {n_sims:,} simulations")
 

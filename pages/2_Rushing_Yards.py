@@ -13,28 +13,29 @@ import streamlit as st
 import plotly.graph_objects as go
 
 from nflsim import data as D, rushing as R
+from nflsim import roster as RO, ui as UI
 
 st.set_page_config(page_title="Rushing Yards Simulator", page_icon="🏈", layout="wide")
 
 
-@st.cache_data(show_spinner="Downloading NFL data…")
+@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Downloading NFL data…")
 def get_weekly(seasons):
     return D.load_weekly(tuple(sorted(seasons)))
 
 
-@st.cache_data(show_spinner="Loading advanced rushing data…")
+@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Loading advanced rushing data…")
 def get_pfr(seasons):
     pfr = D.load_pfr_rush(tuple(sorted(seasons)))
     agg, lg = R.pfr_rush_aggregates(pfr)
     return pfr, agg, lg
 
 
-@st.cache_data(show_spinner="Loading play-by-play run-defense data…")
+@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Loading play-by-play run-defense data…")
 def get_pbp(seasons):
     return D.load_pbp(tuple(sorted(seasons)))
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner=False)
 def get_derived(seasons):
     wk = get_weekly(seasons)
     pfr, _, _ = get_pfr(seasons)
@@ -43,14 +44,18 @@ def get_derived(seasons):
             R.team_rush_volume(wk), R.rush_defense_profiles(wk, pfr, pbp))
 
 
+@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Loading live depth charts and injury reports…")
+def get_rosters(seasons, use_injuries):
+    return UI.cached_rosters(tuple(sorted(seasons)), use_injuries)
+
+
+@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner=False)
+def get_live_team_vol(seasons):
+    return UI.cached_live(tuple(sorted(seasons)))["team_vol"]
+
+
 st.sidebar.header("Setup")
-ALL_SEASONS = [2026, 2025, 2024, 2023, 2022]
-seasons = st.sidebar.multiselect(
-    "Seasons used to build priors", ALL_SEASONS, default=[2025, 2024],
-    help="More seasons = steadier estimates; fewer = more current form. "
-         "Recent seasons are weighted more heavily either way.")
-if not seasons:
-    st.sidebar.error("Pick at least one season."); st.stop()
+seasons = UI.season_picker("Seasons used to build priors")
 
 try:
     wk = get_weekly(tuple(seasons))
@@ -65,10 +70,27 @@ if skipped:
 
 players, defenses, team_vol, def_profiles = get_derived(tuple(seasons))
 
-player_label = st.sidebar.selectbox(
-    "Rusher", players["label"].tolist(),
-    help="Only players with 40+ carries in the selected seasons are listed.")
-player_row = players[players["label"] == player_label].iloc[0]
+use_live = st.sidebar.toggle(
+    "Pick from live depth charts", value=True,
+    help="Current-season depth chart and injury report. The player's usage share is "
+         "redistributed when teammates are ruled out, and team volume follows his "
+         "CURRENT team, not the one in his history.")
+live_row = None
+if use_live:
+    use_inj = st.sidebar.toggle("Drop players ruled out", value=True)
+    rosters = get_rosters(tuple(seasons), use_inj)
+    if rosters.empty:
+        st.sidebar.error("Depth charts did not load — using history only."); use_live = False
+    else:
+        live_row = UI.pick_player(rosters, ['RB', 'QB', 'WR', 'FB'], key='rush')
+        player_id = live_row["player_id"]
+if not use_live:
+    player_label = st.sidebar.selectbox(
+        "Rusher", players["label"].tolist(),
+        help="Only players with 40+ carries in the selected seasons are listed.")
+    player_row = players[players["label"] == player_label].iloc[0]
+    player_id = player_row["player_id"]
+
 
 opp = st.sidebar.selectbox("Opponent defense", defenses,
                            index=defenses.index("SF") if "SF" in defenses else 0)
@@ -85,7 +107,15 @@ n_sims = st.sidebar.select_slider("Simulations", [5000, 10000, 20000, 50000, 100
                                   value=20000)
 
 _, pfr_agg, pfr_lg = get_pfr(tuple(seasons))
-pri = R.player_rush_priors(wk, player_row["player_id"], pfr_agg, pfr_lg)
+try:
+    pri = R.player_rush_priors(wk, player_id, pfr_agg, pfr_lg)
+except ValueError:
+    if live_row is None:
+        raise
+    pri = RO.rushing_priors_from_role(live_row, pfr_lg)
+if live_row is not None:
+    pri["team"] = live_row["team"]
+    pri["mu_share"] = UI.live_share(live_row, "carry_share")
 pos = pri["position"]
 tv = team_vol.get(pri["team"], team_vol["_LEAGUE_"])
 dprof = def_profiles.get(opp) if use_def else None
@@ -94,6 +124,9 @@ sim = R.simulate(pri, tv, dprof, n_sims=n_sims, def_shrink=shrink, seed=7)
 s = R.summarize(sim, line)
 
 st.title("🏈 Rushing Yards Simulator")
+if live_row is not None:
+    UI.status_warning(live_row)
+    st.caption(UI.role_caption(live_row, "carry_share", "carries"))
 st.caption(f"**{pri['name']}** ({pos}, {pri['team']}) vs **{opp}** defense — "
            f"{pri['games']} games of history, {n_sims:,} simulations")
 

@@ -21,12 +21,9 @@ top-down, so the box score can never disagree with the scoreboard:
      pages use). Team touchdowns are split across players by a multinomial over
      role weights, so player touchdowns always sum to the team's.
 
-**Depth chart to role (§4.4)** is resolved the way the rest of this codebase
-resolves everything: a player's share comes from HIS OWN history when he has
-enough of it, and falls back to a positional-rank prior (WR1 / WR2 / RB1 …) when
-he does not. The depth chart decides who is on the field and in what slot; the
-history decides what that slot is worth. So a rookie WR1 inherits the role's
-prior, while a veteran WR3 who really commands targets keeps his own number.
+**Depth chart to role (§4.4)** lives in `nflsim/roster.py`, shared with the
+single-stat pages: the depth chart decides who is on the field and in what
+slot; the player's own history decides what that slot is worth.
 
 Not modelled: an explicit clock, field position, or drive-by-drive sequencing —
 drives are exchangeable within a game. Sacks and interceptions come from the
@@ -43,43 +40,15 @@ from . import data as D
 from . import rushing as R
 from . import qb as Q
 from . import teams as T
-
-# ---------------------------------------------------------------------------
-# Role priors: what a depth-chart slot is worth when a player has no history.
-# Shares of team targets / team carries; they are renormalised per roster.
-# ---------------------------------------------------------------------------
-
-TARGET_ROLE_PRIOR = {
-    ("WR", 1): 0.22, ("WR", 2): 0.16, ("WR", 3): 0.10, ("WR", 4): 0.05, ("WR", 5): 0.02,
-    ("TE", 1): 0.17, ("TE", 2): 0.05, ("TE", 3): 0.02,
-    ("RB", 1): 0.13, ("RB", 2): 0.07, ("RB", 3): 0.03, ("RB", 4): 0.01,
-    ("FB", 1): 0.02,
-}
-CARRY_ROLE_PRIOR = {
-    ("RB", 1): 0.50, ("RB", 2): 0.23, ("RB", 3): 0.09, ("RB", 4): 0.03,
-    ("QB", 1): 0.09, ("QB", 2): 0.02,
-    ("FB", 1): 0.03,
-    ("WR", 1): 0.02, ("WR", 2): 0.01, ("WR", 3): 0.01,
-    ("TE", 1): 0.005,
-}
-
-# How fast a player's own history takes over from the role prior (games).
-ROLE_BLEND_N = 10.0
+from . import roster as RO
+from .roster import build_roster   # re-exported: the engine's roster contract
 
 # Dirichlet concentration on the allocated shares: higher = less week-to-week
 # wobble in who gets the ball.
 TARGET_CONCENTRATION = 45.0
 CARRY_CONCENTRATION = 30.0
 
-# Receiving fallbacks / regression.
-LG_CATCH_RATE = 0.645
-LG_YPT = 7.6
-CATCH_PRIOR_N = 25.0        # targets-worth of prior on catch rate
-YPT_PRIOR_N = 30.0          # targets-worth of prior on yards per target
 YPC_CV = 1.05               # per-catch yardage spread
-
-# Touchdown role weighting.
-TD_RATE_PRIOR_N = 30.0
 LG_PASS_TD_SHARE = 0.62     # share of offensive TDs that come through the air
 
 # How pace feeds through to scoring and to volume. Both are MEASURED on the
@@ -118,131 +87,6 @@ def team_pass_volume(wk: pd.DataFrame) -> dict:
         out[team] = (float(grp["db"].mean()), float(grp["db"].std(ddof=1) or 5.0))
     out["_LEAGUE_"] = (float(tg["db"].mean()), float(tg["db"].std(ddof=1) or 5.0))
     return out
-
-
-# ---------------------------------------------------------------------------
-# Roster construction: depth chart + history -> shares and priors
-# ---------------------------------------------------------------------------
-
-def _team_totals(wk: pd.DataFrame) -> pd.DataFrame:
-    """Team targets and carries per game, for turning counts into shares."""
-    return (wk.groupby(["recent_team", "season", "week"], as_index=False)
-              .agg(team_tgt=("targets", "sum"), team_car=("carries", "sum")))
-
-
-def build_roster(wk: pd.DataFrame, snapshot: pd.DataFrame, team: str,
-                 ruled_out: set | None = None,
-                 pfr_agg: dict | None = None, pfr_lg: dict | None = None,
-                 max_per_pos: dict | None = None) -> pd.DataFrame:
-    """Turn one depth-chart snapshot into a table of players with usage shares.
-
-    Each player gets a target share and a carry share that blend his own history
-    with the prior for his depth-chart slot, plus the efficiency priors needed
-    to turn volume into yards.
-    """
-    ruled_out = ruled_out or set()
-    caps = {"WR": 5, "TE": 3, "RB": 4, "QB": 1, "FB": 1}
-    caps.update(max_per_pos or {})
-
-    snap = snapshot[~snapshot["player_id"].astype(str).isin(ruled_out)].copy()
-    snap["depth"] = snap["depth"].astype(int)
-    snap = snap[snap.apply(lambda r: r["depth"] <= caps.get(r["position"], 0), axis=1)]
-    if snap.empty:
-        raise ValueError(f"No usable depth chart for {team}.")
-
-    totals = _team_totals(wk)
-    lg = _league_rates(wk)
-    rows = []
-    for _, pl in snap.iterrows():
-        pid = str(pl["player_id"])
-        h = wk[wk["player_id"].astype(str) == pid]
-        rows.append(_player_row(pl, h, totals, lg, pfr_agg, pfr_lg))
-
-    r = pd.DataFrame(rows)
-    # Shares are renormalised so the roster's volume adds up to the team's.
-    for col in ("target_share", "carry_share"):
-        tot = r[col].sum()
-        r[col] = r[col] / tot if tot > 0 else 0.0
-    for col, weight in (("rec_td_weight", "target_share"), ("rush_td_weight", "carry_share")):
-        tot = r[col].sum()
-        r[col] = r[col] / tot if tot > 0 else r[weight]
-    return r.sort_values(["position", "depth"]).reset_index(drop=True)
-
-
-def _league_rates(wk: pd.DataFrame) -> dict:
-    tg, rec = wk["targets"].sum(), wk["receptions"].sum()
-    ry, car = wk["receiving_yards"].sum(), wk["carries"].sum()
-    return dict(
-        catch=float(rec / tg) if tg > 0 else LG_CATCH_RATE,
-        ypt=float(ry / tg) if tg > 0 else LG_YPT,
-        rec_td=float(wk["receiving_tds"].sum() / rec) if rec > 0 else 0.075,
-        rush_td=float(wk["rushing_tds"].sum() / car) if car > 0 else 0.025,
-    )
-
-
-def _player_row(pl: pd.Series, h: pd.DataFrame, totals: pd.DataFrame,
-                lg: dict, pfr_agg, pfr_lg) -> dict:
-    pos, depth = pl["position"], int(pl["depth"])
-    games = int(len(h))
-    blend = games / (games + ROLE_BLEND_N)
-
-    tgt_prior = TARGET_ROLE_PRIOR.get((pos, depth), 0.01)
-    car_prior = CARRY_ROLE_PRIOR.get((pos, depth), 0.005)
-
-    if games:
-        w = h["season_w"].values
-        own_tgt = float(D.wmean(h["target_share"].values, w)) \
-            if h["target_share"].sum() > 0 else _share_from_counts(h, totals, "targets")
-        own_car = _share_from_counts(h, totals, "carries")
-        tgt = blend * _safe(own_tgt, tgt_prior) + (1 - blend) * tgt_prior
-        car = blend * _safe(own_car, car_prior) + (1 - blend) * car_prior
-
-        tg_tot, rec_tot = float(h["targets"].sum()), float(h["receptions"].sum())
-        ry_tot, car_tot = float(h["receiving_yards"].sum()), float(h["carries"].sum())
-        catch = (rec_tot + CATCH_PRIOR_N * lg["catch"]) / (tg_tot + CATCH_PRIOR_N)
-        ypt = (ry_tot + YPT_PRIOR_N * lg["ypt"]) / (tg_tot + YPT_PRIOR_N)
-        rec_td = ((float(h["receiving_tds"].sum()) + TD_RATE_PRIOR_N * lg["rec_td"])
-                  / (rec_tot + TD_RATE_PRIOR_N))
-        rush_td = ((float(h["rushing_tds"].sum()) + TD_RATE_PRIOR_N * lg["rush_td"])
-                   / (car_tot + TD_RATE_PRIOR_N))
-        name = str(h["player_display_name"].iloc[-1])
-    else:
-        tgt, car = tgt_prior, car_prior
-        catch, ypt = lg["catch"], lg["ypt"]
-        rec_td, rush_td = lg["rec_td"], lg["rush_td"]
-        name = str(pl.get("player_name") or pl["player_id"])
-
-    rush_priors = None
-    if car > 0.02 and games:
-        try:
-            rush_priors = R.player_rush_priors(h, str(pl["player_id"]), pfr_agg, pfr_lg)
-        except Exception:
-            rush_priors = None
-
-    return dict(
-        player_id=str(pl["player_id"]), name=name, position=pos, depth=depth,
-        games=games, from_history=bool(games), blend=float(blend),
-        target_share=float(max(tgt, 0.0)), carry_share=float(max(car, 0.0)),
-        catch_rate=float(np.clip(catch, 0.30, 0.90)),
-        ypt=float(np.clip(ypt, 3.0, 14.0)),
-        rec_td_rate=float(np.clip(rec_td, 0.005, 0.30)),
-        rush_td_rate=float(np.clip(rush_td, 0.002, 0.20)),
-        # Role weight for splitting team touchdowns: opportunity x conversion.
-        rec_td_weight=float(max(tgt, 0.0) * np.clip(rec_td, 0.005, 0.30) / max(lg["rec_td"], 1e-6)),
-        rush_td_weight=float(max(car, 0.0) * np.clip(rush_td, 0.002, 0.20) / max(lg["rush_td"], 1e-6)),
-        rush_priors=rush_priors,
-    )
-
-
-def _safe(x, fallback):
-    return float(x) if x is not None and np.isfinite(x) and x > 0 else float(fallback)
-
-
-def _share_from_counts(h: pd.DataFrame, totals: pd.DataFrame, col: str) -> float:
-    """A player's share of team volume across the games he actually played."""
-    j = h.merge(totals, on=["recent_team", "season", "week"], how="left")
-    tot = j["team_tgt" if col == "targets" else "team_car"].sum()
-    return float(j[col].sum() / tot) if tot and tot > 0 else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -555,49 +399,30 @@ def summarize(sim: dict) -> dict:
 def prepare(seasons: tuple[int, ...], depth_seasons: tuple[int, ...] | None = None) -> dict:
     """Load every feed the engine needs once, and build the shared pieces.
 
-    `seasons` is the priors window (how teams and players have played).
-    `depth_seasons` is who is on the roster NOW — a different question, so it
-    defaults to the season after the priors window (the one being played) and
-    falls back to the last priors season if that file does not exist yet.
+    `seasons` is the priors window (how teams and players have played); depth
+    charts and injuries come from the season being played (see `roster.py`).
     """
-    wk = D.load_weekly(seasons)
-    drives = D.load_drives(seasons)
-    ratings = T.team_ratings(drives, D.load_games(seasons))
+    live = RO.load_live(seasons, depth_seasons)
+    wk = live["wk"]
+    drives = D.load_drives(live["seasons"])
+    ratings = T.team_ratings(drives, D.load_games(live["seasons"]))
     ratings["pass_def"] = D.def_pass_rates(wk)
-    pfr = D.load_pfr_rush(seasons)
-    agg, pfr_lg = R.pfr_rush_aggregates(pfr)
-    depth_seasons, depth, injuries = _current_rosters(seasons, depth_seasons)
-    return dict(
-        wk=wk, ratings=ratings,
+    ctx = dict(live)
+    ctx.update(
+        ratings=ratings,
         pass_vol=team_pass_volume(wk), rush_vol=R.team_rush_volume(wk),
-        rush_def=R.rush_defense_profiles(wk, pfr, D.load_pbp(seasons)),
-        lg_pass=Q.league_pass_rates(wk), pfr_agg=agg, pfr_lg=pfr_lg,
-        depth=depth, injuries=injuries, depth_seasons=depth_seasons,
+        rush_def=R.rush_defense_profiles(wk, D.load_pfr_rush(live["seasons"]),
+                                         D.load_pbp(live["seasons"])),
+        lg_pass=Q.league_pass_rates(wk),
     )
-
-
-def _current_rosters(seasons: tuple[int, ...],
-                     depth_seasons: tuple[int, ...] | None):
-    """Depth charts and injury reports for the season being played."""
-    if depth_seasons is None:
-        depth_seasons = (max(int(s) for s in seasons) + 1,)
-        if D.load_depth_charts(depth_seasons).empty:
-            depth_seasons = (max(int(s) for s in seasons),)
-    depth_seasons = tuple(sorted(int(s) for s in depth_seasons))
-    return depth_seasons, D.load_depth_charts(depth_seasons), D.load_injuries(depth_seasons)
+    return ctx
 
 
 def roster_for(ctx: dict, team: str, use_injuries: bool = True,
                week: int | None = None) -> pd.DataFrame:
-    """Build one team's roster from its most recent depth chart.
-
-    The injury filter uses the latest report of the CURRENT season (or `week` if
-    given). It is only meaningful in season — out of season the last report
-    belongs to a game already played.
-    """
-    snap = D.depth_chart_snapshot(ctx["depth"], team)
-    out = D.players_ruled_out(ctx["injuries"], team, week=week) if use_injuries else set()
-    return build_roster(ctx["wk"], snap, team, out, ctx["pfr_agg"], ctx["pfr_lg"])
+    """One team's roster; inactive (ruled-out) players are dropped for the engine."""
+    r = RO.roster_for(ctx, team, use_injuries, week)
+    return r[r["active"]].reset_index(drop=True)
 
 
 if __name__ == "__main__":

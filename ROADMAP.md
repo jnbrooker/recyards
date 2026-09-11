@@ -231,6 +231,7 @@ and the drive table, so a session downloads each season's play-by-play once.
 | 4 | QB sacks + INTs pages ✅ | Offense-side rates, log-odds defense combine, NGS time-to-throw (optional). `nflsim/qb.py`, pages 4 & 5. |
 | 5a | Team-strength layer ✅ | `nflsim/teams.py` + page 6. Opponent-adjusted points per drive, pace, fitted home field, calibrated scoring level; validated on 544 games (§4.1). |
 | 5b | Drive-based game engine ✅ | `nflsim/game.py`. Pace-invariant drive simulation, game script, Dirichlet allocation to the depth chart, multinomial TD split (§4.2–4.4). |
+| 6b | Schedule + fantasy ✅ | `data.load_schedule` (nflverse `games.csv`): pick a real game by week on page 7, closing line shown as a comparator. `nflsim/fantasy.py` + page 8: per-simulation PPR/half/standard scoring for the whole slate with floor/ceiling and an exact breakdown, plus a head-to-head lineup simulator that sums each side PER SIMULATION so stacks and same-game players keep their correlation (Burrow–Chase +0.41; players in different games 0.00). |
 | 6 | Game dashboard ✅ | Page 7: projected box score, margin and total distributions, win probability and fair moneyline. |
 
 Keep it as a **multi-page Streamlit app** — `recyards` becomes one page among
@@ -247,10 +248,26 @@ several, sharing a common data/model utility layer.
    depth charts for the current season, with each player's share blending his
    own history and his positional-rank prior. Uploading a custom depth chart is
    still worth adding for hypotheticals ("what if this WR were the WR1").
-3. **Seasons window** — how many seasons of priors, and how hard to weight the
-   current one for in-season form.
+3. **Seasons window** — *partly answered.* The picker defaults to the three most
+   recent seasons nflverse has published (`data.season_choices`), so the current
+   season joins automatically the week its first file lands and carries the top
+   weight (1.0 / 0.7 / 0.45) from then on. Still open: weighting *within* the
+   current season so the last 4–6 games count more than September (see §8).
 
 ---
+
+*Live depth charts everywhere (`nflsim/roster.py`, `nflsim/ui.py`): pages 1–5
+now pick players from the current season's depth chart with injury tags, use
+the player's CURRENT team for volume (a traded receiver gets his new team's
+pass rate), and use the live, injury-redistributed usage share. A player with no
+history gets role-only priors; one listed Out is simulated "if he plays" with a
+warning. The old history-only picker is still there behind a toggle.*
+
+*Freshness: every nflverse loader sits behind a time-bucketed cache
+(`data.ttl_cache`, `REFRESH_HOURS = 6`) and the page caches expire on the same
+clock, so a long-running app picks up a new week without a restart. nflverse
+republishes weekly stats within hours of games and depth charts / injuries
+daily; nothing here needs a manual refresh.*
 
 *Phase 5b note: every box-score identity is asserted to hold in EVERY
 simulation, not on average — player targets sum to team attempts, player
@@ -270,6 +287,37 @@ carries the TD/FG detail. Yards per drive is still worth adding as a second
 rating if the box-score yardage needs its own anchor.*
 
 *Phase 4 note: sacks & INTs are built on the weekly offense feed (sacks/dropbacks, INTs/attempts) with an optional NGS time-to-throw scaler that degrades to neutral if NGS doesn't load. Rates combine offense + defense in log-odds; game-level rate wobble gives overdispersed counts.*
+
+---
+
+## 8. What would make the models better next (ranked)
+
+1. **An out-of-sample backtest harness.** Every number above is in-sample. A
+   rolling weekly backtest (fit on weeks < w, score week w) for team margins /
+   totals (RMSE, log-loss on the winner) and for player props (Brier score on
+   P(over) at the model's own median) is the single most valuable addition: it
+   is the only way to tune any constant in this codebase honestly.
+2. **Goal-line role for touchdowns.** §3.3 says goal-line role dominates and the
+   pbp has `yardline_100`, but the TD weights are still share × TD rate. Each
+   player's share of his team's carries/targets inside the 10 is the direct
+   signal, and anytime-TD is the biggest player market.
+3. **Within-season recency.** Season-level weights only. A half-life of ~6 games
+   inside the current season tracks form and role changes (a WR whose share
+   jumped after a trade) far better than a flat season weight.
+4. **Snap counts as the role signal.** Depth-chart rank is coarse; nflverse's
+   `snap_counts` release (offense snap %) predicts targets much better and
+   would replace the rank prior for anyone with a few games of snaps.
+5. **QB-aware team ratings.** Team strength does not know who is at QB, and a
+   backup starting is the biggest single swing in the league. Cheap version:
+   when the depth-chart QB1 has fewer than N dropbacks in the drives that built
+   the rating, shrink the offense toward league by a QB-uncertainty factor.
+6. **Weather and roof.** nflverse schedules carry `roof`, `temp`, `wind`; pass
+   volume and yards per attempt drop measurably in wind. Cheap multiplier.
+7. ~~**The market line as a comparator, not an anchor.**~~ Done — pages 7 and 8
+   show the closing spread/total beside the model, never feeding it in.
+8. **Within-game drive correlation.** Totals are still ~9% wider than the real
+   within-matchup spread because drives are exchangeable; leading teams stop
+   pushing in real games.
 
 *Decisions locked so far: offense-only box score · QB-perspective sacks & INTs ·
 fully self-contained scoring (no Vegas anchor).*

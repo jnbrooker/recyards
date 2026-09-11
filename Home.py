@@ -28,7 +28,8 @@ st.markdown(
     "- **QB Sacks** — sacks taken per dropback vs the opponent's pass rush, scaled by NGS time to throw.\n"
     "- **Interceptions** — INTs thrown per attempt, heavily regressed, vs the opponent's secondary.\n"
     "- **Team Strength** — opponent-adjusted points per drive, pace and home field; the base the game model is built on.\n"
-    "- **Game Simulation** — two depth charts in, a simulated box score, score distribution and win probability out.\n"
+    "- **Game Simulation** — pick a game from the schedule; simulated box score, score distribution and win probability, with the closing line beside it for comparison.\n"
+    "- **Fantasy Projections** — every player on the week's slate scored per simulation (PPR / half / standard, editable), with floor, ceiling and a breakdown of where the points come from.\n"
 )
 
 st.subheader("How it works")

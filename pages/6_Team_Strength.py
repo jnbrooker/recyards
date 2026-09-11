@@ -11,11 +11,12 @@ import streamlit as st
 import plotly.graph_objects as go
 
 from nflsim import data as D, teams as T
+from nflsim import ui as UI
 
 st.set_page_config(page_title="Team Strength", page_icon="🏈", layout="wide")
 
 
-@st.cache_data(show_spinner="Downloading play-by-play (this one is a big file)…")
+@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Downloading play-by-play (this one is a big file)…")
 def get_ratings(seasons):
     seasons = tuple(sorted(seasons))
     drives = D.load_drives(seasons)
@@ -25,12 +26,7 @@ def get_ratings(seasons):
 
 
 st.sidebar.header("Setup")
-ALL_SEASONS = [2026, 2025, 2024, 2023, 2022]
-seasons = st.sidebar.multiselect("Seasons used to rate teams", ALL_SEASONS,
-                                 default=[2025, 2024],
-                                 help="Recent seasons are weighted more heavily.")
-if not seasons:
-    st.sidebar.error("Pick at least one season."); st.stop()
+seasons = UI.season_picker("Seasons used to rate teams")
 
 r = get_ratings(tuple(seasons))
 if r is None:
