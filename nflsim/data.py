@@ -423,7 +423,8 @@ _SCHEDULE_URL = ("https://github.com/nflverse/nflverse-data/releases/download/"
 
 _SCHED_KEEP = ["game_id", "season", "game_type", "week", "gameday", "weekday",
                "gametime", "away_team", "home_team", "away_score", "home_score",
-               "spread_line", "total_line", "roof", "surface", "temp", "wind",
+               "spread_line", "total_line", "away_moneyline", "home_moneyline",
+               "roof", "surface", "temp", "wind",
                "away_qb_name", "home_qb_name", "div_game", "stadium"]
 
 
@@ -441,7 +442,8 @@ def load_schedule(seasons: tuple[int, ...]) -> pd.DataFrame:
     if "game_type" in d.columns:
         d = d[d["game_type"] == "REG"]
     d = d[[c for c in _SCHED_KEEP if c in d.columns]].copy()
-    for c in ("away_score", "home_score", "spread_line", "total_line", "temp", "wind"):
+    for c in ("away_score", "home_score", "spread_line", "total_line",
+              "away_moneyline", "home_moneyline", "temp", "wind"):
         if c in d.columns:
             d[c] = pd.to_numeric(d[c], errors="coerce")
     d["played"] = d["home_score"].notna() & d["away_score"].notna()

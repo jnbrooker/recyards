@@ -30,6 +30,7 @@ st.markdown(
     "- **Team Strength** — opponent-adjusted points per drive, pace and home field; the base the game model is built on.\n"
     "- **Game Simulation** — pick a game from the schedule; simulated box score, score distribution and win probability, with the closing line beside it for comparison.\n"
     "- **Fantasy Projections** — every player on the week's slate scored per simulation (PPR / half / standard, editable), with floor, ceiling and a breakdown of where the points come from.\n"
+    "- **Pick'em Card** — a 20-slot confidence card for the week (ATS / underdog ML per game, three 3-team combos, the pool's totals), graded against editable lines and ranked by expected return.\n"
 )
 
 st.subheader("How it works")
