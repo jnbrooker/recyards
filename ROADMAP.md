@@ -183,20 +183,51 @@ models decide *who* scores and the yardage; calibrate so aggregate TDs match the
 efficiency ratings. Getting this reconciliation right is the main challenge of
 the whole build.
 
-### 4.4 Depth-chart → roles — DECIDED and DONE
-A name isn't a workload. **Resolution: do both, and let the data pick.** The
-depth chart (auto-pulled from nflverse, current season) decides *who is on the
-field and in what slot*; the player's own history decides *what that slot is
-worth*. Each share is a blend, weighted `games / (games + 10)`, of the player's
-own target/carry share and the prior for his positional rank (WR1 0.22, WR2
-0.16, TE1 0.17, RB1 0.50 of carries, …). Shares are then renormalised across the
-roster, so a rookie WR1 inherits his slot's prior while a veteran WR3 who really
-commands targets keeps his own number. The box score labels which applied.
+### 4.4 Depth-chart → roles — DECIDED, DONE, and rebuilt 2026-09-12
+A name isn't a workload. The depth chart (auto-pulled from nflverse, current
+season) decides *who is on the field and in what slot*; the player's own
+history decides *what that slot is worth*. The original blend — own share
+weighted `games / (games + 10)`, the rest the slot's rank prior, everyone
+renormalised equally — had three defects that a user spotted from the output
+(a rookie RB1 projected 7 carries; top receivers low) and a role backtest
+over 5 489 listed player-weeks of 2025 then measured: listed **RB1s took 55%
+of carries and were projected 45%; WR1s 25% and projected 22%**.
+
+1. *History was weighted by games alone, never by whether it matched the
+   slot.* A back who was a lead back somewhere and is now listed RB4 (James
+   Conner behind a rookie) kept 65% weight on a 41% share; three such backups
+   squeezed the rookie to 31%. Now the weight on any history-based estimate
+   (own share, snap-count prior) is scaled by its **consistency with the
+   slot's rank prior**, `(smaller / larger) ** 1`; for the top slot, history
+   *above* the anchor is fully consistent (that is what a WR1 looks like) —
+   only a promoted backup's history below it is discounted.
+2. *Slot shares were guesses, and conditional.* They are now **measured,
+   unconditional** shares — over every listed player not ruled out, with a
+   game he did not appear in counting as zero (WR5s appear in 71% of weeks,
+   RB4s in 23%) — so a roster's listed slots sum to the position group's real
+   share of the ball instead of over-filling it and scaling every starter
+   down. A player's own share is unconditional the same way: his touches over
+   the team's touches in every game of his stint, missed games included.
+3. *Renormalisation was over the whole roster.* Each position group is now
+   normalised to the team's own split of touches (shrunk toward league), so
+   the backfield cannot absorb the QB's carries. Depth-order pooling was
+   tested and made no difference, so it is not there.
+
+Role backtest, 2025: RB1 carry-share error −14%, all carries −7%, targets
+level; projected RB1 share 0.455 → 0.51 (actual 0.55; the residual is
+mostly that the backtest's "actual" conditions on playing while the
+projection does not), WR1 0.216 → 0.235. Selection-free level check, PPR
+points per team-game: engine 82.5 vs 82.8 actual, every position group
+within a point; targets 30.5 vs 30.4 once the engine stopped treating every
+attempt as a target (`TARGET_PER_ATTEMPT`, measured 0.952). The single-stat
+pages had the same disease in a different coat — regression toward one
+positional mean pulled the 95th–99th percentile of receivers 10% low — and
+now regress toward the player's **slot within his own team** (rank by share
+→ the same slot table): receiving MAE 22.8 → 22.65, extreme-top bias −8.6 →
+−4.2; rushing likewise.
 
 Players ruled Out or Doubtful on the current season's latest injury report are
 dropped and their share redistributed.
-
----
 
 ## 5. Data sources & the one spike to do first
 
@@ -275,7 +306,7 @@ republishes weekly stats within hours of games and depth charts / injuries
 daily; nothing here needs a manual refresh.*
 
 *Phase 5b note: every box-score identity is asserted to hold in EVERY
-simulation, not on average — player targets sum to team attempts, player
+simulation, not on average — player targets sum to the team's targeted attempts, player
 touchdowns sum to the drive engine's team touchdowns, and team passing yards are
 literally the sum of the receivers' yards. Largest-remainder apportionment on
 the Dirichlet shares is what makes the counts add up exactly.*

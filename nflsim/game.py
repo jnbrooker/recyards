@@ -72,6 +72,12 @@ PASS_FRAC_CLIP = (0.25, 0.80)
 
 XP_RATE = 0.96              # so a touchdown averages T.TD_POINTS
 
+# Not every pass attempt is a target: throwaways, spikes and batted balls are
+# ~5% of attempts. `prepare` measures the ratio from the weekly feed; this is
+# the fallback. Without it the engine ran 5% high on targets and 8% on
+# receiving yards per team-game.
+TARGET_PER_ATTEMPT = 0.95
+
 
 # ---------------------------------------------------------------------------
 # Team volume
@@ -155,7 +161,8 @@ def simulate_game(ratings: dict, wk: pd.DataFrame,
                   lg_pass: dict | None = None,
                   home: str | None = "a",
                   n_sims: int = 20000, seed: int | None = None,
-                  avail: dict | None = None, wind=None, roof=None) -> dict:
+                  avail: dict | None = None, wind=None, roof=None,
+                  target_rate: float | None = None) -> dict:
     """Simulate the game `n_sims` times and return scores plus both box scores.
     `avail` is `{team: availability indices}` (see `availability.py`) and
     `wind` / `roof` the weather — the same shifts `teams.expected_points`
@@ -195,10 +202,11 @@ def simulate_game(ratings: dict, wk: pd.DataFrame,
     pts_b = sb["off_points"] + sa["takeaway_points"]
 
     # 3. game script, then 4. allocation
+    tr = float(target_rate) if target_rate else TARGET_PER_ATTEMPT
     box_a = _side_box(rng, wk, roster_a, team_a, team_b, drives_a, sa,
-                      pts_a - pts_b, pass_vol, rush_vol, rush_def, lg_pass, ratings)
+                      pts_a - pts_b, pass_vol, rush_vol, rush_def, lg_pass, ratings, tr)
     box_b = _side_box(rng, wk, roster_b, team_b, team_a, drives_b, sb,
-                      pts_b - pts_a, pass_vol, rush_vol, rush_def, lg_pass, ratings)
+                      pts_b - pts_a, pass_vol, rush_vol, rush_def, lg_pass, ratings, tr)
 
     return dict(
         team_a=team_a, team_b=team_b, points_a=pts_a, points_b=pts_b,
@@ -296,7 +304,8 @@ def _score_sides(rng, drives_a: np.ndarray, drives_b: np.ndarray, mix_a: dict, m
 
 
 def _side_box(rng, wk, roster, team, opponent, drives, score, margin,
-              pass_vol, rush_vol, rush_def, lg_pass, ratings) -> dict:
+              pass_vol, rush_vol, rush_def, lg_pass, ratings,
+              target_rate: float = TARGET_PER_ATTEMPT) -> dict:
     """Volume, game script and player allocation for one team."""
     n = len(drives)
     k = len(roster)
@@ -346,7 +355,8 @@ def _side_box(rng, wk, roster, team, opponent, drives, score, margin,
                           * TARGET_CONCENTRATION, size=n)
     car_w = rng.dirichlet(np.clip(roster["carry_share"].values, 1e-4, None)
                           * CARRY_CONCENTRATION, size=n)
-    targets = _split_counts(attempts, tgt_w)
+    targeted = rng.binomial(attempts, float(np.clip(target_rate, 0.8, 1.0)))
+    targets = _split_counts(targeted, tgt_w)
     player_car = _split_counts(carries, car_w)
 
     # --- catches and yards -------------------------------------------------
@@ -480,6 +490,8 @@ def prepare(seasons: tuple[int, ...], depth_seasons: tuple[int, ...] | None = No
         rush_def=R.rush_defense_profiles(wk, D.load_pfr_rush(seasons, recency),
                                          D.load_pbp(seasons, recency)),
         lg_pass=Q.league_pass_rates(wk),
+        target_rate=float(np.clip(wk["targets"].sum() / max(wk["attempts"].sum(), 1), 0.85, 1.0))
+        if "attempts" in wk.columns else TARGET_PER_ATTEMPT,
     )
     # who is actually playing this week (§8.5): QB familiarity and defensive
     # starters ruled out, from the live depth charts and injury report

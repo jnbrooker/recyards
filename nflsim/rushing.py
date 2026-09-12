@@ -159,6 +159,25 @@ def league_rush_priors(wk: pd.DataFrame) -> dict:
     out = {"_ALL_": dict(share=float(D.wmean(d["share"], d["w"])), ypc=ypc)}
     for pos, g in d.groupby("position"):
         out[pos] = dict(share=float(D.wmean(g["share"], g["w"])), ypc=ypc)
+    # slot-aware share prior: each player's rank among his latest team's
+    # backs (by weighted carry share) mapped to the roster layer's slot table,
+    # so a lead back regresses toward a lead back's share, not the RB mean
+    from . import roster as RO
+    latest_team = d.sort_values(["season", "week"]).groupby("player_id")["recent_team"].last()
+    sh = (d.assign(x=d["share"] * d["w"]).groupby("player_id")
+            .agg(x=("x", "sum"), w=("w", "sum"), position=("position", "last")))
+    sh["share"] = sh["x"] / sh["w"].clip(lower=1e-9)
+    sh["team"] = latest_team
+    sh["rank"] = sh.groupby(["team", "position"])["share"].rank(ascending=False, method="first")
+    slot = {}
+    for pid, r in sh.iterrows():
+        pos, rank = str(r["position"]), int(r["rank"])
+        val = None
+        for k in range(rank, 0, -1):
+            if (pos, k) in RO.CARRY_ROLE_PRIOR:
+                val = RO.CARRY_ROLE_PRIOR[(pos, k)]; break
+        slot[str(pid)] = float(val if val is not None else out[pos]["share"])
+    out["_slot_"] = slot
     return out
 
 
@@ -175,7 +194,8 @@ def player_rush_priors(wk: pd.DataFrame, player_id: str,
     if p.empty:
         raise ValueError("No usable rushing games for this player.")
     lg = lg or league_rush_priors(wk)
-    prior = lg.get(str(p["position"].iloc[-1]), lg["_ALL_"])
+    prior = dict(lg.get(str(p["position"].iloc[-1]), lg["_ALL_"]))
+    prior["share"] = lg.get("_slot_", {}).get(str(player_id), prior["share"])
     w = p["w"].values
 
     team_car = (wk.groupby(["recent_team", "season", "week"])["carries"]

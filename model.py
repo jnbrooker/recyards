@@ -131,13 +131,37 @@ def _wstd(x, w, fallback):
     return sd if sd > 1e-6 else fallback
 
 
+# Slot-aware target-share prior (roadmap 8.1b follow-up): a player is
+# regressed toward the share of his RANK among his team's receivers, not the
+# positional mean — one number for all WRs pulled stars down 10% and scrubs
+# up. Ranks are by weighted target share within the player's latest team;
+# the slot values are the unconditional shares from `nflsim.roster`.
+def _slot_prior(rank: int, position: str) -> float:
+    from nflsim import roster as _RO
+    table = _RO.TARGET_ROLE_PRIOR
+    for r in range(int(rank), 0, -1):
+        if (position, r) in table:
+            return float(table[(position, r)])
+    return 0.02
+
+
 def league_priors(wk: pd.DataFrame) -> dict:
-    """Positional means the player priors are regressed toward: target share
-    (over games with a target), catch rate, completed air yards per catch and
-    YAC per catch — all recency-weighted. Keyed by position plus "_ALL_"."""
+    """What the player priors are regressed toward: catch rate, completed air
+    yards per catch and YAC per catch by position (recency-weighted), plus each
+    player's slot-aware target-share prior under "_slot_" (see `_slot_prior`).
+    Keyed by position plus "_ALL_"."""
     d = wk[wk["targets"] > 0]
     if "w" not in d.columns:
         d = d.assign(w=1.0)
+    # rank each player among his latest team's receivers by weighted share
+    full = wk if "w" in wk.columns else wk.assign(w=1.0)
+    latest_team = full.sort_values(["season", "week"]).groupby("player_id")["recent_team"].last()
+    sh = (full.assign(x=full["target_share"].fillna(0.0) * full["w"])
+              .groupby("player_id").agg(x=("x", "sum"), w=("w", "sum"), position=("position", "last")))
+    sh["share"] = sh["x"] / sh["w"].clip(lower=1e-9)
+    sh["team"] = latest_team
+    sh["rank"] = sh.groupby(["team", "position"])["share"].rank(ascending=False, method="first")
+    slot = {str(pid): _slot_prior(int(r["rank"]), str(r["position"])) for pid, r in sh.iterrows()}
     yac_col = d.get("receiving_yards_after_catch", pd.Series(0.0, index=d.index))
     out = {}
     for pos, g in list(d.groupby("position")) + [("_ALL_", d)]:
@@ -151,6 +175,7 @@ def league_priors(wk: pd.DataFrame) -> dict:
             air=(float((g["receiving_yards"] * g["w"]).sum()) - yac) / rec if rec > 0 else 5.7,
             yac=yac / rec if rec > 0 else 5.2,
         )
+    out["_slot_"] = slot
     return out
 
 
@@ -165,7 +190,8 @@ def player_priors(wk: pd.DataFrame, player_id: str, lg: dict | None = None) -> d
     if p.empty:
         raise ValueError("No usable games for this player.")
     lg = lg or league_priors(wk)
-    prior = lg.get(str(p["position"].iloc[-1]), lg["_ALL_"])
+    prior = dict(lg.get(str(p["position"].iloc[-1]), lg["_ALL_"]))
+    prior["ts"] = lg.get("_slot_", {}).get(str(player_id), prior["ts"])
 
     w = p["w"].values                            # recency weight per game
     n_eff = float(allg["w"].sum())               # games-worth of weighted history

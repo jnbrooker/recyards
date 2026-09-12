@@ -31,18 +31,25 @@ from . import rushing as R
 # Shares of team targets / team carries; they are renormalised per roster.
 # ---------------------------------------------------------------------------
 
+# UNCONDITIONAL slot shares — measured over every listed player not ruled
+# out, 2025, with a game he did not appear in counting as zero (WR5s appear
+# in 71% of weeks, RB4s in 23%). Unconditional is what the allocation needs:
+# a roster's listed slots then sum to the position group's real share of the
+# ball (WR 0.56, RB 0.81) instead of over-filling it and scaling every starter
+# down. These are what a slot is worth with no history and, via the
+# consistency weighting below, the anchor a player's history is checked against.
 TARGET_ROLE_PRIOR = {
-    ("WR", 1): 0.22, ("WR", 2): 0.16, ("WR", 3): 0.10, ("WR", 4): 0.05, ("WR", 5): 0.02,
-    ("TE", 1): 0.17, ("TE", 2): 0.05, ("TE", 3): 0.02,
-    ("RB", 1): 0.13, ("RB", 2): 0.07, ("RB", 3): 0.03, ("RB", 4): 0.01,
-    ("FB", 1): 0.02,
+    ("WR", 1): 0.242, ("WR", 2): 0.169, ("WR", 3): 0.105, ("WR", 4): 0.058, ("WR", 5): 0.028,
+    ("TE", 1): 0.161, ("TE", 2): 0.063, ("TE", 3): 0.024,
+    ("RB", 1): 0.106, ("RB", 2): 0.054, ("RB", 3): 0.020, ("RB", 4): 0.002,
+    ("FB", 1): 0.012,
 }
 CARRY_ROLE_PRIOR = {
-    ("RB", 1): 0.50, ("RB", 2): 0.23, ("RB", 3): 0.09, ("RB", 4): 0.03,
-    ("QB", 1): 0.09, ("QB", 2): 0.02,
-    ("FB", 1): 0.03,
-    ("WR", 1): 0.02, ("WR", 2): 0.01, ("WR", 3): 0.01,
-    ("TE", 1): 0.005,
+    ("RB", 1): 0.540, ("RB", 2): 0.231, ("RB", 3): 0.061, ("RB", 4): 0.012,
+    ("QB", 1): 0.135, ("QB", 2): 0.01,
+    ("FB", 1): 0.008,
+    ("WR", 1): 0.006, ("WR", 2): 0.006, ("WR", 3): 0.005, ("WR", 4): 0.006, ("WR", 5): 0.003,
+    ("TE", 1): 0.003, ("TE", 2): 0.002, ("TE", 3): 0.003,
 }
 
 # How fast a player's own history takes over from the role prior (games).
@@ -59,6 +66,21 @@ ROLE_BLEND_N = 10.0
 SNAP_TARGET_SLOPE = {"WR": 0.25, "TE": 0.20, "RB": 0.17, "FB": 0.05, "QB": 0.0}
 SNAP_CARRY_SLOPE = {"RB": 0.81, "QB": 0.15, "WR": 0.01, "FB": 0.10, "TE": 0.005}
 SNAP_MIN_GAMES = 2
+
+# A player's history is only as informative as it is CONSISTENT with the slot
+# the depth chart now gives him. A back who was a lead back somewhere and is
+# now listed RB4 (a returning veteran behind a rookie), or a backup promoted
+# to RB1, has history that describes a different role, so the weight on it is
+# scaled by (smaller / larger of own share vs slot prior) ** CONSISTENCY_POW.
+# Then each position group is normalised to the team's own share of touches
+# for that position (shrunk toward league). Before this, three veteran
+# backups with big histories could squeeze a rookie RB1 to 31% of the
+# carries; listed RB1s actually take 55%. Backtested over 5 489 listed
+# player-weeks of 2025 (roadmap 8.4): RB1 carry error -14%, all carries -6%.
+CONSISTENCY_POW = 1.0
+GROUP_PRIOR_GAMES = 8.0     # team-games of prior on the team's group split
+LEAGUE_CARRY_GROUP = {"RB": 0.81, "QB": 0.15, "WR": 0.02, "FB": 0.01, "TE": 0.01}
+LEAGUE_TARGET_GROUP = {"WR": 0.57, "TE": 0.22, "RB": 0.19, "FB": 0.01, "QB": 0.01}
 
 # Receiving fallbacks / regression.
 LG_CATCH_RATE = 0.645
@@ -239,12 +261,14 @@ def build_roster(wk: pd.DataFrame, snapshot: pd.DataFrame, team: str,
     r["own_target_share"] = r["target_share"]
     r["own_carry_share"] = r["carry_share"]
 
-    # Shares are renormalised over ACTIVE players so the team's volume adds up;
-    # inactive players carry zero share.
+    # Depth-chart order within each position group, group normalised to the
+    # team's split of touches; inactive players carry zero share.
+    r = allocate_shares(r, team_group_shares(wk, team))
     act = r["active"].values
-    for col in ("target_share", "carry_share"):
-        tot = r.loc[act, col].sum()
-        r[col] = np.where(act, r[col] / tot if tot > 0 else 0.0, 0.0)
+    # Role weights for splitting team touchdowns follow the FINAL shares:
+    # opportunity x conversion, normalised over active players.
+    r["rec_td_weight"] = r["target_share"] * r["rec_td_rate"] / max(lg["rec_td"], 1e-6)
+    r["rush_td_weight"] = r["carry_share"] * r["rush_td_rate"] / max(lg["rush_td"], 1e-6)
     for col, weight in (("rec_td_weight", "target_share"), ("rush_td_weight", "carry_share")):
         tot = r.loc[act, col].sum()
         r[col] = np.where(act, r[col] / tot if tot > 0 else r[weight], 0.0)
@@ -271,22 +295,28 @@ def _player_row(pl: pd.Series, h: pd.DataFrame, totals: pd.DataFrame,
     games = int(len(h))
     blend = games / (games + ROLE_BLEND_N)
 
-    tgt_prior = TARGET_ROLE_PRIOR.get((pos, depth), 0.01)
-    car_prior = CARRY_ROLE_PRIOR.get((pos, depth), 0.005)
+    rank_tgt = TARGET_ROLE_PRIOR.get((pos, depth), 0.01)
+    rank_car = CARRY_ROLE_PRIOR.get((pos, depth), 0.005)
+    tgt_prior, car_prior = rank_tgt, rank_car
     snap_share, role_source = None, "rank"
     if snap is not None and snap[1] >= SNAP_MIN_GAMES:
+        # the snap prior is history too: weight it by its consistency with the slot
         snap_share = float(snap[0])
-        tgt_prior = 0.5 * tgt_prior + 0.5 * SNAP_TARGET_SLOPE.get(pos, 0.01) * snap_share
-        car_prior = 0.5 * car_prior + 0.5 * SNAP_CARRY_SLOPE.get(pos, 0.005) * snap_share
+        tgt_prior = _blend(0.5, SNAP_TARGET_SLOPE.get(pos, 0.01) * snap_share, rank_tgt, rank_tgt, depth == 1)
+        car_prior = _blend(0.5, SNAP_CARRY_SLOPE.get(pos, 0.005) * snap_share, rank_car, rank_car, depth == 1)
         role_source = "rank + snaps"
 
     if games:
         w = h["w"].values
-        own_tgt = float(D.wmean(h["target_share"].values, w)) \
-            if h["target_share"].sum() > 0 else _share_from_counts(h, totals, "targets")
+        own_tgt = _share_from_counts(h, totals, "targets")
         own_car = _share_from_counts(h, totals, "carries")
-        tgt = blend * _safe(own_tgt, tgt_prior) + (1 - blend) * tgt_prior
-        car = blend * _safe(own_car, car_prior) + (1 - blend) * car_prior
+        # the snap prior is per game appeared; make it unconditional too
+        avail = _stint_appearance_rate(h, totals)
+        if snap_share is not None:
+            tgt_prior = _blend(0.5, SNAP_TARGET_SLOPE.get(pos, 0.01) * snap_share * avail, rank_tgt, rank_tgt, depth == 1)
+            car_prior = _blend(0.5, SNAP_CARRY_SLOPE.get(pos, 0.005) * snap_share * avail, rank_car, rank_car, depth == 1)
+        tgt = _blend(blend, _safe(own_tgt, tgt_prior), tgt_prior, rank_tgt, depth == 1)
+        car = _blend(blend, _safe(own_car, car_prior), car_prior, rank_car, depth == 1)
 
         # Efficiency rates on recency-weighted totals, regressed toward league.
         tg_tot, rec_tot = _wsum(h, "targets"), _wsum(h, "receptions")
@@ -345,13 +375,93 @@ def _safe(x, fallback):
     return float(x) if x is not None and np.isfinite(x) and x > 0 else float(fallback)
 
 
+def _blend(weight: float, own: float, prior: float, anchor: float,
+           top_slot: bool = False) -> float:
+    """`own` (a history-based estimate) vs `prior`, with the history's weight
+    scaled by how consistent it is with the SLOT's rank prior `anchor` (see
+    CONSISTENCY_POW). For the top slot, history ABOVE the anchor is fully
+    consistent — a star who out-produces the WR1 prior is exactly what a WR1
+    looks like; only history below it (a promoted backup) is discounted.
+    CONSISTENCY_POW = 0 recovers the plain games blend."""
+    if own <= 0 or anchor <= 0:
+        return weight * own + (1 - weight) * prior
+    if top_slot and own >= anchor:
+        consistency = 1.0
+    else:
+        consistency = (min(own, anchor) / max(own, anchor)) ** CONSISTENCY_POW
+    b = weight * consistency
+    return b * own + (1 - b) * prior
+
+
+def team_group_shares(wk: pd.DataFrame, team: str) -> dict:
+    """The team's own split of carries and targets by position group,
+    recency-weighted and shrunk toward league over GROUP_PRIOR_GAMES."""
+    t = wk[wk["recent_team"] == team]
+    w = t["w"] if "w" in t.columns else pd.Series(1.0, index=t.index)
+    out = {}
+    for col, league in (("carries", LEAGUE_CARRY_GROUP), ("targets", LEAGUE_TARGET_GROUP)):
+        tot = float((t[col] * w).sum())
+        n_games = float(t.drop_duplicates(["season", "week"])["w"].sum()) if "w" in t.columns else float(t[["season", "week"]].drop_duplicates().shape[0])
+        k = n_games / (n_games + GROUP_PRIOR_GAMES)
+        grp = {}
+        for pos in league:
+            own = float((t.loc[t["position"] == pos, col] * w[t["position"] == pos]).sum()) / tot if tot > 0 else league[pos]
+            grp[pos] = k * own + (1 - k) * league[pos]
+        z = sum(grp.values())
+        out[col] = {p: v / z for p, v in grp.items()}
+    return out
+
+
+def allocate_shares(r: pd.DataFrame, group_shares: dict | None = None) -> pd.DataFrame:
+    """Turn per-player blended shares into a roster allocation: each position
+    group normalised to its share of the team's touches. Operates on
+    `target_share` / `carry_share` of the ACTIVE players in `r`; inactive
+    players get zero."""
+    r = r.copy()
+    act = r["active"].values.astype(bool)
+    for col, key, league in (("carry_share", "carries", LEAGUE_CARRY_GROUP),
+                             ("target_share", "targets", LEAGUE_TARGET_GROUP)):
+        gs = (group_shares or {}).get(key, league)
+        new = np.zeros(len(r))
+        present = {}
+        for pos, g in r[act].groupby("position"):
+            present[pos] = (g.index, g[col].values.astype(float))
+        # groups the roster lacks (no FB listed) give their share back pro rata
+        total_share = sum(gs.get(p, 0.0) for p in present) or 1.0
+        for pos, (idx, vals) in present.items():
+            want = gs.get(pos, 0.0) / total_share
+            tot = vals.sum()
+            new[r.index.get_indexer(idx)] = vals / tot * want if tot > 0 else 0.0
+        r[col] = new
+    return r
+
+
 def _share_from_counts(h: pd.DataFrame, totals: pd.DataFrame, col: str) -> float:
-    """A player's share of team volume across the games he actually played,
-    recent games counting more."""
-    j = h.merge(totals.drop(columns="w", errors="ignore"),
-                on=["recent_team", "season", "week"], how="left")
-    tot = float((j["team_tgt" if col == "targets" else "team_car"] * j["w"]).sum())
-    return float((j[col] * j["w"]).sum() / tot) if tot and tot > 0 else 0.0
+    """A player's UNCONDITIONAL share of team volume: his (weighted) touches
+    over the team's (weighted) touches in every team game during his stint —
+    first to last appearance with each team — so a game he missed counts as
+    zero, the way the slot priors are measured."""
+    tcol = "team_tgt" if col == "targets" else "team_car"
+    num = float((h[col] * h["w"]).sum())
+    den = 0.0
+    for team, g in h.groupby("recent_team"):
+        stamp = g["season"] * 100 + g["week"]
+        t = totals[totals["recent_team"] == team]
+        ts = t["season"] * 100 + t["week"]
+        span = t[(ts >= stamp.min()) & (ts <= stamp.max())]
+        den += float((span[tcol] * span["w"]).sum())
+    return num / den if den > 0 else 0.0
+
+
+def _stint_appearance_rate(h: pd.DataFrame, totals: pd.DataFrame) -> float:
+    """Games appeared / team games during the player's stint(s)."""
+    n_team = 0
+    for team, g in h.groupby("recent_team"):
+        stamp = g["season"] * 100 + g["week"]
+        t = totals[totals["recent_team"] == team]
+        ts = t["season"] * 100 + t["week"]
+        n_team += int(((ts >= stamp.min()) & (ts <= stamp.max())).sum())
+    return float(len(h) / n_team) if n_team > 0 else 1.0
 
 
 # ---------------------------------------------------------------------------

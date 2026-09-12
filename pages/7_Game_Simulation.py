@@ -96,7 +96,7 @@ sim = G.simulate_game(ratings, ctx["wk"], r_home, r_away, home, away,
                       ctx["pass_vol"], ctx["rush_vol"], ctx["rush_def"],
                       ctx["lg_pass"], home=None if neutral else "a",
                       n_sims=n_sims, seed=11, avail=ctx.get("avail"),
-                      wind=wind, roof=_roof)
+                      wind=wind, roof=_roof, target_rate=ctx.get("target_rate"))
 s = G.summarize(sim)
 
 fav, dog = (home, away) if s["mean_margin"] >= 0 else (away, home)
