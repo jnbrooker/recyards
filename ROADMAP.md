@@ -137,10 +137,11 @@ now measured from data rather than assumed:
 - **Home field**, fitted as the home margin the ratings don't already explain:
   **+1.97 points** over 2024–25.
 
-*Validated on all 544 regular-season games of 2024–25:* margin correlation
-**0.50**, margin RMSE **12.7**, straight-up winner **67.1%**, mean total 45.8 vs
-45.9 actual, zero margin bias. The residual spread (sd 12.7 points) is the
-target the drive engine's simulated score distribution has to reproduce.
+*Originally validated in-sample on 2024–25 (RMSE 12.7, winners 67.1%). Those
+numbers are superseded by the out-of-sample harness (§8.1): fitted on prior
+seasons and weeks only, the layer scores 12.71 / 68.0% in 2024 and 12.79 /
+62.0% in 2025 against the closing line's 12.61 / 71.3% and 12.27 / 65.3%. The
+residual spread (margin sd 12.8) is the target the drive engine reproduces.*
 
 ### 4.2 Drive-based game engine — DONE (`nflsim/game.py`, page 7)
 Per simulation:
@@ -245,13 +246,14 @@ several, sharing a common data/model utility layer.
 
 ## 7. Open questions
 
-1. **Project structure** — extend the existing `recyards` folder into a
-   multi-page app, or start a fresh project folder that imports the receiving
-   model? (Affects Phase 1 file layout.)
+1. ~~**Project structure**~~ — answered: the `recyards` repo became the
+   multi-page app, `model.py` (the original receiving model) is page 1 and
+   now delegates its loader to the shared layer.
 2. ~~**Depth-chart input format**~~ — answered in §4.4: auto-pulled nflverse
    depth charts for the current season, with each player's share blending his
-   own history and his positional-rank prior. Uploading a custom depth chart is
-   still worth adding for hypotheticals ("what if this WR were the WR1").
+   own history and his slot's prior (rank averaged with a snap-count prior).
+   *The one thing still open in this document:* uploading a custom depth chart
+   for hypotheticals ("what if this WR were the WR1").
 3. ~~**Seasons window**~~ — answered. The window defaults to the three most
    recent seasons nflverse has published (`data.season_choices`), so the current
    season joins automatically the week its first file lands; how much each
@@ -445,7 +447,10 @@ rating if the box-score yardage needs its own anchor.*
    on player props; Balanced is marginally best on receiving and rushing,
    Recent form on sacks. Recency was not the lever the audit hoped — the
    player models' error is dominated by unregressed means (#1b), not stale
-   ones.
+   ones. *Post-calibration (§8.8), 2025 with availability:* Recent form edges
+   Balanced on the team layer (margin RMSE 12.67 vs 12.79, log-loss 0.631 vs
+   0.644) and is within noise elsewhere; one season is not enough to move the
+   default, but it is the first preset to check when a third season arrives.
 
 4. ~~**Snap counts as the role signal.**~~ *Done 2026-09-12 — smaller than
    hoped, and the roadmap's premise was wrong.* Snap share is a strong proxy
@@ -576,5 +581,31 @@ rating if the box-score yardage needs its own anchor.*
      shift +0.04); totals remain ~3% wide. The harness's win-probability sd
      is 12.8 to match. A 7-point favourite is now 70.8% rather than 68.6%.
 
-*Decisions locked so far: offense-only box score · QB-perspective sacks & INTs ·
-fully self-contained scoring (no Vegas anchor).*
+## 9. Maintenance
+
+Several constants are fitted on out-of-sample residuals and rest on two
+seasons (2024–25). Refit them each off-season, once a season's schedule,
+depth charts, injuries and snap counts are complete:
+
+```bash
+python -m nflsim.calibrate 2024 2025 2026            # report
+python -m nflsim.calibrate 2024 2025 2026 --write    # update the constants
+```
+
+The report shows, with t-stats: the availability coefficients
+(`availability.QB_MARGIN_COEF`, `QB_SWING_COEF`, `DEF_MARGIN_COEF`, and the
+display-only `OL_MARGIN_COEF` — price it if it reaches |t| ≥ 2), the
+ratings' calibration slope (adjust `teams.RATING_PRIOR_N` toward slope 1.0),
+the residual spreads (`backtest.MARGIN_SD`; check `game.LEAD_BETA` still
+reproduces the margin / team sd and correlation with a few simulated
+matchups), and the wind coefficient (`teams.WIND_COEF`). Then re-run the
+harness (page 10 or `python -m nflsim.backtest`) and commit.
+
+The recency presets (§8.3) and the player-prior pseudo-counts (§8.1b) were
+grid-searched on 2025; the same grids are worth re-running with a third
+season, but they moved little and are not expected to move.
+
+*Decisions locked: offense-only box score · QB-perspective sacks & INTs ·
+fully self-contained scoring (no Vegas anchor) · every fitted constant is
+fitted out of sample, and a constant the harness cannot distinguish from zero
+is shown but not priced.*

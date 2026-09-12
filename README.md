@@ -1,77 +1,135 @@
-# Receiving Yards Monte Carlo Model
+# NFL Monte Carlo Model Suite
 
-A dashboard that predicts an NFL player's receiving yards for a single game by
-simulating it thousands of times, then shows the chance of beating a prop line
-and the full distribution of outcomes.
+A self-contained NFL game and player-prop model, as a multi-page Streamlit app.
+Pick a game and it simulates it thousands of times from distributions fitted to
+real game-to-game data — pace, drives, who is on the field, who gets the ball,
+what each touch is worth — and reports the score distribution, win
+probability, a projected box score, and the chance of any player beating a
+line. Nothing anchors to Vegas; the closing line is shown beside the model
+only as a comparator.
 
-## What it does
+Every model in it is scored **out of sample** by its own backtest harness,
+and every constant that could be fitted was fitted on those residuals. The
+numbers below are what the harness says, not what the fit said.
 
-Pick a player, pick the opposing defense, and set a yards line. The model
-simulates the game ~20,000 times and reports:
+## Pages
 
-- the **percentage chance of going over** the line (with fair betting odds),
-- an interactive **graph of the probability of every yardage outcome**,
-- projected mean / median yards, catches and targets,
-- outcome percentiles (floor, median, ceiling),
-- a plain-language read on the opposing defense.
+| Page | What it does |
+|---|---|
+| Receiving Yards | targets → catches → yards (completed air yards + YAC), vs a pass defense |
+| Rushing Yards | carries → stuffed / normal / explosive runs, before and after contact, vs six run-defense factors |
+| Touchdowns | rushing + receiving; TD rate = goal-line role × conversion, scoring scales with volume |
+| QB Sacks | sacks taken per dropback vs the opponent's pass rush, scaled by time to throw |
+| Interceptions | INTs thrown per attempt, heavily regressed, vs the opponent's secondary |
+| Team Strength | opponent-adjusted points per drive, pace, home field — the base of the game model |
+| Game Simulation | a real fixture: score distribution, win probability, box score, availability, wind |
+| Fantasy Projections | the whole slate scored per simulation (PPR / half / standard), floor and ceiling |
+| Pick'em | a 20-slot confidence card graded from the simulated margins and totals |
+| Backtest | every model scored week by week out of sample, vs the closing line and a trailing average |
 
-## How the model works
+Pages 1–5 pick players from the **live depth chart** with injury tags; a
+player's usage share blends his own history with his slot's prior (depth-chart
+rank averaged with a snap-count prior).
 
-Each simulated game is built one step at a time, drawing from distributions fit
-to the player's real game-to-game numbers (so **variance** is baked in, not just
-averages):
+## How the game model works
 
-1. **Team pass volume** — how many targets the player's offense throws (Normal
-   around the team's per-game average).
-2. **Target share** — the player's slice of those targets (Beta fit to their
-   mean & variance). Targets = volume × share.
-3. **Catch rate** — how many targets become catches (Beta fit to mean &
-   variance → Binomial).
-4. **Yards per catch** — driven by **average depth of target (aDOT)** plus
-   **yards-after-catch**, each catch drawn from a right-skewed Gamma so the odd
-   big play shows up like it does in real life.
+1. **Team strength** (`nflsim/teams.py`) — offensive and defensive points per
+   drive, solved jointly so a schedule of tough defenses is not held against an
+   offense, shrunk toward league by the drives behind each rating, recent
+   games weighted more. Home field and the return/safety scoring residual are
+   measured, not assumed.
+2. **Availability** (`nflsim/availability.py`) — the ratings describe a
+   *unit*; this layer asks who is actually playing. *QB familiarity* (the
+   starter's share of the dropbacks behind the rating, refined by his
+   efficiency vs the incumbents') and *defensive starters ruled out*
+   (snap-weighted, from the defensive depth chart as of kickoff) shift the
+   expected margin with coefficients fitted on out-of-sample residuals. The
+   offensive line is indexed and shown but not priced — the fitted effect is
+   within noise.
+3. **Drive engine** (`nflsim/game.py`) — one shared pace draw, then drives
+   resolved in sequence for both teams with a lead-dependent scoring rate
+   (leading teams sit on the ball, trailing teams press), calibrated so the
+   simulated spread equals the real conditional spread. Expected points are
+   pace-invariant, as the data says they are.
+4. **Allocation** (`nflsim/roster.py`) — Dirichlet shares spread targets and
+   carries across the depth chart; each player's own priors fill in catches
+   and yards; team touchdowns are split by goal-line role. Every box-score
+   identity holds in every simulation: targets sum to attempts, player
+   touchdowns to team touchdowns, passing yards to the receivers' yards.
 
-**Defense adjustment** (toggleable): for the chosen opponent it compares what
-that defense allows *to that position* — catch rate, aDOT, and yards per target —
-against the league average, and nudges the player's depth, catch rate and
-efficiency accordingly. Because one season of defense-vs-position data is a
-small sample, the adjustment is **shrunk toward league average** (strength is a
-slider; default 0.6).
+Recency: every feed carries one weight column — a season curve times a
+per-team, bye-aware game decay — and every rate, share and volume is a
+weighted estimate. The sidebar's *How much to trust this season* control sets
+both.
 
-Data comes from **nflverse** via `nfl_data_py` (regular-season only), and more
-recent seasons are weighted more heavily when building priors.
+## Out-of-sample performance (2025 season, fitted only on games before each week)
 
-## Files
+**Team layer** — 272 games:
 
-- `app.py` — the Streamlit dashboard (run this).
-- `model.py` — all the data + simulation logic (importable / runnable on its own).
-- `requirements.txt` — dependencies.
+| | margin RMSE | winners | log-loss |
+|---|---|---|---|
+| Model | 12.79 | 62.0% | 0.644 |
+| Closing line | 12.27 | 65.3% | 0.610 |
+
+2024 (fitted on 2022–23 + prior weeks): model 12.71 / 68.0% vs the line's
+12.61 / 71.3%. Win probabilities are calibrated; margins regress on
+predictions with slope ≈ 1.
+
+**Player models** vs a trailing weighted average of the stat (the baseline any
+model has to beat):
+
+| stat | MAE | naive MAE | 10–90 band covers | notes |
+|---|---|---|---|---|
+| Receiving yards | 22.8 | 23.1 | 87% | bias 0.0 in every quintile |
+| Rushing yards | 24.2 | 24.6 | 83% | |
+| Touchdowns | — | — | — | anytime-TD Brier 0.207 vs base rate 0.217 |
+
+Sacks and interceptions sit at their naive baselines. Everything above comes
+from the Backtest page (`nflsim/backtest.py`), which also shows the largest
+misses so the model can be argued with.
 
 ## Setup & run
 
 ```bash
-cd recyardsmodel
-python3 -m venv .venv && source .venv/bin/activate   # optional but recommended
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-streamlit run app.py
+streamlit run Home.py
 ```
 
-It opens in your browser. The first data load downloads a few MB from nflverse
-and is cached, so later interactions are fast.
+Data is pulled from nflverse releases (weekly player stats, play-by-play,
+depth charts, injuries, snap counts, PFR advanced rushing, NGS, schedules)
+and cached; a season's play-by-play is a few tens of MB on first load. The
+caches expire every six hours, so a long-running app picks up a new week on
+its own.
 
-Quick command-line sanity check without the dashboard:
+Command-line checks, no dashboard:
 
 ```bash
-python model.py
+python -m nflsim.game            # simulate one game and print the box score
+python -m nflsim.backtest 2025   # score the season out of sample
+python -m nflsim.calibrate 2024 2025          # refit report for the fitted constants
+python -m nflsim.calibrate 2024 2025 --write  # ...and update them in place
 ```
 
-## Notes & caveats
+## Maintaining it
 
-- Uses **season-level** player and defense numbers — it does not yet account for
-  injuries, weather, a new team/role mid-season, or specific coverage schemes
-  beyond what shows up in yards/aDOT allowed.
-- Defense splits vs a single position over one season are noisy; that's why the
-  adjustment is shrunk. Turn the strength down (or off) if you want the player's
-  pure baseline.
+The fitted constants rest on two seasons and should be refitted each
+off-season with `nflsim.calibrate`: the availability coefficients, the
+ratings' shrinkage (read off the calibration slope), the spread the engine
+reproduces, and the wind coefficient. The report prints current beside
+refitted with t-stats; `--write` changes only what is clearly different from
+zero. Then re-run the harness and commit.
+
+`ROADMAP.md` records every design decision and every finding, including the
+ones that did not pan out.
+
+## Caveats
+
+- The QB index measures "did not take the dropbacks behind this rating"; a
+  proven starter who changed teams is charged like a backup until he has
+  played, softened by his efficiency gap.
+- nflverse only records wind after the game; for an upcoming game, type the
+  forecast.
+- Depth charts and injury reports cannot be replayed for past weeks, so the
+  player backtests use the history-only path.
 - For research and entertainment.
