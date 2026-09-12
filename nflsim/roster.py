@@ -83,15 +83,17 @@ def current_season(seasons: tuple[int, ...],
 
 
 def load_live(seasons: tuple[int, ...],
-              depth_seasons: tuple[int, ...] | None = None) -> dict:
-    """Weekly priors + current depth charts + injuries + PFR, in one dict."""
+              depth_seasons: tuple[int, ...] | None = None,
+              recency: D.Recency = D.RECENCY_DEFAULT) -> dict:
+    """Weekly priors + current depth charts + injuries + PFR, in one dict.
+    `recency` sets the game weights on every feed (see `data.game_weights`)."""
     seasons = tuple(sorted(int(s) for s in seasons))
-    wk = D.load_weekly(seasons)
+    wk = D.load_weekly(seasons, recency)
     depth_seasons = current_season(seasons, depth_seasons)
-    pfr = D.load_pfr_rush(seasons)
+    pfr = D.load_pfr_rush(seasons, recency)
     agg, pfr_lg = R.pfr_rush_aggregates(pfr)
     return dict(
-        seasons=seasons, depth_seasons=depth_seasons, wk=wk,
+        seasons=seasons, depth_seasons=depth_seasons, recency=D.Recency(*recency), wk=wk,
         depth=D.load_depth_charts(depth_seasons),
         injuries=D.load_injuries(depth_seasons),
         pfr_agg=agg, pfr_lg=pfr_lg,
@@ -99,17 +101,28 @@ def load_live(seasons: tuple[int, ...],
     )
 
 
+def team_games(wk: pd.DataFrame, **sums) -> pd.DataFrame:
+    """One row per team-game with the requested column sums and the game's
+    recency weight `w`, e.g. `team_games(wk, tgt=("targets", "sum"))`."""
+    if "w" not in wk.columns:
+        wk = wk.assign(w=1.0)
+    return (wk.groupby(["recent_team", "season", "week"], as_index=False)
+              .agg(**dict(sums), w=("w", "first")))
+
+
 def team_volumes(wk: pd.DataFrame) -> dict:
-    """Per team: mean attempts, dropbacks and carries per game (plus league)."""
+    """Per team: recency-weighted mean attempts, dropbacks and carries per game
+    (plus league)."""
     db = "dropbacks" if "dropbacks" in wk.columns else "attempts"
-    tg = (wk.groupby(["recent_team", "season", "week"], as_index=False)
-            .agg(att=("attempts", "sum"), db=(db, "sum"), car=("carries", "sum"),
-                 tgt=("targets", "sum")))
-    out = {t: dict(attempts=float(g["att"].mean()), dropbacks=float(g["db"].mean()),
-                   carries=float(g["car"].mean()), targets=float(g["tgt"].mean()))
-           for t, g in tg.groupby("recent_team")}
-    out["_LEAGUE_"] = dict(attempts=float(tg["att"].mean()), dropbacks=float(tg["db"].mean()),
-                           carries=float(tg["car"].mean()), targets=float(tg["tgt"].mean()))
+    tg = team_games(wk, att=("attempts", "sum"), db=(db, "sum"),
+                    car=("carries", "sum"), tgt=("targets", "sum"))
+
+    def _row(g):
+        return dict(attempts=D.wmean(g["att"], g["w"]), dropbacks=D.wmean(g["db"], g["w"]),
+                    carries=D.wmean(g["car"], g["w"]), targets=D.wmean(g["tgt"], g["w"]))
+
+    out = {t: _row(g) for t, g in tg.groupby("recent_team")}
+    out["_LEAGUE_"] = _row(tg)
     return out
 
 
@@ -133,8 +146,12 @@ def injury_status(inj: pd.DataFrame, team: str, week: int | None = None) -> dict
 
 def _team_totals(wk: pd.DataFrame) -> pd.DataFrame:
     """Team targets and carries per game, for turning counts into shares."""
-    return (wk.groupby(["recent_team", "season", "week"], as_index=False)
-              .agg(team_tgt=("targets", "sum"), team_car=("carries", "sum")))
+    return team_games(wk, team_tgt=("targets", "sum"), team_car=("carries", "sum"))
+
+
+def _wsum(h: pd.DataFrame, col: str) -> float:
+    """Recency-weighted total of `col` over a player's games."""
+    return float((h[col] * h["w"]).sum())
 
 
 def build_roster(wk: pd.DataFrame, snapshot: pd.DataFrame, team: str,
@@ -195,13 +212,13 @@ def build_roster(wk: pd.DataFrame, snapshot: pd.DataFrame, team: str,
 
 
 def _league_rates(wk: pd.DataFrame) -> dict:
-    tg, rec = wk["targets"].sum(), wk["receptions"].sum()
-    ry, car = wk["receiving_yards"].sum(), wk["carries"].sum()
+    tg, rec = _wsum(wk, "targets"), _wsum(wk, "receptions")
+    ry, car = _wsum(wk, "receiving_yards"), _wsum(wk, "carries")
     return dict(
         catch=float(rec / tg) if tg > 0 else LG_CATCH_RATE,
         ypt=float(ry / tg) if tg > 0 else LG_YPT,
-        rec_td=float(wk["receiving_tds"].sum() / rec) if rec > 0 else 0.075,
-        rush_td=float(wk["rushing_tds"].sum() / car) if car > 0 else 0.025,
+        rec_td=float(_wsum(wk, "receiving_tds") / rec) if rec > 0 else 0.075,
+        rush_td=float(_wsum(wk, "rushing_tds") / car) if car > 0 else 0.025,
     )
 
 
@@ -215,20 +232,21 @@ def _player_row(pl: pd.Series, h: pd.DataFrame, totals: pd.DataFrame,
     car_prior = CARRY_ROLE_PRIOR.get((pos, depth), 0.005)
 
     if games:
-        w = h["season_w"].values
+        w = h["w"].values
         own_tgt = float(D.wmean(h["target_share"].values, w)) \
             if h["target_share"].sum() > 0 else _share_from_counts(h, totals, "targets")
         own_car = _share_from_counts(h, totals, "carries")
         tgt = blend * _safe(own_tgt, tgt_prior) + (1 - blend) * tgt_prior
         car = blend * _safe(own_car, car_prior) + (1 - blend) * car_prior
 
-        tg_tot, rec_tot = float(h["targets"].sum()), float(h["receptions"].sum())
-        ry_tot, car_tot = float(h["receiving_yards"].sum()), float(h["carries"].sum())
+        # Efficiency rates on recency-weighted totals, regressed toward league.
+        tg_tot, rec_tot = _wsum(h, "targets"), _wsum(h, "receptions")
+        ry_tot, car_tot = _wsum(h, "receiving_yards"), _wsum(h, "carries")
         catch = (rec_tot + CATCH_PRIOR_N * lg["catch"]) / (tg_tot + CATCH_PRIOR_N)
         ypt = (ry_tot + YPT_PRIOR_N * lg["ypt"]) / (tg_tot + YPT_PRIOR_N)
-        rec_td = ((float(h["receiving_tds"].sum()) + TD_RATE_PRIOR_N * lg["rec_td"])
+        rec_td = ((_wsum(h, "receiving_tds") + TD_RATE_PRIOR_N * lg["rec_td"])
                   / (rec_tot + TD_RATE_PRIOR_N))
-        rush_td = ((float(h["rushing_tds"].sum()) + TD_RATE_PRIOR_N * lg["rush_td"])
+        rush_td = ((_wsum(h, "rushing_tds") + TD_RATE_PRIOR_N * lg["rush_td"])
                    / (car_tot + TD_RATE_PRIOR_N))
         name = str(h["player_display_name"].iloc[-1])
         prev_team = str(h["recent_team"].iloc[-1])
@@ -269,10 +287,12 @@ def _safe(x, fallback):
 
 
 def _share_from_counts(h: pd.DataFrame, totals: pd.DataFrame, col: str) -> float:
-    """A player's share of team volume across the games he actually played."""
-    j = h.merge(totals, on=["recent_team", "season", "week"], how="left")
-    tot = j["team_tgt" if col == "targets" else "team_car"].sum()
-    return float(j[col].sum() / tot) if tot and tot > 0 else 0.0
+    """A player's share of team volume across the games he actually played,
+    recent games counting more."""
+    j = h.merge(totals.drop(columns="w", errors="ignore"),
+                on=["recent_team", "season", "week"], how="left")
+    tot = float((j["team_tgt" if col == "targets" else "team_car"] * j["w"]).sum())
+    return float((j[col] * j["w"]).sum() / tot) if tot and tot > 0 else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -340,10 +360,12 @@ def _pos_league(wk: pd.DataFrame, position: str) -> dict:
     p = wk[wk["position"] == position]
     if p.empty or p["targets"].sum() == 0:
         p = wk
-    tg, rec = float(p["targets"].sum()), float(p["receptions"].sum())
+    tg, rec = _wsum(p, "targets"), _wsum(p, "receptions")
+    yac = _wsum(p, "receiving_yards_after_catch")
     return dict(
-        adot=float(p["receiving_air_yards"].sum() / tg) if tg > 0 else 8.0,
-        yac_per_rec=float(p["receiving_yards_after_catch"].sum() / rec) if rec > 0 else 5.0,
+        adot=float(_wsum(p, "receiving_air_yards") / tg) if tg > 0 else 8.0,
+        air_per_rec=float((_wsum(p, "receiving_yards") - yac) / rec) if rec > 0 else 5.7,
+        yac_per_rec=float(yac / rec) if rec > 0 else 5.0,
         catch=float(rec / tg) if tg > 0 else LG_CATCH_RATE,
     )
 
@@ -358,6 +380,7 @@ def receiving_priors_from_role(wk: pd.DataFrame, row: pd.Series) -> dict:
         mu_catch=float(np.clip(row.get("catch_rate", lg["catch"]), 0.3, 0.95)),
         sd_catch=0.10,
         mu_adot=lg["adot"], sd_adot=3.0,
+        mu_air=lg["air_per_rec"], sd_air=2.5,
         yac_per_rec=lg["yac_per_rec"],
     )
 

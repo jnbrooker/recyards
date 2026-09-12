@@ -11,6 +11,7 @@ CURRENT team, which is what the team-volume lookups should use.
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -77,32 +78,71 @@ def live_share(row: pd.Series, share_col: str) -> float:
     return float(row.get(f"own_{share_col}", row[share_col]))
 
 
-def cached_live(seasons: tuple[int, ...]) -> dict:
-    return RO.load_live(tuple(sorted(seasons)))
+def priors_picker(label: str = "Seasons used to build priors",
+                  key: str = "seasons") -> tuple:
+    """The priors window every page shares: `(seasons, recency)`.
 
+    The visible control is "how much to trust this season" — a preset that
+    sets both the season curve and the within-season half-life (see
+    `data.Recency`), applied to every rate, share, volume and team rating. The
+    seasons multiselect sits under an *Advanced* expander: its default is the
+    most recent seasons nflverse has actually published, so the current season
+    joins the week its first stats file lands. Stops the page if no season is
+    selected.
+    """
+    from . import data as D
+    names = list(D.RECENCY_PRESETS)
+    choice = st.sidebar.select_slider(
+        "How much to trust this season", names, value="Balanced", key=f"{key}_recency",
+        help="**Long memory**: seasons count as flat blocks (×0.7 a year) — the "
+             "original curve; this season is under half the model until week 17.  \n"
+             "**Balanced**: ×0.85 a year, and a game 12 back counts half — this "
+             "season is half the model by week 9.  \n**Recent form**: ×0.7 a year, a "
+             "game 6 back counts half — the last six weeks dominate.  \n"
+             "Applies to every rate, share, volume and team rating on every page.")
+    recency = D.RECENCY_PRESETS[choice]
 
-def cached_rosters(seasons: tuple[int, ...], use_injuries: bool) -> pd.DataFrame:
-    return RO.league_rosters(cached_live(seasons), use_injuries)
+    options, defaults = D.season_choices()
+    with st.sidebar.expander("Advanced: seasons in the window"):
+        seasons = st.multiselect(
+            label, options, default=defaults, key=key,
+            help="Which seasons feed the priors. The current season is included "
+                 "automatically once it has data; how much each season counts is "
+                 "set by the recency control above.")
+    if not seasons:
+        st.sidebar.error("Pick at least one season.")
+        st.stop()
+    return tuple(int(s) for s in seasons), recency
 
 
 def season_picker(label: str = "Seasons used to build priors",
                   key: str = "seasons") -> tuple:
-    """The seasons multiselect every page shares.
+    """Seasons only (default recency) — kept for callers that don't thread the
+    recency through; new pages should use `priors_picker`."""
+    return priors_picker(label, key)[0]
 
-    Options run back from the current calendar year; the default is the most
-    recent seasons nflverse has actually published, so the current season joins
-    the defaults the week its first stats file lands and is weighted most
-    heavily from then on. Stops the page if nothing is selected.
-    """
+
+def recency_caption(wk: pd.DataFrame | None, recency, shares: dict | None = None) -> None:
+    """One sidebar line saying how the weight is spread across seasons —
+    computed from `wk`, or passed in as `shares` (`data.weight_shares`)."""
     from . import data as D
-    options, defaults = D.season_choices()
-    seasons = st.sidebar.multiselect(
-        label, options, default=defaults, key=key,
-        help="Recent seasons are weighted more heavily (1.0 / 0.7 / 0.45 / 0.3). "
-             "The current season is included automatically once it has data; "
-             "early in the year it carries few games, so its influence grows "
-             "week by week.")
-    if not seasons:
-        st.sidebar.error("Pick at least one season.")
-        st.stop()
-    return tuple(int(s) for s in seasons)
+    shares = shares if shares is not None else D.weight_shares(wk)
+    if not shares:
+        return
+    latest = max(shares)
+    parts = ", ".join(f"{s}: {v:.0%}" for s, v in sorted(shares.items(), reverse=True))
+    r = D.Recency(*recency)
+    tail = ("every game in a season counts equally" if not np.isfinite(r.half_life)
+            else f"each game back counts less (half after {r.half_life:g})")
+    st.sidebar.caption(f"Weight by season — {parts}. {latest} is "
+                       f"**{shares[latest]:.0%}** of the model; {tail}.")
+
+
+def cached_live(seasons: tuple[int, ...], recency=None) -> dict:
+    from . import data as D
+    return RO.load_live(tuple(sorted(seasons)), recency=recency or D.RECENCY_DEFAULT)
+
+
+def cached_rosters(seasons: tuple[int, ...], use_injuries: bool,
+                   recency=None) -> pd.DataFrame:
+    return RO.league_rosters(cached_live(seasons, recency), use_injuries)

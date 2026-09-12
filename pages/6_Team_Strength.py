@@ -17,21 +17,24 @@ st.set_page_config(page_title="Team Strength", page_icon="🏈", layout="wide")
 
 
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Downloading play-by-play (this one is a big file)…")
-def get_ratings(seasons):
+def get_ratings(seasons, recency):
     seasons = tuple(sorted(seasons))
-    drives = D.load_drives(seasons)
+    drives = D.load_drives(seasons, recency)
     if drives.empty:
         return None
-    return T.team_ratings(drives, D.load_games(seasons))
+    r = T.team_ratings(drives, D.load_games(seasons))
+    r["weight_shares"] = D.weight_shares(drives[drives["live"]], team_col="posteam")
+    return r
 
 
 st.sidebar.header("Setup")
-seasons = UI.season_picker("Seasons used to rate teams")
+seasons, recency = UI.priors_picker("Seasons used to rate teams")
 
-r = get_ratings(tuple(seasons))
+r = get_ratings(tuple(seasons), recency)
 if r is None:
     st.error("Play-by-play data did not load for those seasons — try another season.")
     st.stop()
+UI.recency_caption(None, recency, shares=r.get("weight_shares"))
 
 teams = list(r["off"].index)
 st.sidebar.divider()

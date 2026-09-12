@@ -58,8 +58,11 @@ EFF_SHRINK_SCALE = 0.6   # efficiency factor overlaps YBC/YAC → apply it softe
 FALLBACK_SHARE_SD = 0.06
 FALLBACK_YPC = 4.2
 YBC_FRACTION = 0.60      # fallback split of YPC into before/after contact
-LG_YBC_SD = 1.4          # fallback game-to-game SDs when no PFR history
-LG_YAC_SD = 1.0
+LG_YBC_SD = 0.6          # fallback game-to-game SDs when no PFR history
+LG_YAC_SD = 0.5          # (between-game, net of per-carry noise)
+MIN_SHARE_SD = 0.03      # floors on the between-game spread (data.between_sd)
+MIN_YBC_SD = 0.4
+MIN_YAC_SD = 0.3
 LG_BRK_RATE = 0.06
 
 BRK_PRIOR_N = 60.0       # carries-worth of regression on broken-tackle rate
@@ -70,16 +73,22 @@ BRK_PRIOR_N = 60.0       # carries-worth of regression on broken-tackle rate
 # ---------------------------------------------------------------------------
 
 def team_rush_volume(wk: pd.DataFrame) -> dict:
-    """Mean & std of total team carries per game, keyed by team (plus league)."""
-    tg = (wk.groupby(["recent_team", "season", "week"], as_index=False)
-            .agg(team_car=("carries", "sum")))
-    out = {}
-    for team, grp in tg.groupby("recent_team"):
-        out[team] = (float(grp["team_car"].mean()),
-                     float(grp["team_car"].std(ddof=1) or 4.0))
-    out["_LEAGUE_"] = (float(tg["team_car"].mean()),
-                       float(tg["team_car"].std(ddof=1) or 4.0))
+    """Recency-weighted mean & std of total team carries per game, keyed by
+    team (plus league)."""
+    tg = team_game_volume(wk, "carries")
+    out = {team: (D.wmean(grp["vol"], grp["w"]), D.wstd(grp["vol"], grp["w"], 4.0))
+           for team, grp in tg.groupby("recent_team")}
+    out["_LEAGUE_"] = (D.wmean(tg["vol"], tg["w"]), D.wstd(tg["vol"], tg["w"], 4.0))
     return out
+
+
+def team_game_volume(wk: pd.DataFrame, col: str) -> pd.DataFrame:
+    """One row per team-game: the team's total of `col` as `vol`, and the
+    game's recency weight `w` (1.0 if the frame is unweighted)."""
+    if "w" not in wk.columns:
+        wk = wk.assign(w=1.0)
+    return (wk.groupby(["recent_team", "season", "week"], as_index=False)
+              .agg(vol=(col, "sum"), w=("w", "first")))
 
 
 # ---------------------------------------------------------------------------
@@ -93,26 +102,34 @@ def pfr_rush_aggregates(pfr: pd.DataFrame) -> tuple[dict, dict]:
                       mu_yac=FALLBACK_YPC * (1 - YBC_FRACTION), brk=LG_BRK_RATE)
     if pfr is None or pfr.empty or "gsis_id" not in pfr.columns:
         return {}, lg_default
+    if "w" not in pfr.columns:
+        pfr = pfr.assign(w=1.0)
     have = pfr.dropna(subset=["gsis_id"])
     if have.empty:
         return {}, lg_default
-    g = (have.groupby("gsis_id")
-             .agg(pfr_games=("carries", "count"), car=("carries", "sum"),
-                  mu_ybc=("ybc_att", "mean"), sd_ybc=("ybc_att", "std"),
-                  mu_yac=("yac_att", "mean"), sd_yac=("yac_att", "std"),
-                  brk=("brk_rate", "mean")))
+    # Per-game means and SDs are recency-weighted; `car` is the weighted carry
+    # total the broken-tackle regression acts on.
     agg = {}
-    for gid, r in g.iterrows():
+    for gid, g in have.groupby("gsis_id"):
+        w = g["w"].values
+        car = g["carries"].values.astype(float)
+        mu_ybc, mu_yac = D.wmean(g["ybc_att"], w), D.wmean(g["yac_att"], w)
+        # per-game SDs net of the per-carry Gamma noise the simulator draws
         agg[gid] = dict(
-            pfr_games=int(r["pfr_games"]), car=float(r["car"]),
-            mu_ybc=float(r["mu_ybc"]), sd_ybc=float(r["sd_ybc"] if r["sd_ybc"] == r["sd_ybc"] else LG_YBC_SD),
-            mu_yac=float(r["mu_yac"]), sd_yac=float(r["sd_yac"] if r["sd_yac"] == r["sd_yac"] else LG_YAC_SD),
-            brk=float(r["brk"]),
+            pfr_games=int(len(g)), car=float((car * w).sum()),
+            mu_ybc=mu_ybc,
+            sd_ybc=D.between_sd(g["ybc_att"], w, (YBC_CV * max(mu_ybc, 0.5)) ** 2 / car,
+                                MIN_YBC_SD, LG_YBC_SD),
+            mu_yac=mu_yac,
+            sd_yac=D.between_sd(g["yac_att"], w, (YAC_CV * max(mu_yac, 0.5)) ** 2 / car,
+                                MIN_YAC_SD, LG_YAC_SD),
+            brk=D.wmean(g["brk_rate"], w),
         )
+    wcar = float((pfr["carries"] * pfr["w"]).sum())
     lg = dict(
-        mu_ybc=float((pfr["rushing_yards_before_contact"].sum() / pfr["carries"].sum())),
-        mu_yac=float((pfr["rushing_yards_after_contact"].sum() / pfr["carries"].sum())),
-        brk=float(pfr["rushing_broken_tackles"].sum() / pfr["carries"].sum()),
+        mu_ybc=float((pfr["rushing_yards_before_contact"] * pfr["w"]).sum() / wcar),
+        mu_yac=float((pfr["rushing_yards_after_contact"] * pfr["w"]).sum() / wcar),
+        brk=float((pfr["rushing_broken_tackles"] * pfr["w"]).sum() / wcar),
     )
     return agg, lg
 
@@ -130,14 +147,16 @@ def player_rush_priors(wk: pd.DataFrame, player_id: str,
     p = p[p["carries"] > 0]
     if p.empty:
         raise ValueError("No usable rushing games for this player.")
-    w = p["season_w"].values
+    w = p["w"].values
 
     team_car = (wk.groupby(["recent_team", "season", "week"])["carries"]
                   .sum().rename("team_car").reset_index())
     p = p.merge(team_car, on=["recent_team", "season", "week"], how="left")
     share = (p["carries"] / p["team_car"]).clip(0, 1).values
     mu_share = D.wmean(share, w)
-    sd_share = D.wstd(share, w, FALLBACK_SHARE_SD)
+    # Poisson noise on the carries behind a share: var(share) ~ share / team carries
+    sd_share = D.between_sd(share, w, np.clip(mu_share, 0.01, None) / np.clip(p["team_car"].values, 5, None),
+                            MIN_SHARE_SD, FALLBACK_SHARE_SD)
     mu_ypc = D.wmean((p["rushing_yards"] / p["carries"]).values, p["carries"].values * w)
     if not np.isfinite(mu_ypc):
         mu_ypc = FALLBACK_YPC
@@ -179,9 +198,11 @@ def _pfr_defense(wk: pd.DataFrame, pfr: pd.DataFrame | None) -> dict:
     """PFR-based front/tackling/broken-tackle ratios (the original three)."""
     if pfr is None or pfr.empty:
         rb = wk[wk["position"].isin(["RB", "FB"])]
-        d = (rb.groupby("opponent_team", as_index=False)
-               .agg(car=("carries", "sum"), ry=("rushing_yards", "sum")))
-        d = d[d["car"] >= 40]
+        rb = rb.assign(_w=rb["w"] if "w" in rb.columns else 1.0)
+        d = (rb.assign(w_car=rb["carries"] * rb["_w"], w_ry=rb["rushing_yards"] * rb["_w"])
+               .groupby("opponent_team", as_index=False)
+               .agg(car=("w_car", "sum"), ry=("w_ry", "sum"), raw_car=("carries", "sum")))
+        d = d[d["raw_car"] >= 40]
         d["ypc"] = d["ry"] / d["car"]
         lg = float(d["ry"].sum() / d["car"].sum())
         return {r["opponent_team"]: dict(r_ybc=float(r["ypc"] / lg), r_yac=float(r["ypc"] / lg),
@@ -190,12 +211,16 @@ def _pfr_defense(wk: pd.DataFrame, pfr: pd.DataFrame | None) -> dict:
                                          lg_ybc=lg * YBC_FRACTION, lg_yac=lg * (1 - YBC_FRACTION))
                 for _, r in d.iterrows()}
 
-    d = (pfr.groupby("opponent", as_index=False)
-           .agg(car=("carries", "sum"),
-                ybc=("rushing_yards_before_contact", "sum"),
-                yac=("rushing_yards_after_contact", "sum"),
-                brk=("rushing_broken_tackles", "sum")))
-    d = d[d["car"] >= 60]
+    # Weighted totals give the rates; raw carries guard the sample size.
+    x = pfr.assign(_w=pfr["w"] if "w" in pfr.columns else 1.0)
+    d = (x.assign(w_car=x["carries"] * x["_w"],
+                  w_ybc=x["rushing_yards_before_contact"] * x["_w"],
+                  w_yac=x["rushing_yards_after_contact"] * x["_w"],
+                  w_brk=x["rushing_broken_tackles"] * x["_w"])
+          .groupby("opponent", as_index=False)
+          .agg(car=("w_car", "sum"), ybc=("w_ybc", "sum"), yac=("w_yac", "sum"),
+               brk=("w_brk", "sum"), raw_car=("carries", "sum")))
+    d = d[d["raw_car"] >= 60]
     d["ybc_att"] = d["ybc"] / d["car"]
     d["yac_att"] = d["yac"] / d["car"]
     d["brk_rate"] = d["brk"] / d["car"]

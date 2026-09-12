@@ -17,8 +17,8 @@ st.set_page_config(page_title="Pick'em", page_icon="🏈", layout="wide")
 
 
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Loading play-by-play, depth charts and injuries…")
-def get_context(seasons):
-    return G.prepare(tuple(sorted(seasons)))
+def get_context(seasons, recency):
+    return G.prepare(tuple(sorted(seasons)), recency=recency)
 
 
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner=False)
@@ -27,8 +27,8 @@ def get_schedule(season):
 
 
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Simulating every game this week…")
-def get_slate(seasons, week, n_sims, use_injuries):
-    ctx = get_context(seasons)
+def get_slate(seasons, recency, week, n_sims, use_injuries):
+    ctx = get_context(seasons, recency)
     sched = get_schedule(ctx["depth_seasons"][-1])
     games = sched[sched["week"] == int(week)]
     return P.simulate_slate(ctx, games, n_sims=n_sims, use_injuries=use_injuries)
@@ -36,8 +36,9 @@ def get_slate(seasons, week, n_sims, use_injuries):
 
 # --- sidebar ----------------------------------------------------------------
 st.sidebar.header("Setup")
-seasons = UI.season_picker("Seasons used to build priors")
-ctx = get_context(tuple(seasons))
+seasons, recency = UI.priors_picker("Seasons used to build priors")
+ctx = get_context(tuple(seasons), recency)
+UI.recency_caption(ctx["wk"], recency)
 sched = get_schedule(ctx["depth_seasons"][-1])
 if sched.empty:
     st.error("The schedule did not load."); st.stop()
@@ -73,7 +74,7 @@ market_w = st.sidebar.slider(
          "flatters every underdog. Blending is the honest hedge against that.")
 
 # --- run ----------------------------------------------------------------------
-sims = get_slate(tuple(seasons), int(week), int(n_sims), use_inj)
+sims = get_slate(tuple(seasons), recency, int(week), int(n_sims), use_inj)
 games = sched[sched["week"] == int(week)].copy()
 games = games[games["game_id"].isin(sims.keys())]
 if exclude_played:

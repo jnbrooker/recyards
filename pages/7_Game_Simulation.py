@@ -18,8 +18,8 @@ st.set_page_config(page_title="Game Simulation", page_icon="🏈", layout="wide"
 
 
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Loading play-by-play, depth charts and injuries…")
-def get_context(seasons):
-    return G.prepare(tuple(sorted(seasons)))
+def get_context(seasons, recency):
+    return G.prepare(tuple(sorted(seasons)), recency=recency)
 
 
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner=False)
@@ -28,15 +28,16 @@ def get_schedule(season):
 
 
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner=False)
-def get_roster(seasons, team, use_injuries):
-    ctx = get_context(seasons)
+def get_roster(seasons, recency, team, use_injuries):
+    ctx = get_context(seasons, recency)
     return G.roster_for(ctx, team, use_injuries=use_injuries)
 
 
 st.sidebar.header("Setup")
-seasons = UI.season_picker("Seasons used to build priors")
+seasons, recency = UI.priors_picker("Seasons used to build priors")
 
-ctx = get_context(tuple(seasons))
+ctx = get_context(tuple(seasons), recency)
+UI.recency_caption(ctx["wk"], recency)
 ratings = ctx["ratings"]
 teams = list(ratings["off"].index)
 
@@ -78,8 +79,8 @@ st.caption(f"Depth charts from the {dseasons} season · priors from "
            f"{', '.join(str(s) for s in ratings['seasons'])} · {n_sims:,} simulations")
 
 try:
-    r_home = get_roster(tuple(seasons), home, use_inj)
-    r_away = get_roster(tuple(seasons), away, use_inj)
+    r_home = get_roster(tuple(seasons), recency, home, use_inj)
+    r_away = get_roster(tuple(seasons), recency, away, use_inj)
 except ValueError as e:
     st.error(str(e)); st.stop()
 

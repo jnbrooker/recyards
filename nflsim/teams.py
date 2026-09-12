@@ -14,7 +14,7 @@ average of what its drives produced after subtracting the defensive ratings of
 the units it actually faced, and vice versa. That is the SRS idea applied to
 points per drive, so a good offense that played a brutal schedule is not
 punished for it. Every rating is shrunk toward league average by how many drives
-it rests on, and recent seasons are weighted more heavily.
+it rests on, and recent seasons and recent games are weighted more heavily.
 
 The layer outputs, per matchup:
 
@@ -98,7 +98,9 @@ def team_ratings(drives: pd.DataFrame, games: pd.DataFrame | None = None,
     d = drives[drives["live"]].copy()
     if d.empty:
         raise ValueError("Drive table has no live drives.")
-    d["w"] = d["season_w"].astype(float)
+    # `w` is the recency weight from `data.load_drives` (season curve x
+    # within-season decay); an unweighted table counts every drive equally.
+    d["w"] = d["w"].astype(float) if "w" in d.columns else d.get("season_w", 1.0)
 
     lg_ppd = float((d["points"] * d["w"]).sum() / d["w"].sum())
     lg_td = float((d["is_td"] * d["w"]).sum() / d["w"].sum())

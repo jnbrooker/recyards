@@ -14,13 +14,13 @@ st.set_page_config(page_title="Touchdowns Simulator", page_icon="🏈", layout="
 
 
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Downloading NFL data…")
-def get_weekly(seasons):
-    return D.load_weekly(tuple(sorted(seasons)))
+def get_weekly(seasons, recency):
+    return D.load_weekly(tuple(sorted(seasons)), recency)
 
 
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner=False)
-def get_derived(seasons):
-    wk = get_weekly(seasons)
+def get_derived(seasons, recency):
+    wk = get_weekly(seasons, recency)
     g = (wk.groupby(["player_id", "player_display_name", "position"], as_index=False)
            .agg(rec=("receptions", "sum"), car=("carries", "sum"),
                 team=("recent_team", "last"), games=("week", "count")))
@@ -32,20 +32,20 @@ def get_derived(seasons):
 
 
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Loading live depth charts and injury reports…")
-def get_rosters(seasons, use_injuries):
-    return UI.cached_rosters(tuple(sorted(seasons)), use_injuries)
+def get_rosters(seasons, recency, use_injuries):
+    return UI.cached_rosters(tuple(sorted(seasons)), use_injuries, recency)
 
 
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner=False)
-def get_live_team_vol(seasons):
-    return UI.cached_live(tuple(sorted(seasons)))["team_vol"]
+def get_live_team_vol(seasons, recency):
+    return UI.cached_live(tuple(sorted(seasons)), recency)["team_vol"]
 
 
 st.sidebar.header("Setup")
-seasons = UI.season_picker("Seasons used to build priors")
+seasons, recency = UI.priors_picker("Seasons used to build priors")
 
 try:
-    wk = get_weekly(tuple(seasons))
+    wk = get_weekly(tuple(seasons), recency)
 except ValueError as e:
     st.error(str(e)); st.stop()
 
@@ -54,8 +54,9 @@ skipped = [s for s in seasons if s not in loaded]
 if skipped:
     st.sidebar.warning(f"No data yet for {', '.join(map(str, skipped))} — "
                        f"using {', '.join(map(str, loaded))}.")
+UI.recency_caption(wk, recency)
 
-players, defenses, lg, def_profiles = get_derived(tuple(seasons))
+players, defenses, lg, def_profiles = get_derived(tuple(seasons), recency)
 
 use_live = st.sidebar.toggle(
     "Pick from live depth charts", value=True,
@@ -65,7 +66,7 @@ use_live = st.sidebar.toggle(
 live_row = None
 if use_live:
     use_inj = st.sidebar.toggle("Drop players ruled out", value=True)
-    rosters = get_rosters(tuple(seasons), use_inj)
+    rosters = get_rosters(tuple(seasons), recency, use_inj)
     if rosters.empty:
         st.sidebar.error("Depth charts did not load — using history only."); use_live = False
     else:
@@ -97,9 +98,9 @@ try:
 except ValueError:
     if live_row is None:
         raise
-    pri = RO.td_priors_from_role(live_row, get_live_team_vol(tuple(seasons)), lg)
+    pri = RO.td_priors_from_role(live_row, get_live_team_vol(tuple(seasons), recency), lg)
 if live_row is not None:
-    tv = get_live_team_vol(tuple(seasons))
+    tv = get_live_team_vol(tuple(seasons), recency)
     tv = tv.get(live_row["team"], tv["_LEAGUE_"])
     pri["team"] = live_row["team"]
     pri = RO.scale_volume_priors(pri, "mu_rec", "var_rec",

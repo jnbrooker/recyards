@@ -23,7 +23,8 @@ Every stat module follows the existing template:
    yards.
 3. **Opponent adjustment with shrinkage** — compare what a defense allows vs
    league average, shrink toward league because one season of splits is noisy.
-4. **Recent seasons weighted more heavily** when building priors.
+4. **Recent seasons — and recent games — weighted more heavily** when building
+   priors (one weight column on every feed; §8.3).
 
 The game model adds two ideas on top:
 
@@ -234,6 +235,7 @@ and the drive table, so a session downloads each season's play-by-play once.
 | 6b | Schedule + fantasy ✅ | `data.load_schedule` (nflverse `games.csv`): pick a real game by week on page 7, closing line shown as a comparator. `nflsim/fantasy.py` + page 8: per-simulation PPR/half/standard scoring for the whole slate with floor/ceiling and an exact breakdown, plus a head-to-head lineup simulator that sums each side PER SIMULATION so stacks and same-game players keep their correlation (Burrow–Chase +0.41; players in different games 0.00). |
 | 6c | Pick'em card ✅ | `nflsim/pickem.py` + page 9. One pick per game (ATS or dog ML), 3-team ATS/ML parlays and 6-pt teaser, pool-named totals; every candidate graded from the simulated margin/total distribution, confidence 20→1 by expected return (flat or odds-weighted). Lines editable. A `market_weight` blend shifts each game's centre toward the line — the model's shrunk ratings see games as closer than the market, which flatters underdogs under odds-weighted scoring. |
 | 6 | Game dashboard ✅ | Page 7: projected box score, margin and total distributions, win probability and fair moneyline. |
+| 7 | Backtest harness ✅ | `nflsim/backtest.py` + page 10: rolling out-of-sample scoring of the team layer (vs the closing line) and the player models (vs a trailing average), per recency preset. First run fixed two receiving-model defects (§8.1). |
 
 Keep it as a **multi-page Streamlit app** — `recyards` becomes one page among
 several, sharing a common data/model utility layer.
@@ -249,11 +251,10 @@ several, sharing a common data/model utility layer.
    depth charts for the current season, with each player's share blending his
    own history and his positional-rank prior. Uploading a custom depth chart is
    still worth adding for hypotheticals ("what if this WR were the WR1").
-3. **Seasons window** — *partly answered.* The picker defaults to the three most
+3. ~~**Seasons window**~~ — answered. The window defaults to the three most
    recent seasons nflverse has published (`data.season_choices`), so the current
-   season joins automatically the week its first file lands and carries the top
-   weight (1.0 / 0.7 / 0.45) from then on. Still open: weighting *within* the
-   current season so the last 4–6 games count more than September (see §8).
+   season joins automatically the week its first file lands; how much each
+   season and each game counts is the recency control (§8.3).
 
 ---
 
@@ -293,61 +294,162 @@ rating if the box-score yardage needs its own anchor.*
 
 ## 8. What would make the models better next (ranked)
 
-1. **An out-of-sample backtest harness.** Every number above is in-sample. A
-   rolling weekly backtest (fit on weeks < w, score week w) for team margins /
-   totals (RMSE, log-loss on the winner) and for player props (Brier score on
-   P(over) at the model's own median) is the single most valuable addition: it
-   is the only way to tune any constant in this codebase honestly.
+1. ~~**An out-of-sample backtest harness.**~~ *Done 2026-09-12* —
+   `nflsim/backtest.py` + page 10. For each week of a scored season everything
+   is refitted on games before it (two prior seasons + earlier weeks), then the
+   week is predicted. Team layer: `expected_points` margin / total per game,
+   scored against the result and against the **closing line on the same
+   games**. Player layer: the five single-stat models on every player who
+   played that week with 5+ prior games and prop-worthy expected volume
+   (history-only path — depth charts and injury reports cannot be replayed
+   for past weeks), each as a full simulated distribution scored on MAE /
+   RMSE / bias, 10–90 coverage, median split, CRPS, and for counts the Brier
+   of P(≥1); a trailing weighted average is the naive baseline. Takes a
+   `Recency`, so it compares the presets.
+
+   **First results — 2025, 272 games, out of sample.** The in-sample table in
+   §4.1 said margin RMSE 12.7 / winner 67%; honestly scored it is:
+
+   | | margin RMSE | winner | log-loss | total RMSE | ATS vs close |
+   |---|---|---|---|---|---|
+   | Closing line | 12.27 | 65.3% | 0.611 | 13.19 | — |
+   | Long memory | 13.47 | 60.5% | 0.665 | 13.40 | 46.9% |
+   | **Balanced** | 13.38 | 59.0% | 0.658 | 13.38 | 49.8% |
+   | Recent form | 13.42 | 60.1% | 0.657 | 13.50 | 50.2% |
+
+   The model is ~1.1 points of RMSE behind the market and has no edge against
+   the spread — as a self-contained rating with no injury / QB / weather
+   information should be. The presets are within noise of each other on
+   teams; recency helps the margin *correlation* (0.32 → 0.41) but not RMSE.
+   Win probabilities are well calibrated at sd 13.5.
+
+   **What the harness found in the player models, and what was fixed.**
+   - **Receiving yards over-projected every receiver by ~10 yards** (bias
+     +9.5, MAE 24.8 vs a trailing average's 22.1). Cause: yards per catch was
+     built as *aDOT + YAC*, but aDOT is air yards per **target** and the deep
+     targets are the incomplete ones — completed passes travel 5.7 air yards
+     vs 7.8 per target, +2.1 yards on every catch. `model.player_priors` now
+     carries `mu_air` (completed air yards per reception) and simulates from
+     it; aDOT stays for display and the defense's depth ratio.
+   - **Every 80% band covered ~93%.** Cause: the per-game SD of a rate (catch
+     rate on six targets, yards per carry on twelve carries) is almost all
+     sampling noise — a receiver's per-game catch-rate SD is 0.209 observed,
+     0.205 of it binomial — and the simulator draws that noise itself, so it
+     was counted twice. `data.between_sd` removes the sampling component
+     (method of moments, floored) and receiving (`sd_ts`, `sd_catch`,
+     `sd_air`) and rushing (`sd_share`, `sd_ybc`, `sd_yac`) priors use it.
+     Coverage went 93% → 87% (receiving) and 86% → 81% (rushing).
+
+   After both fixes, Balanced: receiving MAE 22.9 (naive 22.1), bias +3.8,
+   CRPS 15.5; rushing MAE 24.6 (naive 24.0), bias +3.0, cover 81%; anytime-TD
+   Brier 0.208 vs the base rate's 0.217; sacks and INTs sit at their naive
+   baselines. The player models are calibrated but do **not yet beat a
+   trailing average on the mean** — that is the next item.
+
+1b. **Regress player priors toward the positional mean.** *(Found by #1.)*
+   The remaining receiving bias is entirely in the top quintile (projected 71,
+   actual 61; the bottom quintile is unbiased) and rushing shows the same
+   shape: a star's own history is taken at face value, with no regression.
+   The roster layer already does this for the game engine
+   (`CATCH_PRIOR_N`, `YPT_PRIOR_N`); the single-stat pages need the same on
+   target / carry share and on the per-touch efficiency terms, with the
+   pseudo-counts tuned by the harness (target: MAE below the naive baseline,
+   top-quintile bias ~0). Count-stat 10–90 coverage of ~95% is the discrete
+   band, not a defect.
 2. **Goal-line role for touchdowns.** §3.3 says goal-line role dominates and the
    pbp has `yardline_100`, but the TD weights are still share × TD rate. Each
    player's share of his team's carries/targets inside the 10 is the direct
    signal, and anytime-TD is the biggest player market.
-3. **Recency weighting — make it consistent, then add within-season decay.**
-   *(Audited 2026-09-11; not yet done. Everything needed to pick it up is here.)*
+3. ~~**Recency weighting — make it consistent, then add within-season decay.**~~
+   *Done 2026-09-12.* Every estimate in the suite is now a weighted one, and
+   every feed carries the same weight column.
 
-   **The curve today.** `data.season_weight(season, latest)` weights each GAME by
-   its season's age: current 1.0, one back 0.7, two back 0.45, older 0.3. With
-   the default three-season window the current season's share of the weight is
-   5% after 1 game, 17% after 4, 29% after 8, 38% after 12, 47% after 17 — it
-   never reaches half. (Two-season window: 40% by week 8, 59% by week 17.)
+   **What changed.**
+   - One helper, `data.game_weights(df, team_col, recency)`, stamps `season_w`
+     and `w` on any per-game frame. `w = season_decay ** (seasons ago) ×
+     0.5 ** (games_ago / half_life)`, where `games_ago` is counted **per team
+     over the games it actually played** (a dense rank of distinct
+     season-weeks, so a bye is not a game) and runs **continuously back
+     through earlier seasons** — last season's finale is a few games staler
+     than this season's opener, its week 1 a whole season staler. The first
+     draft decayed only the latest season and left earlier ones flat; that
+     inverted the ordering (a completed season weighed *less* than the one
+     before it), so it was replaced.
+   - The weekly feed (`recent_team`), drive table (`posteam`), designed-run
+     pbp (`defteam`) and PFR rush feed (`team`) all get `w` at load time. The
+     PFR loader now also keeps regular-season games only, like every other
+     feed.
+   - Every previously unweighted `.sum()` in a rate — sack/INT rates, catch
+     rate, yards per target, TD-per-touch, YAC per reception, every defensive
+     profile, team volume means and SDs, the pass-TD share, PFR per-player
+     aggregates and league means — is a `w`-weighted total. Sample-size
+     guards (`db >= 150`, `tgt >= 30`, …) still test raw counts, so a defence
+     is not dropped for being recent. The regression pseudo-counts act on the
+     weighted totals, so a rate built on old games is regressed harder — the
+     intended behaviour.
+   - `model.py` (page 1) no longer has its own loader; it filters
+     `data.load_weekly` to the receiving positions, so the receiving page
+     shares the cache, the schema aliases and the weights.
+   - The season curve is geometric (`season_decay ** gap`) rather than the
+     old `{1, 0.7, 0.45, 0.3}` table; at 0.7 the two differ by 0.04 at two
+     seasons back.
 
-   **The defect: the curve is applied inconsistently.**
-   - *Weighted* (uses `season_w` / `D.wmean`): team ratings and pace
-     (`teams.team_ratings`), target and carry shares (`roster._player_row`,
-     `rushing.player_rush_priors`), per-game volume means (`qb.qb_priors`
-     `mu_att`/`mu_db`, `touchdowns.player_td_priors` `mu_rec`/`mu_car`), rushing
-     YPC, NGS time-to-throw.
-   - *Unweighted — every game counts equally*: sack and INT rates
-     (`qb.qb_priors` sums, `qb.league_pass_rates`), catch rate / yards per target
-     / TD-per-touch rates (`roster._player_row`, `roster._league_rates`,
-     `touchdowns.player_td_priors` rate sums), every defensive profile
-     (`data.def_pass_rates`, `rushing._pfr_defense`, `data.rush_defense_pbp`,
-     `touchdowns.td_defense_profiles`), team volume distributions
-     (`game.team_pass_volume`, `rushing.team_rush_volume`, `roster.team_volumes`),
-     league baselines. So a player's *role* tracks the season while his
-     *efficiency* and the *defence he faces* stay mostly last year's until late.
+   **The control.** `ui.priors_picker` replaces the seasons multiselect with
+   one slider, *How much to trust this season*, mapped to `data.Recency`
+   presets; the multiselect survives under an *Advanced* expander. The
+   sidebar prints the resulting share of weight per season. Current-season
+   share with two prior seasons in the window:
 
-   **The plan, in order.**
-   1. Replace every unweighted `.sum()` in a rate estimate with a `season_w`-
-      weighted sum (`(x * w).sum() / (n * w).sum()`); the regression pseudo-counts
-      (`SACK_PRIOR_N`, `CATCH_PRIOR_N`, …) then act on weighted totals, which is
-      what they should do. Defensive profiles and team volumes likewise.
-   2. Add within-season decay: `game_weight = season_weight × 0.5 ** (games_ago
-      / HALF_LIFE)` with `HALF_LIFE ≈ 6` games, computed in `data.load_weekly`
-      and `data.load_drives` as a single `w` column so every consumer picks it
-      up for free. `games_ago` is per team (weeks since that game, bye-aware).
-   3. Expose one control — "how much to trust this season" — on the pages in
-      place of the hidden three-season multiselect, mapping to the half-life and
-      the season curve.
-   4. Then run the backtest harness (#1) with and without the change: recency
-      should help player props most and team ratings least.
+   | preset | (decay, half-life) | wk 1 | wk 4 | wk 8 | wk 12 | wk 17 |
+   |---|---|---|---|---|---|---|
+   | Long memory | (0.70, ∞) | 5% | 17% | 28% | 37% | 46% |
+   | **Balanced** (default) | (0.85, 12) | 8% | 27% | 46% | 59% | 70% |
+   | Recent form | (0.70, 6) | 16% | 47% | 70% | 82% | 90% |
+
+   *Long memory* reproduces the old flat curve to within a point, so it is the
+   "before" for any A/B. Scored by the harness (#1) on 2025: the three are
+   within noise of each other on team margins (RMSE 13.47 / 13.38 / 13.42) and
+   on player props; Balanced is marginally best on receiving and rushing,
+   Recent form on sacks. Recency was not the lever the audit hoped — the
+   player models' error is dominated by unregressed means (#1b), not stale
+   ones.
+
 4. **Snap counts as the role signal.** Depth-chart rank is coarse; nflverse's
    `snap_counts` release (offense snap %) predicts targets much better and
    would replace the rank prior for anyone with a few games of snaps.
-5. **QB-aware team ratings.** Team strength does not know who is at QB, and a
-   backup starting is the biggest single swing in the league. Cheap version:
-   when the depth-chart QB1 has fewer than N dropbacks in the drives that built
-   the rating, shrink the offense toward league by a QB-uncertainty factor.
+5. **Unit availability — who is actually playing.** *(Added 2026-09-12;
+   generalises the old "QB-aware team ratings" item.)* Team strength is a
+   rating of a *unit* over its recent drives; it does not know who is on the
+   field this week. Offensive skill players are already handled by the depth
+   chart (§4.4), but three things are not:
+
+   - **The QB.** The biggest single swing in the league. When the depth-chart
+     QB1 has few dropbacks in the drives that built the rating, the rating is
+     for a different offense.
+   - **The defense.** Defensive strength is a team rating plus opponent-grouped
+     splits; a starter ruled Out this week changes nothing until his absence
+     shows up in later drives. The feeds cover it: the depth-chart release has
+     `Base 3-4 D` / `Base 4-3 D` groups (11 starters per team, currently dropped
+     by `data.load_depth_charts`, which keeps skill positions only), injury
+     reports list every position, nflverse `snap_counts` carries weekly
+     `defense_pct` per player, and PFR `advstats_week_def` has pressures,
+     targets / yards allowed and missed tackles.
+   - **The offensive line** — same feeds (depth chart `3WR 1TE` group lists
+     OL, snap counts have `offense_pct`).
+
+   **Design: a team-level availability index, not a per-player model.** Per
+   unit, importance of each starter = his recency-weighted snap share × a
+   positional weight (QB ≫ EDGE ≈ CB ≈ LT > DT ≈ S ≈ LB); index = importance
+   of the starters ruled Out / Doubtful ÷ importance of all starters. The
+   unit's rating is then shrunk toward league (and pushed below it) in
+   proportion to the index, with **one coefficient per unit type fitted from
+   history**: injury reports and snap counts exist for 2024–25, so regress the
+   points-for / points-allowed residual after the ratings on that game's index.
+   If the defensive coefficient is not clearly different from zero, ship the QB
+   one and leave the defensive index as a display-only warning. The harness
+   (#1) exists now; `backtest.team_backtest` returns the per-game residuals
+   the fit needs.
+
 6. **Weather and roof.** nflverse schedules carry `roof`, `temp`, `wind`; pass
    volume and yards per attempt drop measurably in wind. Cheap multiplier.
 7. ~~**The market line as a comparator, not an anchor.**~~ Done — pages 7 and 8

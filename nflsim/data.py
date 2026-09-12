@@ -6,7 +6,7 @@ the same data. Responsibilities:
 
   * pull & cache nflverse weekly player stats (offense: passing/rushing/receiving)
   * pull & cache depth charts and injury reports (for the game simulator)
-  * season weighting (recent seasons weighted more heavily)
+  * recency weighting (recent seasons AND recent games weighted more heavily)
   * small shared stats helpers (weighted mean/std, Beta matching, shrinkage)
 
 Design note: this generalises the loader from the original receiving model so
@@ -20,6 +20,7 @@ import datetime as _dt
 import functools
 import time as _time
 import urllib.request
+from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
@@ -60,10 +61,97 @@ OFFENSE_POSITIONS = ["QB", "RB", "WR", "TE", "FB"]
 DEFAULT_DEF_SHRINK = 0.6
 
 
-def season_weight(season: int, latest: int) -> float:
+# ---------------------------------------------------------------------------
+# Recency: how much a game counts, by how long ago it was played
+# ---------------------------------------------------------------------------
+# Every rate, share and volume in the suite is a WEIGHTED estimate, and every
+# feed carries the same two columns so the weighting is consistent everywhere:
+#
+#   season_w  — the season curve: `season_decay ** (seasons ago)`
+#   w         — season_w × 0.5 ** (games_ago / half_life), where games_ago is
+#               counted PER TEAM over the games it has actually played, running
+#               continuously back through earlier seasons (bye-aware: a bye is
+#               not a game). So last season's finale is a few games staler than
+#               this season's opener, and its week 1 is a whole season staler.
+#
+# `Recency` is the single control the pages expose ("how much to trust this
+# season"); the presets below map it to the two constants. The current season's
+# share of the weight, with two prior seasons in the window:
+#
+#                  after week:   1     4     8    12    17
+#   Long memory  (0.70, inf)     5%   17%   28%   37%   46%   ← the pre-2026-09
+#   Balanced     (0.85, 12)      8%   27%   46%   59%   70%     flat curve
+#   Recent form  (0.70, 6)      16%   47%   70%   82%   90%
+#
+# Weighted totals shrink toward the regression pseudo-counts (SACK_PRIOR_N,
+# CATCH_PRIOR_N, …) faster than raw counts do, which is the intended behaviour:
+# a rate built on old games deserves more regression than one built on this
+# month's.
+
+class Recency(NamedTuple):
+    season_decay: float = 0.85   # weight multiplier per season of age
+    half_life: float = 12.0      # games; a game this many back counts half.
+                                 # inf = seasons as flat blocks (no game decay)
+
+
+RECENCY_DEFAULT = Recency()
+
+RECENCY_PRESETS = {
+    "Long memory": Recency(season_decay=0.7, half_life=float("inf")),
+    "Balanced": RECENCY_DEFAULT,
+    "Recent form": Recency(season_decay=0.7, half_life=6.0),
+}
+
+
+def season_weight(season: int, latest: int,
+                  season_decay: float = RECENCY_DEFAULT.season_decay) -> float:
     """More recent seasons carry more weight when building priors."""
-    gap = latest - season
-    return {0: 1.0, 1: 0.7, 2: 0.45}.get(gap, 0.3)
+    gap = max(int(latest) - int(season), 0)
+    return float(season_decay) ** gap
+
+
+def game_weights(df: pd.DataFrame, team_col: str,
+                 recency: Recency = RECENCY_DEFAULT,
+                 season_col: str = "season", week_col: str = "week") -> pd.DataFrame:
+    """Return `df` with `season_w` and `w` set (see the block comment above).
+
+    Works on any per-game frame with a season, a week and a team column: the
+    weekly player feed (`recent_team`), the drive table (`posteam`), pbp
+    (`defteam`) and PFR (`team`). `games_ago` is a dense rank of the distinct
+    (season, week) pairs each team has played, newest first, so a bye week does
+    not count as a game and the count runs straight through the off-season.
+    """
+    r = Recency(*recency)
+    out = df.copy()
+    if season_col not in out.columns or out.empty:
+        out["season_w"] = 1.0
+        out["w"] = 1.0
+        return out
+    season = pd.to_numeric(out[season_col], errors="coerce")
+    latest = int(season.max())
+    sw = np.power(float(r.season_decay), (latest - season).clip(lower=0).astype(float))
+    w = sw.to_numpy(dtype=float).copy()
+    if (np.isfinite(r.half_life) and r.half_life > 0
+            and week_col in out.columns and team_col in out.columns):
+        stamp = season * 100 + pd.to_numeric(out[week_col], errors="coerce")
+        ago = stamp.groupby(out[team_col]).rank(method="dense", ascending=False) - 1.0
+        w *= np.power(0.5, ago.to_numpy(dtype=float) / float(r.half_life))
+    out["season_w"] = sw.to_numpy(dtype=float)
+    out["w"] = w
+    return out
+
+
+def weight_shares(df: pd.DataFrame, team_col: str = "recent_team") -> dict:
+    """Share of total weight each season carries, over team-games. For the
+    sidebar caption: 'this season is 38% of the model'."""
+    if df is None or df.empty or "w" not in df.columns:
+        return {}
+    keys = [c for c in (team_col, "season", "week") if c in df.columns]
+    tg = df.drop_duplicates(keys)
+    tot = float(tg["w"].sum())
+    if tot <= 0:
+        return {}
+    return {int(s): float(v) for s, v in (tg.groupby("season")["w"].sum() / tot).items()}
 
 
 # ---------------------------------------------------------------------------
@@ -139,12 +227,8 @@ def _load_one_season(year: int) -> pd.DataFrame | None:
 
 
 @ttl_cache(maxsize=8)
-def load_weekly(seasons: tuple[int, ...]) -> pd.DataFrame:
-    """Regular-season weekly offensive lines for the given seasons (cached).
-
-    `seasons` is a tuple so it is hashable for lru_cache. Seasons not yet
-    available are skipped; if none load, a clear error is raised.
-    """
+def _load_weekly_raw(seasons: tuple[int, ...]) -> pd.DataFrame:
+    """The download half of `load_weekly` (cached); weights are applied on top."""
     frames, loaded, missing = [], [], []
     for yr in seasons:
         d = _load_one_season(int(yr))
@@ -178,10 +262,24 @@ def load_weekly(seasons: tuple[int, ...]) -> pd.DataFrame:
     if ("dropbacks" not in df.columns or df["dropbacks"].sum() <= 0)             and {"attempts", "sacks"} <= set(df.columns):
         df["dropbacks"] = df["attempts"] + df["sacks"]
 
-    latest = int(df["season"].max())
-    df["season_w"] = df["season"].map(lambda s: season_weight(int(s), latest))
     df.attrs["loaded_seasons"] = sorted(loaded)
     df.attrs["missing_seasons"] = sorted(missing)
+    return df
+
+
+def load_weekly(seasons: tuple[int, ...],
+                recency: Recency = RECENCY_DEFAULT) -> pd.DataFrame:
+    """Regular-season weekly offensive lines for the given seasons, with the
+    recency weights `season_w` / `w` on every row (see `game_weights`).
+
+    `seasons` is a tuple so it is hashable for the cache. Seasons not yet
+    available are skipped; if none load, a clear error is raised. The download
+    is cached; re-weighting for a different `recency` is a cheap copy.
+    """
+    raw = _load_weekly_raw(tuple(int(s) for s in seasons))
+    df = game_weights(raw, "recent_team", recency)
+    df.attrs.update(raw.attrs)
+    df.attrs["recency"] = tuple(Recency(*recency))
     return df
 
 
@@ -391,13 +489,12 @@ def _pfr_id_crosswalk() -> pd.DataFrame:
 
 
 @ttl_cache(maxsize=8)
-def load_pfr_rush(seasons: tuple[int, ...]) -> pd.DataFrame:
-    """PFR advanced weekly rushing (direct parquet): yards before/after contact and
-    broken tackles per game, keyed to gsis_id. Empty frame if unavailable — callers
-    fall back to a yards-per-carry split."""
+def _load_pfr_rush_raw(seasons: tuple[int, ...]) -> pd.DataFrame:
     d = _read_seasons(_PFR_RUSH_URL, seasons)
     if d.empty:
         return d
+    if "game_type" in d.columns:
+        d = d[d["game_type"] == "REG"]
     d = d[d["carries"] > 0].copy()
     d["ybc_att"] = d["rushing_yards_before_contact"] / d["carries"]
     d["yac_att"] = d["rushing_yards_after_contact"] / d["carries"]
@@ -408,6 +505,17 @@ def load_pfr_rush(seasons: tuple[int, ...]) -> pd.DataFrame:
     else:
         d["gsis_id"] = np.nan
     return d
+
+
+def load_pfr_rush(seasons: tuple[int, ...],
+                  recency: Recency = RECENCY_DEFAULT) -> pd.DataFrame:
+    """PFR advanced weekly rushing (direct parquet): yards before/after contact and
+    broken tackles per game, keyed to gsis_id, with recency weights `w`. Empty
+    frame if unavailable — callers fall back to a yards-per-carry split."""
+    d = _load_pfr_rush_raw(tuple(int(s) for s in seasons))
+    if d.empty:
+        return d
+    return game_weights(d, "team", recency)
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +603,26 @@ def wstd(x, w, fallback):
     return sd if sd > 1e-6 else fallback
 
 
+def between_sd(x, w, sampling_var, floor: float, fallback: float | None = None) -> float:
+    """The game-to-game spread of a per-game rate, net of its sampling noise.
+
+    A per-game catch rate on six targets, or yards per carry on twelve carries,
+    varies mostly because the sample is tiny — and the simulator already draws
+    that noise (Binomial on the targets, Gamma per carry). Feeding the raw
+    per-game SD in as a game-level wobble counts it twice, which is why the
+    first backtest found 80% bands covering 93% of outcomes. Method of moments:
+    true var = observed var - mean sampling var, floored at `floor`.
+    `sampling_var` is per game (same length as `x`).
+    """
+    x = np.asarray(x, float); w = np.asarray(w, float); sv = np.asarray(sampling_var, float)
+    m = np.isfinite(x) & np.isfinite(w) & (w > 0) & np.isfinite(sv)
+    if m.sum() < 3:
+        return float(fallback if fallback is not None else floor)
+    obs = wstd(x[m], w[m], 0.0) ** 2
+    noise = float(np.average(sv[m], weights=w[m]))
+    return float(max(np.sqrt(max(obs - noise, 0.0)), floor))
+
+
 def beta_params(mean, sd):
     """Beta(a,b) matched to a mean and std, guarded to stay valid."""
     mean = float(np.clip(mean, 1e-3, 1 - 1e-3))
@@ -572,14 +700,17 @@ def load_pbp_raw(seasons: tuple[int, ...]) -> pd.DataFrame:
     return pbp
 
 
-def load_pbp(seasons: tuple[int, ...]) -> pd.DataFrame:
+def load_pbp(seasons: tuple[int, ...],
+             recency: Recency = RECENCY_DEFAULT) -> pd.DataFrame:
     """Regular-season *designed-run* plays (QB scrambles, kneels and two-point
     plays removed) with the columns needed to score stuff / explosive /
-    efficiency. Empty frame if pbp is unavailable — callers then skip them."""
+    efficiency, weighted by recency (`w`, keyed on the defense's schedule since
+    the run-defense profile is the consumer). Empty frame if pbp is unavailable
+    — callers then skip them."""
     pbp = load_pbp_raw(seasons)
     if pbp.empty:
         return pbp
-    pbp = pbp.copy()
+    pbp = game_weights(pbp, "defteam", recency)
 
     # designed runs only
     is_run = (pbp.get("play_type") == "run")
@@ -606,6 +737,14 @@ def load_pbp(seasons: tuple[int, ...]) -> pd.DataFrame:
     return pbp
 
 
+def _wmean_by(df: pd.DataFrame, key, cols: list[str], w: str = "w") -> pd.DataFrame:
+    """Weighted mean of each column in `cols`, grouped by `key`."""
+    ww = df[w].astype(float)
+    num = df[cols].multiply(ww, axis=0).groupby(df[key] if isinstance(key, str) else key).sum()
+    den = ww.groupby(df[key] if isinstance(key, str) else key).sum()
+    return num.div(den, axis=0)
+
+
 def rush_defense_pbp(pbp: pd.DataFrame) -> dict:
     """Per-defense run factors from pbp, as ratios vs league.
 
@@ -619,24 +758,26 @@ def rush_defense_pbp(pbp: pd.DataFrame) -> dict:
     if pbp is None or pbp.empty or "gain" not in pbp.columns:
         return {}
     g = pbp.copy()
+    if "w" not in g.columns:
+        g["w"] = 1.0
     g["is_stuff"] = (g["gain"] <= STUFF_MAX).astype(float)
     g["is_expl"] = (g["gain"] >= EXPL_MIN).astype(float)
     g["is_expl15"] = (g["gain"] >= EXPL15_MIN).astype(float)
 
-    d = (g.groupby("defteam")
-           .agg(runs=("gain", "size"), stuff=("is_stuff", "mean"),
-                expl=("is_expl", "mean"), expl15=("is_expl15", "mean"),
-                succ=("succ", "mean"), epa=("epa", "mean"))
-           .reset_index())
-    d = d[d["runs"] >= MIN_DEF_RUNS]
+    # Rates are recency-weighted; the sample-size guard stays on raw run counts.
+    cols = ["is_stuff", "is_expl", "is_expl15", "succ", "epa"]
+    d = _wmean_by(g, "defteam", cols).rename(columns=dict(
+        is_stuff="stuff", is_expl="expl", is_expl15="expl15"))
+    d["runs"] = g.groupby("defteam")["gain"].size()
+    d = d[d["runs"] >= MIN_DEF_RUNS].reset_index()
     if d.empty:
         return {}
 
-    lg_stuff = float((g["is_stuff"].sum()) / len(g))
-    lg_expl = float((g["is_expl"].sum()) / len(g))
-    lg_expl15 = float((g["is_expl15"].sum()) / len(g))
-    lg_succ = float(g["succ"].mean())
-    lg_epa = float(g["epa"].mean(skipna=True))
+    lg_stuff = float(wmean(g["is_stuff"], g["w"]))
+    lg_expl = float(wmean(g["is_expl"], g["w"]))
+    lg_expl15 = float(wmean(g["is_expl15"], g["w"]))
+    lg_succ = float(wmean(g["succ"], g["w"]))
+    lg_epa = float(wmean(g["epa"], g["w"]))
 
     prof = {}
     for _, r in d.iterrows():
@@ -677,12 +818,14 @@ _DEAD_DRIVE_RESULTS = {"End of half", "End of game"}
 TURNOVER_RESULTS = {"Turnover", "Opp touchdown"}
 
 
-def load_drives(seasons: tuple[int, ...]) -> pd.DataFrame:
+def load_drives(seasons: tuple[int, ...],
+                recency: Recency = RECENCY_DEFAULT) -> pd.DataFrame:
     """One row per drive: posteam / defteam / result / points / red-zone flag.
 
     Columns: season, week, game_id, drive, posteam, defteam, result, points,
     plays, inside20, start_yl (yards from the opponent's end zone at the start),
-    is_td, is_fg, is_turnover, live (False for clock-artefact drives).
+    is_td, is_fg, is_turnover, live (False for clock-artefact drives), and the
+    recency weights season_w / w (keyed on the offense's schedule).
     Empty frame if the pbp feed or its drive columns are unavailable.
     """
     raw = load_pbp_raw(seasons)
@@ -710,9 +853,7 @@ def load_drives(seasons: tuple[int, ...]) -> pd.DataFrame:
     if "inside20" in g.columns:
         g["inside20"] = pd.to_numeric(g["inside20"], errors="coerce").fillna(0).astype(int)
 
-    latest = int(g["season"].max())
-    g["season_w"] = g["season"].map(lambda x: season_weight(int(x), latest))
-    return g
+    return game_weights(g, "posteam", recency)
 
 
 def load_games(seasons: tuple[int, ...]) -> pd.DataFrame:
@@ -788,23 +929,28 @@ def def_pass_rates(wk: pd.DataFrame) -> dict:
     if not {"sacks", "interceptions", "attempts", "dropbacks"} <= set(wk.columns):
         return {"_LEAGUE_": neutral}
 
-    g = (wk.groupby("opponent_team", as_index=False)
-           .agg(sacks=("sacks", "sum"), dropbacks=("dropbacks", "sum"),
-                ints=("interceptions", "sum"), atts=("attempts", "sum")))
-    lg_sack = float(g["sacks"].sum() / max(g["dropbacks"].sum(), 1))
-    lg_int = float(g["ints"].sum() / max(g["atts"].sum(), 1))
+    # Weighted totals give the rates; raw dropbacks/attempts guard sample size.
+    x = wk.assign(_w=wk["w"] if "w" in wk.columns else 1.0)
+    for c in ("sacks", "dropbacks", "interceptions", "attempts"):
+        x[f"w_{c}"] = x[c] * x["_w"]
+    g = (x.groupby("opponent_team", as_index=False)
+          .agg(sacks=("w_sacks", "sum"), dropbacks=("w_dropbacks", "sum"),
+               ints=("w_interceptions", "sum"), atts=("w_attempts", "sum"),
+               raw_db=("dropbacks", "sum"), raw_att=("attempts", "sum")))
+    lg_sack = float(g["sacks"].sum() / max(g["dropbacks"].sum(), 1e-9))
+    lg_int = float(g["ints"].sum() / max(g["atts"].sum(), 1e-9))
     lg_sack = lg_sack if lg_sack > 0 else LG_SACK_RATE
     lg_int = lg_int if lg_int > 0 else LG_INT_RATE
     prof = {}
     for _, r in g.iterrows():
         db, at = r["dropbacks"], r["atts"]
-        sack_rate = r["sacks"] / db if db >= 150 else lg_sack
-        int_rate = r["ints"] / at if at >= 150 else lg_int
+        sack_rate = r["sacks"] / db if r["raw_db"] >= 150 and db > 0 else lg_sack
+        int_rate = r["ints"] / at if r["raw_att"] >= 150 and at > 0 else lg_int
         prof[r["opponent_team"]] = dict(
             r_sack=float(sack_rate / lg_sack) if lg_sack > 0 else 1.0,
             r_int=float(int_rate / lg_int) if lg_int > 0 else 1.0,
             sack_rate_allowed=float(sack_rate), int_rate_allowed=float(int_rate),
-            lg_sack=lg_sack, lg_int=lg_int, pass_plays=int(db))
+            lg_sack=lg_sack, lg_int=lg_int, pass_plays=int(r["raw_db"]))
     prof["_LEAGUE_"] = dict(r_sack=1.0, r_int=1.0, sack_rate_allowed=lg_sack,
                             int_rate_allowed=lg_int, lg_sack=lg_sack, lg_int=lg_int,
                             pass_plays=0)
@@ -837,7 +983,8 @@ def load_ngs_pass(seasons: tuple[int, ...]) -> pd.DataFrame:
     return d.copy()
 
 
-def ngs_time_to_throw(ngs: pd.DataFrame) -> dict:
+def ngs_time_to_throw(ngs: pd.DataFrame,
+                      recency: Recency = RECENCY_DEFAULT) -> dict:
     """gsis_id -> avg_time_to_throw (seconds), plus league mean under key
     '_LEAGUE_'. Empty dict (league only) if the feed lacks the column.
 
@@ -863,7 +1010,8 @@ def ngs_time_to_throw(ngs: pd.DataFrame) -> dict:
 
     if "season" in d.columns:
         latest = int(d["season"].max())
-        d["w"] = d["season"].map(lambda s: season_weight(int(s), latest))
+        d["w"] = d["season"].map(
+            lambda s: season_weight(int(s), latest, Recency(*recency).season_decay))
     else:
         d["w"] = 1.0
     d = d[d[idcol].notna()]

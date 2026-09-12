@@ -78,14 +78,13 @@ XP_RATE = 0.96              # so a touchdown averages T.TD_POINTS
 # ---------------------------------------------------------------------------
 
 def team_pass_volume(wk: pd.DataFrame) -> dict:
-    """Mean & std of team DROPBACKS per game (attempts + sacks), by team."""
+    """Recency-weighted mean & std of team DROPBACKS per game (attempts +
+    sacks), by team."""
     col = "dropbacks" if "dropbacks" in wk.columns else "attempts"
-    tg = (wk.groupby(["recent_team", "season", "week"], as_index=False)
-            .agg(db=(col, "sum")))
-    out = {}
-    for team, grp in tg.groupby("recent_team"):
-        out[team] = (float(grp["db"].mean()), float(grp["db"].std(ddof=1) or 5.0))
-    out["_LEAGUE_"] = (float(tg["db"].mean()), float(tg["db"].std(ddof=1) or 5.0))
+    tg = R.team_game_volume(wk, col)
+    out = {team: (D.wmean(grp["vol"], grp["w"]), D.wstd(grp["vol"], grp["w"], 5.0))
+           for team, grp in tg.groupby("recent_team")}
+    out["_LEAGUE_"] = (D.wmean(tg["vol"], tg["w"]), D.wstd(tg["vol"], tg["w"], 5.0))
     return out
 
 
@@ -330,9 +329,10 @@ def _side_box(rng, wk, roster, team, opponent, drives, score, margin,
 def _team_pass_td_share(wk: pd.DataFrame, team: str) -> float:
     """Share of a team's offensive touchdowns that come through the air."""
     t = wk[wk["recent_team"] == team]
-    rec, rush = float(t["receiving_tds"].sum()), float(t["rushing_tds"].sum())
-    if rec + rush < 20:
+    if float(t["receiving_tds"].sum() + t["rushing_tds"].sum()) < 20:
         return LG_PASS_TD_SHARE
+    w = t["w"] if "w" in t.columns else 1.0
+    rec, rush = float((t["receiving_tds"] * w).sum()), float((t["rushing_tds"] * w).sum())
     return float(np.clip(rec / (rec + rush), 0.35, 0.85))
 
 
@@ -396,23 +396,26 @@ def summarize(sim: dict) -> dict:
 # One-call convenience wrapper
 # ---------------------------------------------------------------------------
 
-def prepare(seasons: tuple[int, ...], depth_seasons: tuple[int, ...] | None = None) -> dict:
+def prepare(seasons: tuple[int, ...], depth_seasons: tuple[int, ...] | None = None,
+            recency: D.Recency = D.RECENCY_DEFAULT) -> dict:
     """Load every feed the engine needs once, and build the shared pieces.
 
     `seasons` is the priors window (how teams and players have played); depth
     charts and injuries come from the season being played (see `roster.py`).
+    `recency` sets how much recent games count on every feed (`data.Recency`).
     """
-    live = RO.load_live(seasons, depth_seasons)
+    live = RO.load_live(seasons, depth_seasons, recency)
     wk = live["wk"]
-    drives = D.load_drives(live["seasons"])
-    ratings = T.team_ratings(drives, D.load_games(live["seasons"]))
+    seasons = live["seasons"]
+    drives = D.load_drives(seasons, recency)
+    ratings = T.team_ratings(drives, D.load_games(seasons))
     ratings["pass_def"] = D.def_pass_rates(wk)
     ctx = dict(live)
     ctx.update(
         ratings=ratings,
         pass_vol=team_pass_volume(wk), rush_vol=R.team_rush_volume(wk),
-        rush_def=R.rush_defense_profiles(wk, D.load_pfr_rush(live["seasons"]),
-                                         D.load_pbp(live["seasons"])),
+        rush_def=R.rush_defense_profiles(wk, D.load_pfr_rush(seasons, recency),
+                                         D.load_pbp(seasons, recency)),
         lg_pass=Q.league_pass_rates(wk),
     )
     return ctx

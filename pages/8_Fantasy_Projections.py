@@ -17,8 +17,8 @@ st.set_page_config(page_title="Fantasy Projections", page_icon="🏈", layout="w
 
 
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Loading play-by-play, depth charts and injuries…")
-def get_context(seasons):
-    return G.prepare(tuple(sorted(seasons)))
+def get_context(seasons, recency):
+    return G.prepare(tuple(sorted(seasons)), recency=recency)
 
 
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner=False)
@@ -27,8 +27,8 @@ def get_schedule(season):
 
 
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Simulating every game this week…")
-def get_week(seasons, week, rules_items, n_sims, use_injuries):
-    ctx = get_context(seasons)
+def get_week(seasons, recency, week, rules_items, n_sims, use_injuries):
+    ctx = get_context(seasons, recency)
     sched = get_schedule(ctx["depth_seasons"][-1])
     games = sched[sched["week"] == int(week)]
     return F.week_projections(ctx, games, dict(rules_items), n_sims=n_sims,
@@ -37,8 +37,9 @@ def get_week(seasons, week, rules_items, n_sims, use_injuries):
 
 # --- sidebar ----------------------------------------------------------------
 st.sidebar.header("Setup")
-seasons = UI.season_picker("Seasons used to build priors")
-ctx = get_context(tuple(seasons))
+seasons, recency = UI.priors_picker("Seasons used to build priors")
+ctx = get_context(tuple(seasons), recency)
+UI.recency_caption(ctx["wk"], recency)
 sched = get_schedule(ctx["depth_seasons"][-1])
 if sched.empty:
     st.error("The schedule did not load."); st.stop()
@@ -65,7 +66,7 @@ team_filter = st.sidebar.multiselect("Teams (blank = all)", sorted(ctx["ratings"
 min_proj = st.sidebar.slider("Hide players projected under", 0.0, 10.0, 2.0, 0.5)
 
 # --- run --------------------------------------------------------------------
-table, samples, summaries = get_week(tuple(seasons), int(week),
+table, samples, summaries = get_week(tuple(seasons), recency, int(week),
                                      tuple(sorted(rules.items())), int(n_sims), use_inj)
 
 st.title("🏈 Fantasy Projections")

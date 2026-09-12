@@ -42,20 +42,26 @@ DEFAULT_TD_DEF_SHRINK = 0.35
 # League positional TD rates (the regression targets)
 # ---------------------------------------------------------------------------
 
+def _wsum(g: pd.DataFrame, col: str) -> float:
+    """Recency-weighted total of `col` (plain total if the frame is unweighted)."""
+    w = g["w"] if "w" in g.columns else 1.0
+    return float((g[col] * w).sum())
+
+
 def league_td_rates(wk: pd.DataFrame) -> dict:
-    """League mean rec-TD-per-reception and rush-TD-per-carry, by position."""
+    """League mean rec-TD-per-reception and rush-TD-per-carry, by position
+    (recency-weighted)."""
     out = {}
     for pos, g in wk.groupby("position"):
-        rec = g["receptions"].sum()
-        car = g["carries"].sum()
+        rec, car = _wsum(g, "receptions"), _wsum(g, "carries")
         out[pos] = dict(
-            rec_td_per_rec=float(g["receiving_tds"].sum() / rec) if rec > 0 else 0.05,
-            rush_td_per_car=float(g["rushing_tds"].sum() / car) if car > 0 else 0.025,
+            rec_td_per_rec=float(_wsum(g, "receiving_tds") / rec) if rec > 0 else 0.05,
+            rush_td_per_car=float(_wsum(g, "rushing_tds") / car) if car > 0 else 0.025,
         )
     # sensible global fallbacks
     out["_ALL_"] = dict(
-        rec_td_per_rec=float(wk["receiving_tds"].sum() / max(wk["receptions"].sum(), 1)),
-        rush_td_per_car=float(wk["rushing_tds"].sum() / max(wk["carries"].sum(), 1)),
+        rec_td_per_rec=float(_wsum(wk, "receiving_tds") / max(_wsum(wk, "receptions"), 1e-9)),
+        rush_td_per_car=float(_wsum(wk, "rushing_tds") / max(_wsum(wk, "carries"), 1e-9)),
     )
     return out
 
@@ -81,7 +87,7 @@ def player_td_priors(wk: pd.DataFrame, player_id: str, lg: dict) -> dict:
     if p.empty:
         raise ValueError("No games for this player.")
     pos = p["position"].iloc[-1]
-    w = p["season_w"].values
+    w = p["w"].values
     prior = lg.get(pos, lg["_ALL_"])
 
     # --- expected volume per game (mean & variance for the NB draw) ---
@@ -92,11 +98,11 @@ def player_td_priors(wk: pd.DataFrame, player_id: str, lg: dict) -> dict:
     var_rec = np.average((rec_g - mu_rec) ** 2, weights=w) if len(rec_g) > 1 else mu_rec
     var_car = np.average((car_g - mu_car) ** 2, weights=w) if len(car_g) > 1 else mu_car
 
-    # --- regressed conversion rates ---
-    rec_tot = p["receptions"].sum()
-    car_tot = p["carries"].sum()
-    rec_td = p["receiving_tds"].sum()
-    rush_td = p["rushing_tds"].sum()
+    # --- regressed conversion rates (on recency-weighted totals) ---
+    rec_tot = _wsum(p, "receptions")
+    car_tot = _wsum(p, "carries")
+    rec_td = _wsum(p, "receiving_tds")
+    rush_td = _wsum(p, "rushing_tds")
     p_rec_td = (rec_td + REC_TD_PRIOR_N * prior["rec_td_per_rec"]) / (rec_tot + REC_TD_PRIOR_N)
     p_rush_td = (rush_td + RUSH_TD_PRIOR_N * prior["rush_td_per_car"]) / (car_tot + RUSH_TD_PRIOR_N)
 
@@ -119,20 +125,25 @@ def player_td_priors(wk: pd.DataFrame, player_id: str, lg: dict) -> dict:
 def td_defense_profiles(wk: pd.DataFrame) -> dict:
     """(defense, position) -> ratios of rec-TD/reception and rush-TD/carry
     allowed vs league. >1 = gives up more scores than average."""
-    d = (wk.groupby(["opponent_team", "position"], as_index=False)
-           .agg(rec=("receptions", "sum"), rtd=("receiving_tds", "sum"),
-                car=("carries", "sum"), rutd=("rushing_tds", "sum")))
+    # Weighted totals give the rates; raw counts guard the sample size.
+    x = wk.assign(_w=wk["w"] if "w" in wk.columns else 1.0)
+    for c in ("receptions", "receiving_tds", "carries", "rushing_tds"):
+        x[f"w_{c}"] = x[c] * x["_w"]
+    d = (x.groupby(["opponent_team", "position"], as_index=False)
+          .agg(rec=("w_receptions", "sum"), rtd=("w_receiving_tds", "sum"),
+               car=("w_carries", "sum"), rutd=("w_rushing_tds", "sum"),
+               raw_rec=("receptions", "sum"), raw_car=("carries", "sum")))
     lg = {}
     for pos, g in d.groupby("position"):
         lg[pos] = dict(
-            rec=float(g["rtd"].sum() / max(g["rec"].sum(), 1)),
-            rush=float(g["rutd"].sum() / max(g["car"].sum(), 1)),
+            rec=float(g["rtd"].sum() / max(g["rec"].sum(), 1e-9)),
+            rush=float(g["rutd"].sum() / max(g["car"].sum(), 1e-9)),
         )
     prof = {}
     for _, r in d.iterrows():
         pos = r["position"]; base = lg[pos]
-        rec_rate = r["rtd"] / r["rec"] if r["rec"] >= 25 else base["rec"]
-        rush_rate = r["rutd"] / r["car"] if r["car"] >= 25 else base["rush"]
+        rec_rate = r["rtd"] / r["rec"] if r["raw_rec"] >= 25 and r["rec"] > 0 else base["rec"]
+        rush_rate = r["rutd"] / r["car"] if r["raw_car"] >= 25 and r["car"] > 0 else base["rush"]
         prof[(r["opponent_team"], pos)] = dict(
             r_rec_td=float(rec_rate / base["rec"]) if base["rec"] > 0 else 1.0,
             r_rush_td=float(rush_rate / base["rush"]) if base["rush"] > 0 else 1.0,

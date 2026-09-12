@@ -54,10 +54,14 @@ def league_pass_rates(wk: pd.DataFrame) -> dict:
     schema change degrades to league-average rather than crashing a page.
     """
     q = wk[wk["position"] == "QB"]
-    at = float(q["attempts"].sum()) if "attempts" in q.columns else 0.0
-    db = float(q["dropbacks"].sum()) if "dropbacks" in q.columns else at
-    sacks = float(q["sacks"].sum()) if "sacks" in q.columns else 0.0
-    ints = float(q["interceptions"].sum()) if "interceptions" in q.columns else 0.0
+    w = q["w"] if "w" in q.columns else pd.Series(1.0, index=q.index)
+
+    def tot(col):
+        return float((q[col] * w).sum()) if col in q.columns else 0.0
+
+    at = tot("attempts")
+    db = tot("dropbacks") if "dropbacks" in q.columns else at
+    sacks, ints = tot("sacks"), tot("interceptions")
     return dict(
         sack=sacks / db if db > 0 and sacks > 0 else D.LG_SACK_RATE,
         intr=ints / at if at > 0 and ints > 0 else D.LG_INT_RATE,
@@ -82,7 +86,7 @@ def qb_priors(wk: pd.DataFrame, player_id: str, lg: dict,
     p = p[p["attempts"] > 0]
     if p.empty:
         raise ValueError("No usable passing games for this QB.")
-    w = p["season_w"].values
+    w = p["w"].values
     has_db = "dropbacks" in p.columns and p["dropbacks"].sum() > 0
 
     att = p["attempts"].values.astype(float)
@@ -94,10 +98,12 @@ def qb_priors(wk: pd.DataFrame, player_id: str, lg: dict,
     mu_db = D.wmean(db, w)
     var_db = np.average((db - mu_db) ** 2, weights=w) if len(db) > 1 else mu_db
 
-    sacks = p["sacks"].sum()
-    ints = p["interceptions"].sum()
-    db_tot = db.sum()
-    att_tot = att.sum()
+    # Rates on recency-weighted totals: the pseudo-count priors then regress a
+    # rate built on old games harder than one built on recent ones.
+    sacks = float((p["sacks"].values * w).sum())
+    ints = float((p["interceptions"].values * w).sum())
+    db_tot = float((db * w).sum())
+    att_tot = float((att * w).sum())
 
     p_sack = (sacks + SACK_PRIOR_N * lg["sack"]) / (db_tot + SACK_PRIOR_N)
     p_int = (ints + INT_PRIOR_N * lg["intr"]) / (att_tot + INT_PRIOR_N)
@@ -221,7 +227,7 @@ if __name__ == "__main__":
     wk = D.load_weekly(seasons)
     lg = league_pass_rates(wk)
     dpr = D.def_pass_rates(wk)
-    ttt = D.ngs_time_to_throw(D.load_ngs_pass(seasons))
+    ttt = D.ngs_time_to_throw(D.load_ngs_pass(seasons))  # default recency
     print(f"league sack rate {lg['sack']:.3f} / dropback | INT rate {lg['intr']:.3f} / att | "
           f"NGS QBs: {len(ttt)-1}")
 
