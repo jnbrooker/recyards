@@ -113,11 +113,14 @@ def _score_weeks(sched: pd.DataFrame, score_seasons, weeks=None):
 
 def team_backtest(score_seasons, n_prior: int = 2,
                   recency: D.Recency = D.RECENCY_DEFAULT,
-                  weeks=None, progress=None) -> pd.DataFrame:
+                  weeks=None, progress=None, availability: bool = False) -> pd.DataFrame:
     """One row per scored game: model margin/total vs actual and the closing line.
 
     Ratings (and home field, and the scoring-level calibration) are refitted
-    for every week on drives and finals from before that week only.
+    for every week on drives and finals from before that week only. With
+    `availability`, the QB-familiarity / defensive-starter margin shift
+    (`availability.py`, as knowable before each kickoff) is applied and the
+    indices are kept in the output.
     """
     seasons = window(score_seasons, n_prior)
     drives = D.load_drives(seasons)
@@ -159,6 +162,26 @@ def team_backtest(score_seasons, n_prior: int = 2,
     out = pd.DataFrame(rows)
     if out.empty:
         return out
+    if availability:
+        from . import availability as AV
+        idx = AV.historical_indices(score_seasons, n_prior, recency, weeks, progress)
+        key = idx.set_index(["game_id", "team"])
+        shift, qb_h, qb_a, df_h, df_a = [], [], [], [], []
+        for g, h, a in zip(out["game_id"], out["home"], out["away"]):
+            try:
+                ih, ia = key.loc[(g, h)].to_dict(), key.loc[(g, a)].to_dict()
+            except KeyError:
+                ih, ia = {}, {}
+            shift.append(0.5 * AV.margin_shift(ih, ia))
+            qb_h.append(ih.get("qb_idx", np.nan)); qb_a.append(ia.get("qb_idx", np.nan))
+            df_h.append(ih.get("def_idx", np.nan)); df_a.append(ia.get("def_idx", np.nan))
+        shift = np.array(shift)
+        out["pred_home"] += shift
+        out["pred_away"] -= shift
+        out["pred_margin"] = out["pred_home"] - out["pred_away"]
+        out["avail_shift"] = 2 * shift
+        out["qb_idx_home"], out["qb_idx_away"] = qb_h, qb_a
+        out["def_idx_home"], out["def_idx_away"] = df_h, df_a
     out["p_home"] = _norm_cdf(out["pred_margin"] / MARGIN_SD)
     out["line_p_home"] = _norm_cdf(out["line_margin"] / MARGIN_SD)
     return out
@@ -408,10 +431,13 @@ def player_metrics(pb: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def run(score_seasons, presets: dict | None = None, stats=("rec_yards", "rush_yards", "tds"),
-        n_prior: int = 2, n_sims: int = 4000, weeks=None, progress=None) -> dict:
+        n_prior: int = 2, n_sims: int = 4000, weeks=None, progress=None,
+        availability: bool = False) -> dict:
     """Team and player backtests for each recency preset.
 
-    Returns {"team": {preset: games df}, "player": {preset: rows df}}.
+    Returns {"team": {preset: games df}, "player": {preset: rows df}}. With
+    `availability`, the team layer is scored with the §8.5 margin shift and
+    a "<preset> (no availability)" row is added for comparison.
     """
     presets = presets or {"Balanced": D.RECENCY_DEFAULT}
     out = dict(team={}, player={})
@@ -420,7 +446,15 @@ def run(score_seasons, presets: dict | None = None, stats=("rec_yards", "rush_ya
         def prog(f, txt, i=i):
             if progress:
                 progress((i + f) / n, f"{name}: {txt}")
-        out["team"][name] = team_backtest(score_seasons, n_prior, rec, weeks, prog)
+        bt = team_backtest(score_seasons, n_prior, rec, weeks, prog, availability=availability)
+        out["team"][name] = bt
+        if availability and not bt.empty:
+            plain = bt.copy()
+            plain["pred_home"] -= plain["avail_shift"] / 2
+            plain["pred_away"] += plain["avail_shift"] / 2
+            plain["pred_margin"] = plain["pred_home"] - plain["pred_away"]
+            plain["p_home"] = _norm_cdf(plain["pred_margin"] / MARGIN_SD)
+            out["team"][f"{name} (no availability)"] = plain
         if stats:
             out["player"][name] = player_backtest(score_seasons, stats, n_prior, rec,
                                                   n_sims, weeks=weeks, progress=prog)

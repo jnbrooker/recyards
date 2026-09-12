@@ -154,8 +154,11 @@ def simulate_game(ratings: dict, wk: pd.DataFrame,
                   rush_def: dict | None = None,
                   lg_pass: dict | None = None,
                   home: str | None = "a",
-                  n_sims: int = 20000, seed: int | None = None) -> dict:
-    """Simulate the game `n_sims` times and return scores plus both box scores."""
+                  n_sims: int = 20000, seed: int | None = None,
+                  avail: dict | None = None) -> dict:
+    """Simulate the game `n_sims` times and return scores plus both box scores.
+    `avail` is `{team: availability indices}` (see `availability.py`) — the
+    same expected-points shift `teams.expected_points` applies."""
     rng = np.random.default_rng(seed)
     n = int(n_sims)
 
@@ -163,13 +166,18 @@ def simulate_game(ratings: dict, wk: pd.DataFrame,
     mix_b = T.matchup(ratings, team_b, team_a)
     pace = T.game_pace(ratings, team_a, team_b)
 
+    shift_a = shift_b = 0.0
+    if avail:
+        from . import availability as AV
+        shift_a = 0.5 * AV.margin_shift(avail.get(team_a), avail.get(team_b))
+        shift_b = -shift_a
     half = 0.5 * float(ratings.get("hfa", T.HFA_DEFAULT))
     if home in ("a", team_a):
-        mix_a = _apply_hfa(mix_a, +half, pace["mean"])
-        mix_b = _apply_hfa(mix_b, -half, pace["mean"])
+        shift_a, shift_b = shift_a + half, shift_b - half
     elif home in ("b", team_b):
-        mix_a = _apply_hfa(mix_a, -half, pace["mean"])
-        mix_b = _apply_hfa(mix_b, +half, pace["mean"])
+        shift_a, shift_b = shift_a - half, shift_b + half
+    mix_a = _apply_hfa(mix_a, shift_a, pace["mean"])
+    mix_b = _apply_hfa(mix_b, shift_b, pace["mean"])
 
     # 1. pace — one shared draw, both teams within a possession of each other
     base = rng.normal(pace["mean"], pace["sd"], n)
@@ -193,6 +201,7 @@ def simulate_game(ratings: dict, wk: pd.DataFrame,
         team_a=team_a, team_b=team_b, points_a=pts_a, points_b=pts_b,
         drives_a=drives_a, drives_b=drives_b, box_a=box_a, box_b=box_b,
         mix_a=mix_a, mix_b=mix_b, pace=pace, n_sims=n, home=home,
+        avail=avail, avail_shift_a=float(shift_a), avail_shift_b=float(shift_b),
     )
 
 
@@ -418,6 +427,13 @@ def prepare(seasons: tuple[int, ...], depth_seasons: tuple[int, ...] | None = No
                                          D.load_pbp(seasons, recency)),
         lg_pass=Q.league_pass_rates(wk),
     )
+    # who is actually playing this week (§8.5): QB familiarity and defensive
+    # starters ruled out, from the live depth charts and injury report
+    try:
+        from . import availability as AV
+        ctx["avail"] = AV.current_indices(live)
+    except Exception:
+        ctx["avail"] = {}
     return ctx
 
 

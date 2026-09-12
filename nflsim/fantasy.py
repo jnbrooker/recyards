@@ -141,7 +141,7 @@ def week_projections(ctx: dict, games: pd.DataFrame, rules: dict,
             sim = G.simulate_game(ratings, ctx["wk"], roster(home), roster(away),
                                   home, away, ctx["pass_vol"], ctx["rush_vol"],
                                   ctx["rush_def"], ctx["lg_pass"], home="a",
-                                  n_sims=n_sims, seed=seed + i)
+                                  n_sims=n_sims, seed=seed + i, avail=ctx.get("avail"))
         except ValueError as e:
             summaries.append(dict(game_id=g["game_id"], home=home, away=away,
                                   ok=False, error=str(e)))

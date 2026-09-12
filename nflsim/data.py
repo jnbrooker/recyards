@@ -376,55 +376,87 @@ def _read_seasons(url_tmpl, seasons):
 # (the raw feed is ~550k rows a season).
 SKILL_POSITIONS = ["QB", "RB", "FB", "WR", "TE"]
 
-# The offensive personnel group in the current depth-chart feed. Older releases
-# used `pos_grp == "OFF"`; both are accepted.
+# The personnel groups in the current depth-chart feed. Older releases used
+# `pos_grp == "OFF"` / plain positions; both are accepted.
 _OFFENSE_GROUPS = ("3WR 1TE", "OFF", "Offense")
+_DEFENSE_GROUPS = ("Base 3-4 D", "Base 4-3 D", "DEF", "Defense")
+
+# Defensive depth-chart positions (both feed generations), for the
+# availability layer. Side-specific abbreviations are kept as they come.
+DEF_POSITIONS = {"DE", "DT", "NT", "LDE", "RDE", "LDT", "RDT", "EDGE",
+                 "LB", "ILB", "MLB", "OLB", "WLB", "SLB", "LILB", "RILB", "LOLB", "ROLB",
+                 "CB", "LCB", "RCB", "NB", "NCB", "DB", "S", "FS", "SS"}
 
 
 @ttl_cache(maxsize=8)
-def load_depth_charts(seasons: tuple[int, ...]) -> pd.DataFrame:
-    """Offensive skill-position depth charts, normalised across feed versions.
+def load_depth_charts(seasons: tuple[int, ...], side: str = "offense") -> pd.DataFrame:
+    """Depth charts, normalised across feed versions.
 
-    The current release is a stream of dated snapshots (`dt`) with `pos_abb` and
-    `pos_rank`; older ones were weekly with `position` / `depth_team`. Both are
-    mapped onto: team, player_id, player_name, position, depth (1 = starter),
-    and `dt` as a timestamp. Empty frame if the feed is unavailable.
+    `side` is "offense" (skill positions only — what the game engine allocates
+    to), "defense" (every defensive slot, for the availability layer), or
+    "all". The current release is a stream of dated snapshots (`dt`) with
+    `pos_abb` and `pos_rank`; older ones were weekly with `position` /
+    `depth_team`. Both are mapped onto: team, player_id, player_name,
+    position, depth (1 = starter), `dt` as a timestamp, and season / week
+    when the feed carries them. Empty frame if the feed is unavailable.
     """
     dc = _read_seasons(_DEPTH_URL, seasons)
     if dc.empty:
         return dc
 
-    if "club_code" in dc.columns and "team" not in dc.columns:
-        dc = dc.rename(columns={"club_code": "team"})
-    if "pos_grp" in dc.columns:
-        grp = dc["pos_grp"].astype(str)
-        if grp.isin(_OFFENSE_GROUPS).any():
-            dc = dc[grp.isin(_OFFENSE_GROUPS)]
+    # The two feed generations name things differently; when several seasons
+    # of mixed generations are concatenated, coalesce each pair.
+    def _coalesce(*names):
+        have = [dc[n] for n in names if n in dc.columns]
+        if not have:
+            return None
+        col = have[0]
+        for other in have[1:]:
+            col = col.fillna(other)
+        return col
 
-    # position / depth / id, whichever generation of the feed this is
-    pos = "pos_abb" if "pos_abb" in dc.columns else "position"
-    depth = "pos_rank" if "pos_rank" in dc.columns else "depth_team"
-    pid = ("gsis_id" if "gsis_id" in dc.columns else
-           "player_id" if "player_id" in dc.columns else None)
-    if pos not in dc.columns or depth not in dc.columns or pid is None:
+    team = _coalesce("team", "club_code")
+    if "game_type" in dc.columns:           # older weekly feed includes playoffs
+        dc = dc[dc["game_type"].isna() | (dc["game_type"] == "REG")]
+        team = team.loc[dc.index]
+    if "pos_grp" in dc.columns and side != "all":
+        # group filter only where the row carries a group (the newer feed);
+        # older rows fall through to the position filter below
+        want = _OFFENSE_GROUPS if side == "offense" else _DEFENSE_GROUPS
+        keep = dc["pos_grp"].isna() | dc["pos_grp"].astype(str).isin(want)
+        dc, team = dc[keep], team[keep]
+
+    pos = _coalesce("pos_abb", "position")
+    depth = _coalesce("pos_rank", "depth_team")
+    pid = _coalesce("gsis_id", "player_id")
+    if pos is None or depth is None or pid is None or team is None:
         return pd.DataFrame()
 
     out = pd.DataFrame({
-        "team": dc["team"],
-        "player_id": dc[pid],
-        "player_name": dc.get("player_name", dc.get("full_name")),
-        "position": dc[pos].astype(str),
-        "depth": pd.to_numeric(dc[depth], errors="coerce"),
+        "team": team,
+        "player_id": pid,
+        "player_name": _coalesce("player_name", "full_name"),
+        "position": pos.astype(str),
+        "depth": pd.to_numeric(depth, errors="coerce"),
     })
-    if "dt" in dc.columns:
-        out["dt"] = pd.to_datetime(dc["dt"], errors="coerce", utc=True)
-    elif {"season", "week"} <= set(dc.columns):
-        # older weekly feed: synthesise an orderable stamp
-        out["dt"] = pd.to_datetime(dc["season"].astype(str), errors="coerce", utc=True)             + pd.to_timedelta(pd.to_numeric(dc["week"], errors="coerce") * 7, unit="D")
-    else:
-        out["dt"] = pd.NaT
+    for c in ("season", "week"):
+        if c in dc.columns:
+            out[c] = pd.to_numeric(dc[c], errors="coerce")
+    out["dt"] = (pd.to_datetime(dc["dt"], errors="coerce", utc=True)
+                 if "dt" in dc.columns else pd.NaT)
+    if {"season", "week"} <= set(dc.columns):
+        # older weekly feed: synthesise an orderable stamp — the Tuesday of
+        # that week in a September-start season, so `as_of` a kickoff picks
+        # the chart published for that week and not a later one
+        season_start = pd.to_datetime(dc["season"].astype("Int64").astype(str) + "-09-01",
+                                      errors="coerce", utc=True)
+        synth = season_start + pd.to_timedelta((pd.to_numeric(dc["week"], errors="coerce") - 1) * 7, unit="D")
+        out["dt"] = out["dt"].fillna(synth)
 
-    out = out[out["position"].isin(SKILL_POSITIONS)]
+    if side == "offense":
+        out = out[out["position"].isin(SKILL_POSITIONS)]
+    elif side == "defense":
+        out = out[out["position"].isin(DEF_POSITIONS)]
     return out.dropna(subset=["player_id", "depth"]).reset_index(drop=True)
 
 
@@ -516,6 +548,32 @@ def load_pfr_rush(seasons: tuple[int, ...],
     if d.empty:
         return d
     return game_weights(d, "team", recency)
+
+
+_SNAP_URL = ("https://github.com/nflverse/nflverse-data/releases/download/"
+             "snap_counts/snap_counts_{year}.parquet")
+
+
+@ttl_cache(maxsize=8)
+def load_snap_counts(seasons: tuple[int, ...]) -> pd.DataFrame:
+    """Per player-game snap shares (regular season), keyed to gsis_id via the
+    PFR crosswalk: season, week, team, opponent, player_id, position,
+    offense_pct, defense_pct. Empty frame if unavailable."""
+    d = _read_seasons(_SNAP_URL, seasons)
+    if d.empty:
+        return d
+    if "game_type" in d.columns:
+        d = d[d["game_type"] == "REG"]
+    xw = _pfr_id_crosswalk().rename(columns={"pfr_id": "pfr_player_id", "gsis_id": "player_id"})
+    d = d.merge(xw, on="pfr_player_id", how="left") if not xw.empty else d.assign(player_id=np.nan)
+    keep = ["season", "week", "team", "opponent", "player_id", "player", "position",
+            "offense_pct", "defense_pct", "offense_snaps", "defense_snaps"]
+    d = d[[c for c in keep if c in d.columns]].dropna(subset=["player_id"]).copy()
+    for c in ("offense_pct", "defense_pct", "offense_snaps", "defense_snaps"):
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
+    d["player_id"] = d["player_id"].astype(str)
+    return d.reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------

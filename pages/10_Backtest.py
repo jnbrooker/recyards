@@ -13,10 +13,12 @@ st.set_page_config(page_title="Backtest", page_icon="🏈", layout="wide")
 
 
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner=False)
-def run_backtest(score_seasons, preset_names, stats, n_prior, n_sims, weeks, _progress=None):
+def run_backtest(score_seasons, preset_names, stats, n_prior, n_sims, weeks, availability,
+                 _progress=None):
     presets = {n: D.RECENCY_PRESETS[n] for n in preset_names}
     return B.run(list(score_seasons), presets, stats=list(stats), n_prior=int(n_prior),
-                 n_sims=int(n_sims), weeks=list(weeks) or None, progress=_progress)
+                 n_sims=int(n_sims), weeks=list(weeks) or None, progress=_progress,
+                 availability=bool(availability))
 
 
 # --- sidebar ----------------------------------------------------------------
@@ -35,6 +37,11 @@ stats = st.sidebar.multiselect(
     format_func=lambda s: B.PLAYER_STATS[s]["label"])
 n_sims = st.sidebar.select_slider("Simulations per player-game", [1000, 2000, 4000, 8000],
                                   value=4000)
+availability = st.sidebar.toggle(
+    "Apply availability (QB / defensive starters)", value=True,
+    help="Shift each game's margin by the QB-familiarity and missing-defensive-"
+         "starter indices as they were knowable before kickoff (roadmap §8.5). "
+         "Adds a 'no availability' row per preset for comparison.")
 week_range = st.sidebar.slider("Weeks", 1, 18, (1, 18))
 weeks = tuple(range(week_range[0], week_range[1] + 1)) if week_range != (1, 18) else ()
 go_btn = st.sidebar.button("Run backtest", type="primary",
@@ -52,7 +59,7 @@ if "bt_args" not in st.session_state and not go_btn:
 if go_btn:
     st.session_state["bt_args"] = (tuple(sorted(int(s) for s in score_seasons)),
                                    tuple(preset_names), tuple(stats), int(n_prior),
-                                   int(n_sims), weeks)
+                                   int(n_sims), weeks, bool(availability))
 args = st.session_state["bt_args"]
 bar = st.progress(0.0, text="Fitting week by week…")
 res = run_backtest(*args, _progress=lambda f, t: bar.progress(min(f, 1.0), text=t))
@@ -85,7 +92,8 @@ st.caption("Lower is better for RMSE / MAE / log-loss / Brier; bias is predictio
            "likes more than the market covered the closing spread — 52.4% breaks even at "
            "-110. The **Closing line** row is the market scored on the same games.")
 
-best = min(res["team"], key=lambda n: B.team_metrics(res["team"][n]).loc["Model", "margin_rmse"])
+best = min((n for n in res["team"] if "(no availability)" not in n),
+           key=lambda n: B.team_metrics(res["team"][n]).loc["Model", "margin_rmse"])
 bt = res["team"][best]
 
 c1, c2 = st.columns(2)

@@ -326,13 +326,15 @@ def game_pace(r: dict, team_a: str, team_b: str) -> dict:
 
 
 def expected_points(r: dict, team_a: str, team_b: str,
-                    home: str | None = None) -> dict:
+                    home: str | None = None, avail: dict | None = None) -> dict:
     """A first, non-simulated read on the game: expected points for each team.
 
     `home` names which side is at home ("a", "b", or a team abbreviation); pass
-    None for a neutral site. This is the deterministic check that the ratings
-    behave — the drive engine (§4.2) replaces it with a simulation, but the
-    means should agree.
+    None for a neutral site. `avail` is `{team: availability indices}` (see
+    `availability.py`): the margin is shifted by the QB-familiarity and
+    defensive-starter differences with fitted coefficients, half to each side.
+    This is the deterministic check that the ratings behave — the drive engine
+    (§4.2) replaces it with a simulation, but the means should agree.
     """
     pace = game_pace(r, team_a, team_b)
     a = matchup(r, team_a, team_b)
@@ -347,6 +349,15 @@ def expected_points(r: dict, team_a: str, team_b: str,
     pts_b = (b["ppd"] * pace["mean"]
              + a["def_score_rate"] * pace["mean"] * TD_POINTS + other)
 
+    # Availability (§8.5): an unfamiliar QB or missing defensive starters move
+    # the MARGIN (fitted; no effect on the total), split like home field.
+    shift_a = shift_b = 0.0
+    if avail:
+        from . import availability as AV
+        shift_a = 0.5 * AV.margin_shift(avail.get(team_a), avail.get(team_b))
+        shift_b = -shift_a
+        pts_a, pts_b = pts_a + shift_a, pts_b + shift_b
+
     # Home field is split evenly: the home side gains half, the road side loses
     # half, so the total is untouched and only the margin moves.
     half = 0.5 * float(r.get("hfa", HFA_DEFAULT))
@@ -360,6 +371,7 @@ def expected_points(r: dict, team_a: str, team_b: str,
     return dict(team_a=team_a, team_b=team_b, drives=pace["mean"], home=side,
                 points_a=float(pts_a), points_b=float(pts_b),
                 margin=float(pts_a - pts_b), total=float(pts_a + pts_b),
+                avail_shift_a=float(shift_a), avail_shift_b=float(shift_b),
                 a=a, b=b)
 
 

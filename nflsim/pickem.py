@@ -100,7 +100,7 @@ def simulate_slate(ctx: dict, games: pd.DataFrame, n_sims: int = 10000,
             sim = G.simulate_game(ratings, ctx["wk"], roster(home), roster(away),
                                   home, away, ctx["pass_vol"], ctx["rush_vol"],
                                   ctx["rush_def"], ctx["lg_pass"], home="a",
-                                  n_sims=n_sims, seed=seed + i)
+                                  n_sims=n_sims, seed=seed + i, avail=ctx.get("avail"))
         except ValueError:
             continue
         out[g["game_id"]] = dict(

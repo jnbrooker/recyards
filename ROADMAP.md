@@ -236,6 +236,7 @@ and the drive table, so a session downloads each season's play-by-play once.
 | 6c | Pick'em card ✅ | `nflsim/pickem.py` + page 9. One pick per game (ATS or dog ML), 3-team ATS/ML parlays and 6-pt teaser, pool-named totals; every candidate graded from the simulated margin/total distribution, confidence 20→1 by expected return (flat or odds-weighted). Lines editable. A `market_weight` blend shifts each game's centre toward the line — the model's shrunk ratings see games as closer than the market, which flatters underdogs under odds-weighted scoring. |
 | 6 | Game dashboard ✅ | Page 7: projected box score, margin and total distributions, win probability and fair moneyline. |
 | 7 | Backtest harness ✅ | `nflsim/backtest.py` + page 10: rolling out-of-sample scoring of the team layer (vs the closing line) and the player models (vs a trailing average), per recency preset. First run fixed two receiving-model defects (§8.1). |
+| 8 | Availability layer ✅ | `nflsim/availability.py`: QB familiarity + defensive starters out, fitted on out-of-sample residuals as a margin shift (§8.5). 2025: 13.38 → 12.89 RMSE, 59% → 63% winners. |
 
 Keep it as a **multi-page Streamlit app** — `recyards` becomes one page among
 several, sharing a common data/model utility layer.
@@ -434,38 +435,47 @@ rating if the box-score yardage needs its own anchor.*
 4. **Snap counts as the role signal.** Depth-chart rank is coarse; nflverse's
    `snap_counts` release (offense snap %) predicts targets much better and
    would replace the rank prior for anyone with a few games of snaps.
-5. **Unit availability — who is actually playing.** *(Added 2026-09-12;
-   generalises the old "QB-aware team ratings" item.)* Team strength is a
-   rating of a *unit* over its recent drives; it does not know who is on the
-   field this week. Offensive skill players are already handled by the depth
-   chart (§4.4), but three things are not:
+5. ~~**Unit availability — who is actually playing.**~~ *Built and fitted
+   2026-09-12* — `nflsim/availability.py`, applied in `teams.expected_points`,
+   the drive engine, fantasy, pick'em and page 7; scored on page 10.
 
-   - **The QB.** The biggest single swing in the league. When the depth-chart
-     QB1 has few dropbacks in the drives that built the rating, the rating is
-     for a different offense.
-   - **The defense.** Defensive strength is a team rating plus opponent-grouped
-     splits; a starter ruled Out this week changes nothing until his absence
-     shows up in later drives. The feeds cover it: the depth-chart release has
-     `Base 3-4 D` / `Base 4-3 D` groups (11 starters per team, currently dropped
-     by `data.load_depth_charts`, which keeps skill positions only), injury
-     reports list every position, nflverse `snap_counts` carries weekly
-     `defense_pct` per player, and PFR `advstats_week_def` has pressures,
-     targets / yards allowed and missed tackles.
-   - **The offensive line** — same feeds (depth chart `3WR 1TE` group lists
-     OL, snap counts have `offense_pct`).
+   **Two indices, knowable before kickoff.** *QB familiarity* = 1 − the share
+   of the team's recency-weighted dropbacks in the priors window taken by this
+   week's starter (depth-chart QB1, or QB2 if he is Out). *Defensive
+   availability* = importance of the defensive starters ruled Out / Doubtful ÷
+   importance of all twelve starters (base front seven, secondary, nickel —
+   the depth chart's `Base 3-4 D` / `Base 4-3 D` group as of kickoff), where a
+   starter's importance is his recency-weighted defensive snap share
+   (`data.load_snap_counts`, joined by gsis id). `data.load_depth_charts` now
+   takes `side="defense"` and reconciles the two feed generations when
+   seasons are mixed.
 
-   **Design: a team-level availability index, not a per-player model.** Per
-   unit, importance of each starter = his recency-weighted snap share × a
-   positional weight (QB ≫ EDGE ≈ CB ≈ LT > DT ≈ S ≈ LB); index = importance
-   of the starters ruled Out / Doubtful ÷ importance of all starters. The
-   unit's rating is then shrunk toward league (and pushed below it) in
-   proportion to the index, with **one coefficient per unit type fitted from
-   history**: injury reports and snap counts exist for 2024–25, so regress the
-   points-for / points-allowed residual after the ratings on that game's index.
-   If the defensive coefficient is not clearly different from zero, ship the QB
-   one and leave the defensive index as a display-only warning. The harness
-   (#1) exists now; `backtest.team_backtest` returns the per-game residuals
-   the fit needs.
+   **Fitted, not guessed.** Both indices were reconstructed for every 2024–25
+   team-game (`historical_indices`) and regressed on the out-of-sample
+   residuals from the harness (#1). The finding that set the design: **the QB
+   effect is a margin effect, not a scoring effect** — −8.8 points of margin
+   per unit of QB-index difference (t = −7.2, n = 544), with no effect on the
+   total (t < 1.2 in either season). A backup QB costs his own side *and*
+   hands the opponent short fields. So the shift is applied to the margin,
+   half to each side, exactly like home field. The defensive index is
+   directionally consistent and monotone by bin (+12.1 margin per unit
+   difference; one or two key starters out ≈ +1.7 points to the opponent) but
+   only t ≈ 2 pooled — real, small.
+
+   **Out of sample, both directions:** fit on 2024 → 2025 takes margin RMSE
+   13.38 → 12.92 and winners 59.8% → 63.1%; fit on 2025 → 2024 takes 13.66 →
+   12.88. Almost all of it is the QB term; the defensive term adds ~0.04 of
+   RMSE. With the pooled coefficients the 2025 harness reads **12.89 RMSE /
+   63.1% winners vs the closing line's 12.27 / 65.3%** — half the gap to the
+   market closed, from one feature.
+
+   **Caveats / next.** The QB index says "did not take the dropbacks behind
+   this rating"; in the fit sample that was mostly injury backups, so a proven
+   starter who changed teams (2026: Tua to ATL, Cousins to LV) gets the same
+   average penalty until he has played. Weighting the index by the QB's own
+   prior efficiency vs the incumbent's is the obvious refinement. The
+   offensive line is not yet indexed (same feeds: `3WR 1TE` group lists OL,
+   snap counts have `offense_pct`).
 
 6. **Weather and roof.** nflverse schedules carry `roof`, `temp`, `wind`; pass
    volume and yards per attempt drop measurably in wind. Cheap multiplier.
