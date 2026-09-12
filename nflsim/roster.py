@@ -180,6 +180,7 @@ def build_roster(wk: pd.DataFrame, snapshot: pd.DataFrame, team: str,
 
     totals = _team_totals(wk)
     lg = _league_rates(wk)
+    lg["rush"] = R.league_rush_priors(wk)
     rows = []
     for _, pl in snap.iterrows():
         pid = str(pl["player_id"])
@@ -262,7 +263,8 @@ def _player_row(pl: pd.Series, h: pd.DataFrame, totals: pd.DataFrame,
     rush_priors = None
     if car > 0.02 and games:
         try:
-            rush_priors = R.player_rush_priors(h, str(pl["player_id"]), pfr_agg, pfr_lg)
+            rush_priors = R.player_rush_priors(h, str(pl["player_id"]), pfr_agg, pfr_lg,
+                                               lg=lg.get("rush"))
         except Exception:
             rush_priors = None
 

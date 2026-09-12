@@ -67,6 +67,13 @@ LG_BRK_RATE = 0.06
 
 BRK_PRIOR_N = 60.0       # carries-worth of regression on broken-tackle rate
 
+# Regression toward the positional / league mean (roadmap 8.1b): carry share
+# over SHARE_PRIOR_N games-worth of prior, per-carry yardage (YPC, and the PFR
+# before/after-contact split) over YPC_PRIOR_N carries-worth. Both act on
+# recency-weighted totals. Tuned on the 2025 backtest.
+SHARE_PRIOR_N = 2.0
+YPC_PRIOR_N = 40.0
+
 
 # ---------------------------------------------------------------------------
 # Team rush volume
@@ -138,49 +145,86 @@ def pfr_rush_aggregates(pfr: pd.DataFrame) -> tuple[dict, dict]:
 # Player priors
 # ---------------------------------------------------------------------------
 
+def league_rush_priors(wk: pd.DataFrame) -> dict:
+    """What the rushing priors regress toward: each position's mean carry share
+    (over every game a player appeared in) and the league yards per carry,
+    recency-weighted. Keyed by position plus "_ALL_"."""
+    d = wk if "w" in wk.columns else wk.assign(w=1.0)
+    team_car = (d.groupby(["recent_team", "season", "week"])["carries"]
+                  .sum().rename("team_car").reset_index())
+    d = d.merge(team_car, on=["recent_team", "season", "week"], how="left")
+    d["share"] = (d["carries"] / d["team_car"].clip(lower=1)).clip(0, 1)
+    car_w = float((d["carries"] * d["w"]).sum())
+    ypc = float((d["rushing_yards"] * d["w"]).sum() / car_w) if car_w > 0 else LG_YPC
+    out = {"_ALL_": dict(share=float(D.wmean(d["share"], d["w"])), ypc=ypc)}
+    for pos, g in d.groupby("position"):
+        out[pos] = dict(share=float(D.wmean(g["share"], g["w"])), ypc=ypc)
+    return out
+
+
 def player_rush_priors(wk: pd.DataFrame, player_id: str,
                        pfr_agg: dict | None = None,
-                       pfr_lg: dict | None = None) -> dict:
+                       pfr_lg: dict | None = None,
+                       lg: dict | None = None) -> dict:
     """Carry share (+variance) from the main feed, decomposed per-carry yardage
-    (YBC / YAC / broken tackles, each +variance) from PFR when available."""
-    p = wk[wk["player_id"] == player_id].copy()
-    p = p[p["carries"] > 0]
+    (YBC / YAC / broken tackles, each +variance) from PFR when available.
+    `lg` is `league_rush_priors(wk)` (computed here if omitted); share and
+    per-carry yardage are regressed toward it."""
+    allg = wk[wk["player_id"] == player_id].copy()   # every game he appeared in
+    p = allg[allg["carries"] > 0]                    # games with a carry (for the rates)
     if p.empty:
         raise ValueError("No usable rushing games for this player.")
+    lg = lg or league_rush_priors(wk)
+    prior = lg.get(str(p["position"].iloc[-1]), lg["_ALL_"])
     w = p["w"].values
 
     team_car = (wk.groupby(["recent_team", "season", "week"])["carries"]
                   .sum().rename("team_car").reset_index())
+    allg = allg.merge(team_car, on=["recent_team", "season", "week"], how="left")
     p = p.merge(team_car, on=["recent_team", "season", "week"], how="left")
+    # Share over every appearance (a no-carry game while active is a real
+    # outcome), regressed toward the position's mean share.
+    share_all = (allg["carries"] / allg["team_car"].clip(lower=1)).clip(0, 1).values
+    w_all = allg["w"].values
+    n_eff = float(w_all.sum())
+    mu_share_raw = D.wmean(share_all, w_all)
+    mu_share = ((mu_share_raw * n_eff + prior["share"] * SHARE_PRIOR_N) / (n_eff + SHARE_PRIOR_N)
+                if n_eff + SHARE_PRIOR_N > 0 else mu_share_raw)
     share = (p["carries"] / p["team_car"]).clip(0, 1).values
-    mu_share = D.wmean(share, w)
     # Poisson noise on the carries behind a share: var(share) ~ share / team carries
     sd_share = D.between_sd(share, w, np.clip(mu_share, 0.01, None) / np.clip(p["team_car"].values, 5, None),
                             MIN_SHARE_SD, FALLBACK_SHARE_SD)
-    mu_ypc = D.wmean((p["rushing_yards"] / p["carries"]).values, p["carries"].values * w)
-    if not np.isfinite(mu_ypc):
-        mu_ypc = FALLBACK_YPC
+    car_w = float((p["carries"] * p["w"]).sum())
+    mu_ypc_raw = D.wmean((p["rushing_yards"] / p["carries"]).values, p["carries"].values * w)
+    if not np.isfinite(mu_ypc_raw):
+        mu_ypc_raw = prior["ypc"]
+    mu_ypc = (mu_ypc_raw * car_w + prior["ypc"] * YPC_PRIOR_N) / (car_w + YPC_PRIOR_N)
 
     a = (pfr_agg or {}).get(player_id)
-    lg = pfr_lg or dict(mu_ybc=mu_ypc * YBC_FRACTION, mu_yac=mu_ypc * (1 - YBC_FRACTION), brk=LG_BRK_RATE)
+    pl = pfr_lg or dict(mu_ybc=prior["ypc"] * YBC_FRACTION,
+                        mu_yac=prior["ypc"] * (1 - YBC_FRACTION), brk=LG_BRK_RATE)
     if a is not None and a["pfr_games"] >= 3:
-        mu_ybc, sd_ybc = a["mu_ybc"], a["sd_ybc"]
-        mu_yac, sd_yac = a["mu_yac"], a["sd_yac"]
-        # regress broken-tackle rate toward league
+        # regress the before/after-contact split and the broken-tackle rate
+        # toward league on the (weighted) carries behind them
+        k = a["car"] / (a["car"] + YPC_PRIOR_N)
+        mu_ybc = k * a["mu_ybc"] + (1 - k) * pl["mu_ybc"]
+        mu_yac = k * a["mu_yac"] + (1 - k) * pl["mu_yac"]
+        sd_ybc, sd_yac = a["sd_ybc"], a["sd_yac"]
         brk = (a["brk"] * a["car"] + LG_BRK_RATE * BRK_PRIOR_N) / (a["car"] + BRK_PRIOR_N)
         source = f"PFR ({a['pfr_games']} g)"
     else:
-        # fallback: split YPC into league-typical before/after contact
+        # fallback: split (regressed) YPC into league-typical before/after contact
         mu_ybc = mu_ypc * YBC_FRACTION
         mu_yac = mu_ypc * (1 - YBC_FRACTION)
-        sd_ybc, sd_yac, brk = LG_YBC_SD, LG_YAC_SD, lg["brk"]
+        sd_ybc, sd_yac, brk = LG_YBC_SD, LG_YAC_SD, pl["brk"]
         source = "YPC split (no PFR history)"
 
     return dict(
         player_id=player_id, name=p["player_display_name"].iloc[-1],
         position=p["position"].iloc[-1], team=p["recent_team"].iloc[-1],
-        games=int(len(p)),
+        games=int(len(allg)),
         mu_share=float(np.clip(mu_share, 0.01, 0.95)), sd_share=float(sd_share),
+        raw_share=float(mu_share_raw), raw_ypc=float(mu_ypc_raw),
         mu_ypc=float(mu_ypc),
         mu_ybc=float(np.clip(mu_ybc, 0.5, 6.0)), sd_ybc=float(np.clip(sd_ybc, 0.4, 3.0)),
         mu_yac=float(np.clip(mu_yac, 0.5, 5.0)), sd_yac=float(np.clip(sd_yac, 0.3, 3.0)),

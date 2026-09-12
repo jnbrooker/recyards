@@ -244,11 +244,13 @@ def _prior_context(stat: str, wk_prior: pd.DataFrame, pfr_prior, pbp_prior) -> d
     if stat == "rec_yards":
         import model as M
         rec = wk_prior[wk_prior["position"].isin(M.RECEIVING_POSITIONS)]
-        return dict(M=M, tv=M.team_pass_volume(rec), defs=M.defense_profiles(rec))
+        return dict(M=M, tv=M.team_pass_volume(rec), defs=M.defense_profiles(rec),
+                    lg=M.league_priors(rec))
     if stat == "rush_yards":
         agg, lg = R.pfr_rush_aggregates(pfr_prior)
         return dict(agg=agg, lg=lg, tv=R.team_rush_volume(wk_prior),
-                    defs=R.rush_defense_profiles(wk_prior, pfr_prior, pbp_prior))
+                    defs=R.rush_defense_profiles(wk_prior, pfr_prior, pbp_prior),
+                    rush_lg=R.league_rush_priors(wk_prior))
     if stat == "tds":
         return dict(lg=TD.league_td_rates(wk_prior), defs=TD.td_defense_profiles(wk_prior))
     if stat in ("sacks", "ints"):
@@ -262,16 +264,18 @@ def _predict(stat: str, ctx: dict, wk_prior: pd.DataFrame, row: pd.Series,
     pid, team, opp = str(row["player_id"]), row["recent_team"], row["opponent_team"]
     if stat == "rec_yards":
         M = ctx["M"]
-        pri = M.player_priors(wk_prior, pid)
+        pri = M.player_priors(wk_prior, pid, ctx["lg"])
         tv = ctx["tv"].get(team, ctx["tv"]["_LEAGUE_"])
-        if pri["mu_ts"] * tv[0] < MIN_EXP_TARGETS:
+        # select on the player's own (unregressed) share so the candidate set
+        # does not move when the regression constants are tuned
+        if pri.get("raw_ts", pri["mu_ts"]) * tv[0] < MIN_EXP_TARGETS:
             return None
         return M.simulate(pri, tv, ctx["defs"].get((opp, pri["position"])),
                           n_sims=n_sims, seed=seed)["yards"]
     if stat == "rush_yards":
-        pri = R.player_rush_priors(wk_prior, pid, ctx["agg"], ctx["lg"])
+        pri = R.player_rush_priors(wk_prior, pid, ctx["agg"], ctx["lg"], lg=ctx["rush_lg"])
         tv = ctx["tv"].get(team, ctx["tv"]["_LEAGUE_"])
-        if pri["mu_share"] * tv[0] < MIN_EXP_CARRIES:
+        if pri.get("raw_share", pri["mu_share"]) * tv[0] < MIN_EXP_CARRIES:
             return None
         return R.simulate(pri, tv, ctx["defs"].get(opp), n_sims=n_sims, seed=seed)["yards"]
     if stat == "tds":

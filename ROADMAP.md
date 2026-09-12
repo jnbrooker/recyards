@@ -346,16 +346,33 @@ rating if the box-score yardage needs its own anchor.*
    baselines. The player models are calibrated but do **not yet beat a
    trailing average on the mean** — that is the next item.
 
-1b. **Regress player priors toward the positional mean.** *(Found by #1.)*
-   The remaining receiving bias is entirely in the top quintile (projected 71,
-   actual 61; the bottom quintile is unbiased) and rushing shows the same
-   shape: a star's own history is taken at face value, with no regression.
-   The roster layer already does this for the game engine
-   (`CATCH_PRIOR_N`, `YPT_PRIOR_N`); the single-stat pages need the same on
-   target / carry share and on the per-touch efficiency terms, with the
-   pseudo-counts tuned by the harness (target: MAE below the naive baseline,
-   top-quintile bias ~0). Count-stat 10–90 coverage of ~95% is the discrete
-   band, not a defect.
+1b. ~~**Regress player priors toward the positional mean.**~~ *Done
+   2026-09-12, tuned by #1.* Two causes behind the residual bias, both fixed:
+   - **Stars taken at face value.** The receiving priors now blend target
+     share with the position's mean over `TS_PRIOR_N = 3` games-worth, and
+     catch rate / air per catch / YAC per catch over 25 targets / 20
+     receptions-worth (`model.league_priors`); rushing blends carry share
+     over `SHARE_PRIOR_N = 2` games and YPC / the PFR contact split over 40
+     carries (`rushing.league_rush_priors`). All on recency-weighted totals.
+   - **Share estimated only from targeted (or carried) games.** A zero-target
+     game while active is a real outcome that the backtest — and a prop —
+     scores, and dropping those inflated mid-tier receivers' volume by ~15%.
+     Shares now use every appearance; rates still use the games with a touch.
+
+   The grid (2025, 2 000 sims, stable candidate set) put the pseudo-counts
+   where overall and top-quintile bias cross zero; MAE was flat beyond that.
+   Result, Balanced, 2025 out of sample: receiving MAE **22.8 vs naive 23.1**,
+   bias −0.0 (was +9.5 before #1's fixes), every quintile within ±2.5 yards;
+   rushing MAE **24.2 vs naive 24.6**, bias −0.6, 10–90 coverage 83%. The
+   harness selects candidates on the *unregressed* share (`raw_ts`,
+   `raw_share`) so the scored set does not move when the constants do.
+
+   Still open: regression toward one positional mean pulls low-share players
+   *up* (second quintile +2.5); a level-aware prior (WR1 vs WR4 — the depth
+   chart's role prior, once it can be replayed historically) would fix the
+   tail both ways. Count stats (TDs, sacks, INTs) sit at their naive
+   baselines and have not had this treatment.
+
 2. **Goal-line role for touchdowns.** §3.3 says goal-line role dominates and the
    pbp has `yardline_100`, but the TD weights are still share × TD rate. Each
    player's share of his team's carries/targets inside the 10 is the direct

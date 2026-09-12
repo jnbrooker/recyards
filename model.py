@@ -46,6 +46,16 @@ MIN_TS_SD = 0.03
 MIN_CATCH_SD = 0.04
 MIN_AIR_SD = 0.8
 
+# Regression toward the positional mean (roadmap 8.1b). A player's own history
+# is not taken at face value: his target share is blended with the position's
+# mean share over `TS_PRIOR_N` games-worth of prior, and his catch rate / air
+# yards per catch / YAC per catch over `CATCH_PRIOR_N` targets-worth and
+# `EFF_PRIOR_N` receptions-worth. All act on recency-WEIGHTED totals, so an old
+# history is regressed harder than a fresh one. Tuned on the 2025 backtest.
+TS_PRIOR_N = 3.0
+CATCH_PRIOR_N = 25.0
+EFF_PRIOR_N = 20.0
+
 # Per-catch yards are very right-skewed (a 5-yard slant vs a 60-yard bomb),
 # so we model them with a Gamma. This is the coefficient of variation of a
 # single catch's yardage; ~1.1 matches league-wide yards-per-reception spread.
@@ -121,20 +131,56 @@ def _wstd(x, w, fallback):
     return sd if sd > 1e-6 else fallback
 
 
-def player_priors(wk: pd.DataFrame, player_id: str) -> dict:
-    """Estimate a player's per-game distributions from their game logs."""
-    p = wk[wk["player_id"] == player_id].copy()
-    p = p[p["targets"] > 0]                      # games they were actually involved
+def league_priors(wk: pd.DataFrame) -> dict:
+    """Positional means the player priors are regressed toward: target share
+    (over games with a target), catch rate, completed air yards per catch and
+    YAC per catch — all recency-weighted. Keyed by position plus "_ALL_"."""
+    d = wk[wk["targets"] > 0]
+    if "w" not in d.columns:
+        d = d.assign(w=1.0)
+    yac_col = d.get("receiving_yards_after_catch", pd.Series(0.0, index=d.index))
+    out = {}
+    for pos, g in list(d.groupby("position")) + [("_ALL_", d)]:
+        w = g["w"].values
+        tg = float((g["targets"] * g["w"]).sum())
+        rec = float((g["receptions"] * g["w"]).sum())
+        yac = float((yac_col.loc[g.index] * g["w"]).sum())
+        out[pos] = dict(
+            ts=float(_wmean(g["target_share"].values, w)) if g["target_share"].notna().any() else 0.13,
+            catch=rec / tg if tg > 0 else 0.65,
+            air=(float((g["receiving_yards"] * g["w"]).sum()) - yac) / rec if rec > 0 else 5.7,
+            yac=yac / rec if rec > 0 else 5.2,
+        )
+    return out
+
+
+def player_priors(wk: pd.DataFrame, player_id: str, lg: dict | None = None) -> dict:
+    """Estimate a player's per-game distributions from their game logs.
+
+    `lg` is `league_priors(wk)`; computed here if not supplied (pass it when
+    calling in a loop).
+    """
+    allg = wk[wk["player_id"] == player_id].copy()   # every game he appeared in
+    p = allg[allg["targets"] > 0]                    # games with a target (for the rates)
     if p.empty:
         raise ValueError("No usable games for this player.")
+    lg = lg or league_priors(wk)
+    prior = lg.get(str(p["position"].iloc[-1]), lg["_ALL_"])
 
     w = p["w"].values                            # recency weight per game
+    n_eff = float(allg["w"].sum())               # games-worth of weighted history
 
-    # Target share: fraction of the team's targets this player draws.
-    ts = p["target_share"].values
-    if not np.isfinite(ts).any():
-        ts = (p["targets"] / p["targets"].sum() * len(p)).values  # crude fallback
-    mu_ts = _wmean(ts, w)
+    # Target share: fraction of the team's targets this player draws, over
+    # EVERY game he appeared in — a zero-target game while active is a real
+    # outcome (the backtest scores it, and a prop would have paid on it), and
+    # leaving those out overstated mid-tier receivers' volume by ~15%.
+    ts_all = allg["target_share"].fillna(0.0).values
+    if not np.isfinite(ts_all).any() or allg["target_share"].isna().all():
+        ts_all = (allg["targets"] / max(allg["targets"].sum(), 1) * len(allg)).values
+    ts = p["target_share"].fillna(0.0).values     # targeted games, for the spread
+    mu_ts_raw = _wmean(ts_all, allg["w"].values)
+    mu_ts = ((mu_ts_raw * n_eff + prior["ts"] * TS_PRIOR_N) / (n_eff + TS_PRIOR_N)
+             if n_eff + TS_PRIOR_N > 0 else mu_ts_raw)
     # sampling noise on a share of ~T team targets: Poisson on the player's
     # targets -> var(share) ~ share / T
     team_t = np.where(ts > 0, p["targets"].values / np.clip(ts, 1e-6, None), 30.0)
@@ -143,7 +189,10 @@ def player_priors(wk: pd.DataFrame, player_id: str) -> dict:
 
     # Catch rate per game.
     catch_g = (p["receptions"] / p["targets"]).clip(0, 1).values
-    mu_catch = _wmean(catch_g, p["targets"].values * w)   # weight by volume
+    tg_w = float((p["targets"] * p["w"]).sum())
+    mu_catch_raw = _wmean(catch_g, p["targets"].values * w)   # weight by volume
+    mu_catch = ((mu_catch_raw * tg_w + prior["catch"] * CATCH_PRIOR_N) / (tg_w + CATCH_PRIOR_N)
+                if tg_w + CATCH_PRIOR_N > 0 else mu_catch_raw)
     pc = float(np.clip(mu_catch, 0.05, 0.95))
     sd_catch = _D.between_sd(catch_g, w, pc * (1 - pc) / p["targets"].values,
                              MIN_CATCH_SD, FALLBACK_CATCH_SD)   # net of binomial noise
@@ -164,8 +213,9 @@ def player_priors(wk: pd.DataFrame, player_id: str) -> dict:
     rec_tot = float((p["receptions"] * p["w"]).sum())
     yac_tot = float((yac_col * p["w"]).sum())
     air_tot = float(((p["receiving_yards"] - yac_col) * p["w"]).sum())
-    yac_per_rec = float(yac_tot / rec_tot) if rec_tot > 0 else 4.0
-    mu_air = float(air_tot / rec_tot) if rec_tot > 0 else max(mu_adot - 2.0, 0.0)
+    den = rec_tot + EFF_PRIOR_N
+    yac_per_rec = (yac_tot + prior["yac"] * EFF_PRIOR_N) / den if den > 0 else prior["yac"]
+    mu_air = (air_tot + prior["air"] * EFF_PRIOR_N) / den if den > 0 else prior["air"]
     caught = p[p["receptions"] > 0]
     air_g = ((caught["receiving_yards"] - yac_col.loc[caught.index]) / caught["receptions"]).values
     # per-catch Gamma noise (cv YPR_CV) averaged over the game's catches
@@ -178,7 +228,7 @@ def player_priors(wk: pd.DataFrame, player_id: str) -> dict:
         name=p["player_display_name"].iloc[-1],
         position=p["position"].iloc[-1],
         team=p["recent_team"].iloc[-1],
-        games=int(len(p)),
+        games=int(len(allg)),
         mu_ts=float(np.clip(mu_ts, 0.01, 0.6)),
         sd_ts=float(sd_ts),
         mu_catch=float(np.clip(mu_catch, 0.3, 0.95)),
@@ -188,6 +238,10 @@ def player_priors(wk: pd.DataFrame, player_id: str) -> dict:
         mu_air=float(max(0.0, mu_air)),
         sd_air=float(sd_air),
         yac_per_rec=float(max(0.0, yac_per_rec)),
+        # unregressed, for display
+        raw_ts=float(mu_ts_raw), raw_catch=float(mu_catch_raw),
+        raw_ypr=float((air_tot + yac_tot) / rec_tot) if rec_tot > 0 else np.nan,
+        games_eff=n_eff,
     )
 
 
