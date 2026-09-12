@@ -26,10 +26,22 @@ numbers below are what the harness says, not what the fit said.
 | Fantasy Projections | the whole slate scored per simulation (PPR / half / standard), floor and ceiling |
 | Pick'em | a 20-slot confidence card graded from the simulated margins and totals |
 | Backtest | every model scored week by week out of sample, vs the closing line and a trailing average |
+| Prop Evaluation | this week's player-prop lines (The Odds API, on request) beside the model's frozen projection, settled automatically, graded against the book |
 
 Pages 1–5 pick players from the **live depth chart** with injury tags; a
 player's usage share blends his own history with his slot's prior (depth-chart
-rank averaged with a snap-count prior).
+rank averaged with a snap-count prior). Each has a **Game / Season** view:
+*Game* picks a fixture (week → game → player) and takes the opponent, home
+field, availability, wind and the pre-game script from the engine; *Season* is
+the player's typical game against any defense.
+
+**Player props** need a line source the free data does not have. Put an
+Odds API key (the-odds-api.com, free tier) in `.streamlit/secrets.toml` as
+`ODDS_API_KEY = "..."`; the Prop Evaluation page fetches this week's lines
+only when asked (~32 credits for two markets across a slate), freezes the
+model's projection at that moment, fills in the actuals once games are
+played, and grades mean or median against the line and P(over) against the
+book's vig-free probability. The ledger is `props/ledger.csv`.
 
 ## How the game model works
 

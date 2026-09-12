@@ -640,6 +640,16 @@ rating if the box-score yardage needs its own anchor.*
    between the two. Judkins as a 14-point road dog: 13.8 carries in season
    view, 12.8 in game view, where the old engine had him at 11.1.
 
+10. **Prop evaluation.** *(Added 2026-09-12.)* Player-prop lines from The
+    Odds API (user's key, fetched only on request, ~32 credits a week for two
+    markets), recorded in `props/ledger.csv` with the model's Game-view
+    projection **frozen at fetch time** so nothing is re-projected after the
+    fact; actuals fill in from the weekly feed; graded as mean/median vs the
+    line and P(over) vs the book's vig-free probability (Brier, calibration,
+    hit rate at a chosen edge), by week, game, market and book. The history
+    accumulates from the first fetch — the free tier has no historical props.
+    Re-fetching near kickoff records the closing line, the honest benchmark.
+
 ## 9. Maintenance
 
 Several constants are fitted on out-of-sample residuals and rest on two
