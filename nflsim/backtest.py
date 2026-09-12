@@ -55,6 +55,10 @@ MIN_EXP_CARRIES = 5.0
 MIN_EXP_TOUCHES = 4.0
 MIN_EXP_ATTEMPTS = 15.0
 
+# Goal-line role (8.2) in the touchdown priors; False scores the old positional-
+# mean regression for A/B.
+USE_GOAL_LINE = True
+
 PLAYER_STATS = {
     "rec_yards": dict(label="Receiving yards", positions=("WR", "TE", "RB"), count=False),
     "rush_yards": dict(label="Rushing yards", positions=("RB", "QB", "WR", "FB"), count=False),
@@ -262,7 +266,8 @@ def weekly(bt: pd.DataFrame) -> pd.DataFrame:
 # Player layer
 # ---------------------------------------------------------------------------
 
-def _prior_context(stat: str, wk_prior: pd.DataFrame, pfr_prior, pbp_prior) -> dict:
+def _prior_context(stat: str, wk_prior: pd.DataFrame, pfr_prior, pbp_prior,
+                   touches_prior=None) -> dict:
     """The league / defense / volume inputs each model needs, from prior games only."""
     if stat == "rec_yards":
         import model as M
@@ -275,7 +280,9 @@ def _prior_context(stat: str, wk_prior: pd.DataFrame, pfr_prior, pbp_prior) -> d
                     defs=R.rush_defense_profiles(wk_prior, pfr_prior, pbp_prior),
                     rush_lg=R.league_rush_priors(wk_prior))
     if stat == "tds":
-        return dict(lg=TD.league_td_rates(wk_prior), defs=TD.td_defense_profiles(wk_prior))
+        gl = (TD.goal_line_profiles(touches_prior, wk_prior)
+              if USE_GOAL_LINE and touches_prior is not None and not touches_prior.empty else None)
+        return dict(lg=TD.league_td_rates(wk_prior), defs=TD.td_defense_profiles(wk_prior), gl=gl)
     if stat in ("sacks", "ints"):
         return dict(lg=Q.league_pass_rates(wk_prior), defs=D.def_pass_rates(wk_prior))
     raise KeyError(stat)
@@ -302,7 +309,7 @@ def _predict(stat: str, ctx: dict, wk_prior: pd.DataFrame, row: pd.Series,
             return None
         return R.simulate(pri, tv, ctx["defs"].get(opp), n_sims=n_sims, seed=seed)["yards"]
     if stat == "tds":
-        pri = TD.player_td_priors(wk_prior, pid, ctx["lg"])
+        pri = TD.player_td_priors(wk_prior, pid, ctx["lg"], gl=ctx.get("gl"))
         if pri["mu_rec"] + pri["mu_car"] < MIN_EXP_TOUCHES:
             return None
         return TD.simulate(pri, ctx["defs"].get((opp, pri["position"])),
@@ -351,6 +358,7 @@ def player_backtest(score_seasons, stats=("rec_yards", "rush_yards", "tds"),
     need_rush = "rush_yards" in stats
     pfr_all = D.load_pfr_rush(seasons) if need_rush else pd.DataFrame()
     pbp_all = D.load_pbp(seasons) if need_rush else pd.DataFrame()
+    touches_all = D.load_touches(seasons) if ("tds" in stats and USE_GOAL_LINE) else pd.DataFrame()
     sched = D.load_schedule(tuple(int(s) for s in score_seasons))
     rng = np.random.default_rng(seed)
 
@@ -367,12 +375,14 @@ def player_backtest(score_seasons, stats=("rec_yards", "rush_yards", "tds"),
                      if need_rush and not pfr_all.empty else pd.DataFrame())
         pbp_prior = (D.game_weights(before(pbp_all, S, w), "defteam", recency)
                      if need_rush and not pbp_all.empty else pd.DataFrame())
+        touches_prior = (D.game_weights(before(touches_all, S, w), "posteam", recency)
+                         if not touches_all.empty else None)
         this = wk_all[(wk_all["season"] == S) & (wk_all["week"] == w)]
         games_prior = wk_prior.groupby("player_id").size()
 
         for stat in stats:
             spec = PLAYER_STATS[stat]
-            ctx = _prior_context(stat, wk_prior, pfr_prior, pbp_prior)
+            ctx = _prior_context(stat, wk_prior, pfr_prior, pbp_prior, touches_prior)
             cands = this[this["position"].isin(spec["positions"])]
             for _, row in cands.iterrows():
                 pid = str(row["player_id"])

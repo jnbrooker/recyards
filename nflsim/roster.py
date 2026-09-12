@@ -66,7 +66,9 @@ LG_YPT = 7.6
 CATCH_PRIOR_N = 25.0        # targets-worth of prior on catch rate
 YPT_PRIOR_N = 30.0          # targets-worth of prior on yards per target
 
-# Touchdown role weighting.
+# Touchdown role weighting. With a goal-line profile (touchdowns.py) the TD
+# rates regress toward the player's own role x conversion over
+# TD_ROLE_PRIOR_N touches; otherwise toward league over TD_RATE_PRIOR_N.
 TD_RATE_PRIOR_N = 30.0
 
 # Depth-chart slots the pages and engine consider per position.
@@ -112,7 +114,17 @@ def load_live(seasons: tuple[int, ...],
         team_vol=team_volumes(wk),
         snaps=snap_roles(D.load_snap_counts(tuple(sorted(set(seasons) | set(depth_seasons)))),
                          recency),
+        goal_line=_goal_line(seasons, recency, wk),
     )
+
+
+def _goal_line(seasons, recency, wk) -> dict:
+    """Goal-line role profiles from pbp touches (empty if pbp is unavailable)."""
+    from . import touchdowns as TDm
+    try:
+        return TDm.goal_line_profiles(D.load_touches(seasons, recency), wk)
+    except Exception:
+        return {}
 
 
 def snap_roles(snaps: pd.DataFrame, recency: D.Recency = D.RECENCY_DEFAULT) -> dict:
@@ -186,7 +198,8 @@ def build_roster(wk: pd.DataFrame, snapshot: pd.DataFrame, team: str,
                  pfr_agg: dict | None = None, pfr_lg: dict | None = None,
                  max_per_pos: dict | None = None,
                  status: dict | None = None,
-                 snaps: dict | None = None) -> pd.DataFrame:
+                 snaps: dict | None = None,
+                 goal_line: dict | None = None) -> pd.DataFrame:
     """Turn one depth-chart snapshot into a table of players with usage shares.
 
     Each player gets a target share and a carry share that blend his own history
@@ -209,6 +222,7 @@ def build_roster(wk: pd.DataFrame, snapshot: pd.DataFrame, team: str,
     totals = _team_totals(wk)
     lg = _league_rates(wk)
     lg["rush"] = R.league_rush_priors(wk)
+    lg["goal_line"] = goal_line or {}
     rows = []
     for _, pl in snap.iterrows():
         pid = str(pl["player_id"])
@@ -279,16 +293,25 @@ def _player_row(pl: pd.Series, h: pd.DataFrame, totals: pd.DataFrame,
         ry_tot, car_tot = _wsum(h, "receiving_yards"), _wsum(h, "carries")
         catch = (rec_tot + CATCH_PRIOR_N * lg["catch"]) / (tg_tot + CATCH_PRIOR_N)
         ypt = (ry_tot + YPT_PRIOR_N * lg["ypt"]) / (tg_tot + YPT_PRIOR_N)
-        rec_td = ((_wsum(h, "receiving_tds") + TD_RATE_PRIOR_N * lg["rec_td"])
-                  / (rec_tot + TD_RATE_PRIOR_N))
-        rush_td = ((_wsum(h, "rushing_tds") + TD_RATE_PRIOR_N * lg["rush_td"])
-                   / (car_tot + TD_RATE_PRIOR_N))
+        # TD rates: toward the player's goal-line role when pbp knows it
+        from . import touchdowns as TDm
+        role = TDm.role_td_rates(str(pl["player_id"]), pos, lg.get("goal_line"), float(np.clip(catch, 0.3, 0.95)))
+        if role is not None:
+            n_td, t_rec, t_rush = TDm.TD_ROLE_PRIOR_N, role["rec_td_per_rec"], role["rush_td_per_car"]
+        else:
+            n_td, t_rec, t_rush = TD_RATE_PRIOR_N, lg["rec_td"], lg["rush_td"]
+        rec_td = (_wsum(h, "receiving_tds") + n_td * t_rec) / (rec_tot + n_td)
+        rush_td = (_wsum(h, "rushing_tds") + n_td * t_rush) / (car_tot + n_td)
         name = str(h["player_display_name"].iloc[-1])
         prev_team = str(h["recent_team"].iloc[-1])
     else:
         tgt, car = tgt_prior, car_prior
         catch, ypt = lg["catch"], lg["ypt"]
         rec_td, rush_td = lg["rec_td"], lg["rush_td"]
+        from . import touchdowns as TDm
+        role = TDm.role_td_rates(str(pl["player_id"]), pos, lg.get("goal_line"), catch)
+        if role is not None and role.get("from_profile"):
+            rec_td, rush_td = role["rec_td_per_rec"], role["rush_td_per_car"]
         name = str(pl.get("player_name") or pl["player_id"])
         prev_team = ""
 
@@ -348,7 +371,8 @@ def roster_for(live: dict, team: str, use_injuries: bool = True,
     out = ({p for p, s in status.items() if s in ("Out", "Doubtful")}
            if use_injuries else set())
     return build_roster(live["wk"], snap, team, out, live["pfr_agg"], live["pfr_lg"],
-                        status=status, snaps=live.get("snaps"))
+                        status=status, snaps=live.get("snaps"),
+                        goal_line=live.get("goal_line"))
 
 
 def league_rosters(live: dict, use_injuries: bool = True) -> pd.DataFrame:
@@ -455,6 +479,8 @@ def td_priors_from_role(row: pd.Series, team_vol: dict, lg: dict) -> dict:
         mu_car=mu_car, var_car=max(mu_car * 2.0, 0.5),
         p_rec_td=p_rec, p_rush_td=p_rush,
         raw_rec_td_per_rec=0.0, raw_rush_td_per_car=0.0,
+        prior_rec_td=p_rec, prior_rush_td=p_rush,
+        gl_car_frac=np.nan, gl_tgt_frac=np.nan, role_source="positional mean (no history)",
     )
 
 

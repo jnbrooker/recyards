@@ -735,6 +735,9 @@ _PBP_KEEP = [
     # drive level (game engine)
     "fixed_drive", "fixed_drive_result", "drive_inside20", "yardline_100",
     "touchdown", "field_goal_attempt", "home_score", "away_score",
+    # who touched the ball (goal-line role for touchdowns)
+    "rusher_player_id", "receiver_player_id", "pass_attempt", "complete_pass",
+    "rush_touchdown", "pass_touchdown",
 ]
 
 # Thresholds defining a stuffed / explosive run.
@@ -809,6 +812,39 @@ def _wmean_by(df: pd.DataFrame, key, cols: list[str], w: str = "w") -> pd.DataFr
     num = df[cols].multiply(ww, axis=0).groupby(df[key] if isinstance(key, str) else key).sum()
     den = ww.groupby(df[key] if isinstance(key, str) else key).sum()
     return num.div(den, axis=0)
+
+
+GOAL_LINE_YL = 10      # yards from the end zone that define a goal-line touch
+
+
+def load_touches(seasons: tuple[int, ...],
+                 recency: Recency = RECENCY_DEFAULT) -> pd.DataFrame:
+    """One row per player-game of ball touches from pbp: carries and targets,
+    how many came inside the GOAL_LINE_YL, and the touchdowns — the direct
+    measure of goal-line ROLE (roadmap §3.3 / §8.2). Weighted by `w`. Empty
+    frame if the pbp feed lacks the player-id columns."""
+    raw = load_pbp_raw(seasons)
+    need = {"rusher_player_id", "receiver_player_id", "yardline_100", "posteam"}
+    if raw.empty or not need <= set(raw.columns):
+        return pd.DataFrame()
+    x = raw[pd.to_numeric(raw.get("two_point_attempt"), errors="coerce").fillna(0) != 1]
+    yl = pd.to_numeric(x["yardline_100"], errors="coerce")
+    gl = (yl <= GOAL_LINE_YL).astype(int)
+    rush = x[(pd.to_numeric(x["rush_attempt"], errors="coerce") == 1) & x["rusher_player_id"].notna()]
+    pas = x[(pd.to_numeric(x["pass_attempt"], errors="coerce") == 1) & x["receiver_player_id"].notna()]
+    keys = ["season", "week", "posteam"]
+    r = (rush.assign(player_id=rush["rusher_player_id"].astype(str), gl=gl.loc[rush.index],
+                     td=pd.to_numeric(rush.get("rush_touchdown"), errors="coerce").fillna(0))
+             .groupby(keys + ["player_id"], as_index=False)
+             .agg(car=("gl", "size"), gl_car=("gl", "sum"), rush_td=("td", "sum")))
+    p = (pas.assign(player_id=pas["receiver_player_id"].astype(str), gl=gl.loc[pas.index],
+                    td=pd.to_numeric(pas.get("pass_touchdown"), errors="coerce").fillna(0))
+            .groupby(keys + ["player_id"], as_index=False)
+            .agg(tgt=("gl", "size"), gl_tgt=("gl", "sum"), rec_td=("td", "sum")))
+    t = r.merge(p, on=keys + ["player_id"], how="outer").fillna(0)
+    for c in ("car", "gl_car", "rush_td", "tgt", "gl_tgt", "rec_td"):
+        t[c] = t[c].astype(int)
+    return game_weights(t, "posteam", recency)
 
 
 def rush_defense_pbp(pbp: pd.DataFrame) -> dict:

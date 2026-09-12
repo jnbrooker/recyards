@@ -31,6 +31,12 @@ def get_derived(seasons, recency):
             T.league_td_rates(wk), T.td_defense_profiles(wk))
 
 
+@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Loading play-by-play for goal-line roles…")
+def get_goal_line(seasons, recency):
+    wk = get_weekly(seasons, recency)
+    return T.goal_line_profiles(D.load_touches(tuple(sorted(seasons)), recency), wk)
+
+
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Loading live depth charts and injury reports…")
 def get_rosters(seasons, recency, use_injuries):
     return UI.cached_rosters(tuple(sorted(seasons)), use_injuries, recency)
@@ -94,7 +100,7 @@ shrink = st.sidebar.slider(
 n_sims = st.sidebar.select_slider("Simulations", [10000, 20000, 40000, 100000], value=40000)
 
 try:
-    pri = T.player_td_priors(wk, player_id, lg)
+    pri = T.player_td_priors(wk, player_id, lg, gl=get_goal_line(tuple(seasons), recency))
 except ValueError:
     if live_row is None:
         raise
@@ -170,13 +176,21 @@ with left:
     st.subheader("Player profile (inputs)")
     st.dataframe(pd.DataFrame({
         "Metric": ["Expected receptions", "Rec TD / reception", "Expected carries",
-                   "Rush TD / carry", "Games"],
+                   "Rush TD / carry", "Goal-line share of targets", "Goal-line share of carries",
+                   "Games"],
         "Value":  [f"{pri['mu_rec']:.1f}", f"{pri['p_rec_td']:.1%}",
-                   f"{pri['mu_car']:.1f}", f"{pri['p_rush_td']:.1%}", str(pri["games"])],
-        "Raw (unregressed)": ["—", f"{pri['raw_rec_td_per_rec']:.1%}", "—",
-                              f"{pri['raw_rush_td_per_car']:.1%}", "—"],
+                   f"{pri['mu_car']:.1f}", f"{pri['p_rush_td']:.1%}",
+                   f"{pri['gl_tgt_frac']:.1%}" if np.isfinite(pri.get("gl_tgt_frac", np.nan)) else "—",
+                   f"{pri['gl_car_frac']:.1%}" if np.isfinite(pri.get("gl_car_frac", np.nan)) else "—",
+                   str(pri["games"])],
+        "Prior / raw": [ "—", f"prior {pri['prior_rec_td']:.1%} · raw {pri['raw_rec_td_per_rec']:.1%}", "—",
+                         f"prior {pri['prior_rush_td']:.1%} · raw {pri['raw_rush_td_per_car']:.1%}",
+                         "—", "—", "—"],
     }), hide_index=True, width="stretch")
-    st.caption("TD rates are regressed toward the positional league average.")
+    st.caption(f"TD rates are regressed toward the **{pri.get('role_source', 'positional mean')}** "
+               "— with play-by-play, that is the player's share of his team's touches inside "
+               "the 10 times the league conversion there (~29% per carry, ~39% per target), "
+               "which is far more stable than his own touchdown count.")
 with right:
     st.subheader("Outcome probabilities")
     st.dataframe(pd.DataFrame({

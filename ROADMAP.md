@@ -374,10 +374,25 @@ rating if the box-score yardage needs its own anchor.*
    tail both ways. Count stats (TDs, sacks, INTs) sit at their naive
    baselines and have not had this treatment.
 
-2. **Goal-line role for touchdowns.** §3.3 says goal-line role dominates and the
-   pbp has `yardline_100`, but the TD weights are still share × TD rate. Each
-   player's share of his team's carries/targets inside the 10 is the direct
-   signal, and anytime-TD is the biggest player market.
+2. ~~**Goal-line role for touchdowns.**~~ *Done 2026-09-12.* The pbp now
+   keeps the ball-carrier ids, and `data.load_touches` counts each player's
+   carries and targets inside the 10 per game. Measured on 2024–25: a carry
+   inside the 10 scores **29%** of the time vs 0.9% elsewhere, a target
+   **39%** vs 2.6% — and for receivers the goal-line share is twice as stable
+   year to year as the TD rate itself (r = 0.40 vs 0.21). So
+   `touchdowns.goal_line_profiles` / `role_td_rates` build each player's TD
+   rate as *role × conversion* (his regressed goal-line share of touches
+   times the league conversion inside and outside the 10) and that, not the
+   positional mean, is what his own TD history is regressed toward — over
+   300 touches-worth, because the role is trusted more than the rare TDs.
+   On the 2025 harness: anytime-TD Brier 0.2078 → 0.2063, log-loss 0.605 →
+   0.602, correlation of projected with actual TDs 0.24 → 0.26, top-quintile
+   bias 0.075 → 0.028; the same shrinkage toward the positional mean was
+   worse, so the role signal is what helps. Modest — anytime-TD is mostly a
+   volume-and-team-scoring question — but consistent on every metric. Page 3
+   shows the goal-line shares and the prior; the game engine's TD split
+   (`roster` rec/rush TD weights) uses the same role rates.
+
 3. ~~**Recency weighting — make it consistent, then add within-season decay.**~~
    *Done 2026-09-12.* Every estimate in the suite is now a weighted one, and
    every feed carries the same weight column.

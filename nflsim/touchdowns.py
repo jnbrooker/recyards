@@ -37,6 +37,20 @@ RUSH_TD_PRIOR_N = 45.0     # carries-worth of prior
 # TD-allowed defense splits are noisy; default shrink is strong.
 DEFAULT_TD_DEF_SHRINK = 0.35
 
+# Goal-line role (roadmap 8.2): a carry inside the 10 scores ~29% of the time
+# vs ~1% elsewhere, a target inside the 10 ~39% vs ~2.6%. So a player's TD
+# rate is his goal-line SHARE of touches times those conversions — and the
+# share is measured from touches (tens per season), not from the rare TDs.
+# The share is regressed toward the positional mean over GL_PRIOR_N touches.
+# When the TD-rate prior is role-based it is trusted over TD_ROLE_PRIOR_N
+# touches-worth (vs 40-45 for the positional mean): on the 2025 backtest the
+# anytime-TD Brier went 0.2078 -> 0.2063, log-loss 0.605 -> 0.602 and the
+# correlation of projected with actual TDs 0.24 -> 0.26; the same shrinkage
+# toward the positional mean was worse, so it is the role signal, not the
+# shrinkage, that helps.
+GL_PRIOR_N = 40.0
+TD_ROLE_PRIOR_N = 300.0
+
 
 # ---------------------------------------------------------------------------
 # League positional TD rates (the regression targets)
@@ -46,6 +60,78 @@ def _wsum(g: pd.DataFrame, col: str) -> float:
     """Recency-weighted total of `col` (plain total if the frame is unweighted)."""
     w = g["w"] if "w" in g.columns else 1.0
     return float((g[col] * w).sum())
+
+
+def goal_line_profiles(touches: pd.DataFrame, wk: pd.DataFrame | None = None) -> dict:
+    """From `data.load_touches`: per player the recency-weighted goal-line
+    share of his carries and targets (regressed toward his position's mean),
+    plus the league conversion rates inside and outside the 10.
+
+    Returns {player_id: dict(gl_car_frac, gl_tgt_frac, car, tgt), "_LEAGUE_":
+    dict(p_gl_rush, p_ngl_rush, p_gl_pass, p_ngl_pass, gl_car_frac{pos},
+    gl_tgt_frac{pos})}. Empty dict if there are no touches."""
+    if touches is None or touches.empty:
+        return {}
+    t = touches
+    w = t["w"]
+    car, glc = float((t["car"] * w).sum()), float((t["gl_car"] * w).sum())
+    tgt, glt = float((t["tgt"] * w).sum()), float((t["gl_tgt"] * w).sum())
+    # conversions inside / outside the 10 (league-wide; TDs come with the touches)
+    rtd, ptd = float((t["rush_td"] * w).sum()), float((t["rec_td"] * w).sum())
+    # a TD outside the 10 is rare; split the TDs by where the touches were
+    # using the league conversion ratio measured directly on the plays
+    lg = dict(p_gl_rush=0.29, p_ngl_rush=0.0094, p_gl_pass=0.39, p_ngl_pass=0.026)
+    if car > 0 and tgt > 0:
+        # solve the two-rate split so the totals reconcile: total = ngl*(n-gl) + gl*g
+        # with the inside/outside ratio fixed at the measured 30x / 15x
+        k_r, k_p = 0.29 / 0.0094, 0.39 / 0.026
+        ngl_r = rtd / ((car - glc) + k_r * glc); ngl_p = ptd / ((tgt - glt) + k_p * glt)
+        lg = dict(p_gl_rush=float(k_r * ngl_r), p_ngl_rush=float(ngl_r),
+                  p_gl_pass=float(k_p * ngl_p), p_ngl_pass=float(ngl_p))
+    pos_of = {}
+    if wk is not None and not wk.empty:
+        pos_of = wk.drop_duplicates("player_id").set_index(wk.drop_duplicates("player_id")["player_id"].astype(str))["position"].to_dict()
+    t = t.assign(pos=t["player_id"].map(pos_of).fillna("_ALL_"))
+    pos_frac = {}
+    for pos, g in list(t.groupby("pos")) + [("_ALL_", t)]:
+        c, gc = float((g["car"] * g["w"]).sum()), float((g["gl_car"] * g["w"]).sum())
+        tg, gt = float((g["tgt"] * g["w"]).sum()), float((g["gl_tgt"] * g["w"]).sum())
+        pos_frac[pos] = (gc / c if c > 0 else glc / max(car, 1), gt / tg if tg > 0 else glt / max(tgt, 1))
+    lg["gl_car_frac"] = {k: v[0] for k, v in pos_frac.items()}
+    lg["gl_tgt_frac"] = {k: v[1] for k, v in pos_frac.items()}
+    out = {"_LEAGUE_": lg}
+    g = t.assign(wc=t["car"] * w, wgc=t["gl_car"] * w, wt=t["tgt"] * w, wgt=t["gl_tgt"] * w) \
+         .groupby("player_id")[["wc", "wgc", "wt", "wgt", "pos"]].agg(
+             wc=("wc", "sum"), wgc=("wgc", "sum"), wt=("wt", "sum"), wgt=("wgt", "sum"), pos=("pos", "last"))
+    for pid, r in g.iterrows():
+        pc, pt = pos_frac.get(r["pos"], pos_frac["_ALL_"])
+        out[str(pid)] = dict(
+            gl_car_frac=float((r["wgc"] + GL_PRIOR_N * pc) / (r["wc"] + GL_PRIOR_N)),
+            gl_tgt_frac=float((r["wgt"] + GL_PRIOR_N * pt) / (r["wt"] + GL_PRIOR_N)),
+            car=float(r["wc"]), tgt=float(r["wt"]),
+            raw_gl_car_frac=float(r["wgc"] / r["wc"]) if r["wc"] > 0 else np.nan,
+            raw_gl_tgt_frac=float(r["wgt"] / r["wt"]) if r["wt"] > 0 else np.nan)
+    return out
+
+
+def role_td_rates(pid: str, position: str, gl: dict, catch_rate: float) -> dict | None:
+    """Player-specific TD-rate priors from goal-line role: per carry, and per
+    RECEPTION (the model's unit), converting the per-target rate with the
+    player's catch rate. None if the profile has nothing on him."""
+    if not gl or "_LEAGUE_" not in gl:
+        return None
+    lg = gl["_LEAGUE_"]
+    p = gl.get(str(pid))
+    if p is None:
+        fc = lg["gl_car_frac"].get(position, lg["gl_car_frac"]["_ALL_"])
+        ft = lg["gl_tgt_frac"].get(position, lg["gl_tgt_frac"]["_ALL_"])
+    else:
+        fc, ft = p["gl_car_frac"], p["gl_tgt_frac"]
+    per_car = (1 - fc) * lg["p_ngl_rush"] + fc * lg["p_gl_rush"]
+    per_tgt = (1 - ft) * lg["p_ngl_pass"] + ft * lg["p_gl_pass"]
+    return dict(rush_td_per_car=float(per_car),
+                rec_td_per_rec=float(per_tgt / max(catch_rate, 0.3)),
+                gl_car_frac=float(fc), gl_tgt_frac=float(ft), from_profile=p is not None)
 
 
 def league_td_rates(wk: pd.DataFrame) -> dict:
@@ -82,13 +168,23 @@ def _nb_params(mean, var):
     return max(n, 1e-3), p
 
 
-def player_td_priors(wk: pd.DataFrame, player_id: str, lg: dict) -> dict:
+def player_td_priors(wk: pd.DataFrame, player_id: str, lg: dict,
+                     gl: dict | None = None) -> dict:
+    """`gl` is `goal_line_profiles(...)`: when given, the regression target for
+    the player's TD rates is his own goal-line role x league conversion
+    instead of the positional mean."""
     p = wk[wk["player_id"] == player_id].copy()
     if p.empty:
         raise ValueError("No games for this player.")
     pos = p["position"].iloc[-1]
     w = p["w"].values
     prior = lg.get(pos, lg["_ALL_"])
+    role = None
+    if gl:
+        catch = float(_wsum(p, "receptions") / max(_wsum(p, "targets"), 1e-9)) if _wsum(p, "targets") > 0 else 0.65
+        role = role_td_rates(str(player_id), pos, gl, catch)
+        if role is not None:
+            prior = dict(rec_td_per_rec=role["rec_td_per_rec"], rush_td_per_car=role["rush_td_per_car"])
 
     # --- expected volume per game (mean & variance for the NB draw) ---
     rec_g = p["receptions"].values
@@ -103,8 +199,10 @@ def player_td_priors(wk: pd.DataFrame, player_id: str, lg: dict) -> dict:
     car_tot = _wsum(p, "carries")
     rec_td = _wsum(p, "receiving_tds")
     rush_td = _wsum(p, "rushing_tds")
-    p_rec_td = (rec_td + REC_TD_PRIOR_N * prior["rec_td_per_rec"]) / (rec_tot + REC_TD_PRIOR_N)
-    p_rush_td = (rush_td + RUSH_TD_PRIOR_N * prior["rush_td_per_car"]) / (car_tot + RUSH_TD_PRIOR_N)
+    n_rec = TD_ROLE_PRIOR_N if role else REC_TD_PRIOR_N
+    n_rush = TD_ROLE_PRIOR_N if role else RUSH_TD_PRIOR_N
+    p_rec_td = (rec_td + n_rec * prior["rec_td_per_rec"]) / (rec_tot + n_rec)
+    p_rush_td = (rush_td + n_rush * prior["rush_td_per_car"]) / (car_tot + n_rush)
 
     return dict(
         player_id=player_id, name=p["player_display_name"].iloc[-1], position=pos,
@@ -115,6 +213,10 @@ def player_td_priors(wk: pd.DataFrame, player_id: str, lg: dict) -> dict:
         p_rush_td=float(np.clip(p_rush_td, 0.0, 0.25)),
         raw_rec_td_per_rec=float(rec_td / rec_tot) if rec_tot > 0 else 0.0,
         raw_rush_td_per_car=float(rush_td / car_tot) if car_tot > 0 else 0.0,
+        prior_rec_td=float(prior["rec_td_per_rec"]), prior_rush_td=float(prior["rush_td_per_car"]),
+        gl_car_frac=role["gl_car_frac"] if role else np.nan,
+        gl_tgt_frac=role["gl_tgt_frac"] if role else np.nan,
+        role_source="goal-line role" if role else "positional mean",
     )
 
 
