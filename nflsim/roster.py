@@ -48,6 +48,18 @@ CARRY_ROLE_PRIOR = {
 # How fast a player's own history takes over from the role prior (games).
 ROLE_BLEND_N = 10.0
 
+# Snap counts as a second role signal (roadmap 8.4). A player's expected usage
+# share is roughly proportional to his offensive snap share — fitted on
+# 2024-25 player-games: target share ~ 0.25 x snaps for a WR (r = 0.72), 0.20
+# for a TE, 0.17 for a RB; carry share ~ 0.81 x snaps for a RB (r = 0.87).
+# The role prior is the AVERAGE of the depth-chart-rank prior and the snap
+# prior once the player has SNAP_MIN_GAMES of snaps; backtested on 2025 that
+# cut target-share error 5% for players with < 5 games of history and 2.5%
+# for 5-15, and was neutral for veterans (whose own history dominates).
+SNAP_TARGET_SLOPE = {"WR": 0.25, "TE": 0.20, "RB": 0.17, "FB": 0.05, "QB": 0.0}
+SNAP_CARRY_SLOPE = {"RB": 0.81, "QB": 0.15, "WR": 0.01, "FB": 0.10, "TE": 0.005}
+SNAP_MIN_GAMES = 2
+
 # Receiving fallbacks / regression.
 LG_CATCH_RATE = 0.645
 LG_YPT = 7.6
@@ -98,7 +110,22 @@ def load_live(seasons: tuple[int, ...],
         injuries=D.load_injuries(depth_seasons),
         pfr_agg=agg, pfr_lg=pfr_lg,
         team_vol=team_volumes(wk),
+        snaps=snap_roles(D.load_snap_counts(tuple(sorted(set(seasons) | set(depth_seasons)))),
+                         recency),
     )
+
+
+def snap_roles(snaps: pd.DataFrame, recency: D.Recency = D.RECENCY_DEFAULT) -> dict:
+    """player_id -> (recency-weighted offensive snap share, games of snaps)."""
+    if snaps is None or snaps.empty or "offense_pct" not in snaps.columns:
+        return {}
+    d = D.game_weights(snaps[snaps["offense_pct"] > 0], "team", recency)
+    if d.empty:
+        return {}
+    num = (d["offense_pct"] * d["w"]).groupby(d["player_id"]).sum()
+    den = d["w"].groupby(d["player_id"]).sum()
+    n = d.groupby("player_id").size()
+    return {p: (float(num[p] / den[p]), int(n[p])) for p in num.index}
 
 
 def team_games(wk: pd.DataFrame, **sums) -> pd.DataFrame:
@@ -158,7 +185,8 @@ def build_roster(wk: pd.DataFrame, snapshot: pd.DataFrame, team: str,
                  ruled_out: set | None = None,
                  pfr_agg: dict | None = None, pfr_lg: dict | None = None,
                  max_per_pos: dict | None = None,
-                 status: dict | None = None) -> pd.DataFrame:
+                 status: dict | None = None,
+                 snaps: dict | None = None) -> pd.DataFrame:
     """Turn one depth-chart snapshot into a table of players with usage shares.
 
     Each player gets a target share and a carry share that blend his own history
@@ -185,7 +213,7 @@ def build_roster(wk: pd.DataFrame, snapshot: pd.DataFrame, team: str,
     for _, pl in snap.iterrows():
         pid = str(pl["player_id"])
         h = wk[wk["player_id"].astype(str) == pid]
-        row = _player_row(pl, h, totals, lg, pfr_agg, pfr_lg)
+        row = _player_row(pl, h, totals, lg, pfr_agg, pfr_lg, (snaps or {}).get(pid))
         row["team"] = team
         row["status"] = status.get(pid, "")
         row["active"] = pid not in ruled_out
@@ -224,13 +252,19 @@ def _league_rates(wk: pd.DataFrame) -> dict:
 
 
 def _player_row(pl: pd.Series, h: pd.DataFrame, totals: pd.DataFrame,
-                lg: dict, pfr_agg, pfr_lg) -> dict:
+                lg: dict, pfr_agg, pfr_lg, snap: tuple | None = None) -> dict:
     pos, depth = pl["position"], int(pl["depth"])
     games = int(len(h))
     blend = games / (games + ROLE_BLEND_N)
 
     tgt_prior = TARGET_ROLE_PRIOR.get((pos, depth), 0.01)
     car_prior = CARRY_ROLE_PRIOR.get((pos, depth), 0.005)
+    snap_share, role_source = None, "rank"
+    if snap is not None and snap[1] >= SNAP_MIN_GAMES:
+        snap_share = float(snap[0])
+        tgt_prior = 0.5 * tgt_prior + 0.5 * SNAP_TARGET_SLOPE.get(pos, 0.01) * snap_share
+        car_prior = 0.5 * car_prior + 0.5 * SNAP_CARRY_SLOPE.get(pos, 0.005) * snap_share
+        role_source = "rank + snaps"
 
     if games:
         w = h["w"].values
@@ -271,7 +305,7 @@ def _player_row(pl: pd.Series, h: pd.DataFrame, totals: pd.DataFrame,
     return dict(
         player_id=str(pl["player_id"]), name=name, position=pos, depth=depth,
         games=games, from_history=bool(games), blend=float(blend),
-        prev_team=prev_team,
+        prev_team=prev_team, snap_share=snap_share, role_source=role_source,
         target_share=float(max(tgt, 0.0)), carry_share=float(max(car, 0.0)),
         catch_rate=float(np.clip(catch, 0.30, 0.90)),
         ypt=float(np.clip(ypt, 3.0, 14.0)),
@@ -314,7 +348,7 @@ def roster_for(live: dict, team: str, use_injuries: bool = True,
     out = ({p for p, s in status.items() if s in ("Out", "Doubtful")}
            if use_injuries else set())
     return build_roster(live["wk"], snap, team, out, live["pfr_agg"], live["pfr_lg"],
-                        status=status)
+                        status=status, snaps=live.get("snaps"))
 
 
 def league_rosters(live: dict, use_injuries: bool = True) -> pd.DataFrame:

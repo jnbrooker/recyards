@@ -432,9 +432,21 @@ rating if the box-score yardage needs its own anchor.*
    player models' error is dominated by unregressed means (#1b), not stale
    ones.
 
-4. **Snap counts as the role signal.** Depth-chart rank is coarse; nflverse's
-   `snap_counts` release (offense snap %) predicts targets much better and
-   would replace the rank prior for anyone with a few games of snaps.
+4. ~~**Snap counts as the role signal.**~~ *Done 2026-09-12 — smaller than
+   hoped, and the roadmap's premise was wrong.* Snap share is a strong proxy
+   for usage (WR target share ≈ 0.25 × snaps, r = 0.72; RB carry share ≈
+   0.81 × snaps, r = 0.87), but it does not "predict targets much better"
+   than what the role layer already had: backtested over every listed player
+   in 2025 (5 489 player-weeks), a snap-only prior was *worse* than the
+   depth-chart-rank prior once a player had 15+ games, because his own
+   target share is the better signal by then. Where a prior matters — under
+   15 games — averaging the rank prior with the snap prior cut target-share
+   error 5% (< 5 games) and 2.5% (5–15) and removed the rank prior's small
+   WR/TE under-prediction; carries were neutral. That average is what
+   `roster._player_row` now uses when the player has two games of snaps
+   (`SNAP_TARGET_SLOPE`, `SNAP_CARRY_SLOPE`, `snap_roles`); the pages say
+   "slot + snap prior" and show the snap share.
+
 5. ~~**Unit availability — who is actually playing.**~~ *Built and fitted
    2026-09-12* — `nflsim/availability.py`, applied in `teams.expected_points`,
    the drive engine, fantasy, pick'em and page 7; scored on page 10.

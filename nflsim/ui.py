@@ -47,11 +47,13 @@ def role_caption(row: pd.Series, share_col: str, what: str) -> str:
     games = int(row.get("games", 0))
     bits = [f"**{row['team']} {row['position']}{int(row['depth'])}**",
             f"live share of team {what}: **{live:.0%}**"]
+    prior_txt = ("slot prior" if row.get("role_source", "rank") == "rank"
+                 else f"slot + snap prior ({row.get('snap_share', 0):.0%} of snaps)")
     if games:
         bits.append(f"own history {own:.0%} over {games} games, "
-                    f"blended {row.get('blend', 0):.0%} toward it")
+                    f"blended {row.get('blend', 0):.0%} toward it, rest {prior_txt}")
     else:
-        bits.append("no history in the priors window — slot prior only")
+        bits.append(f"no history in the priors window — {prior_txt} only")
     if row.get("prev_team") and row["prev_team"] != row["team"]:
         bits.append(f"history is from **{row['prev_team']}**; volume now uses "
                     f"**{row['team']}**")
