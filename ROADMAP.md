@@ -236,7 +236,7 @@ and the drive table, so a session downloads each season's play-by-play once.
 | 6c | Pick'em card ✅ | `nflsim/pickem.py` + page 9. One pick per game (ATS or dog ML), 3-team ATS/ML parlays and 6-pt teaser, pool-named totals; every candidate graded from the simulated margin/total distribution, confidence 20→1 by expected return (flat or odds-weighted). Lines editable. A `market_weight` blend shifts each game's centre toward the line — the model's shrunk ratings see games as closer than the market, which flatters underdogs under odds-weighted scoring. |
 | 6 | Game dashboard ✅ | Page 7: projected box score, margin and total distributions, win probability and fair moneyline. |
 | 7 | Backtest harness ✅ | `nflsim/backtest.py` + page 10: rolling out-of-sample scoring of the team layer (vs the closing line) and the player models (vs a trailing average), per recency preset. First run fixed two receiving-model defects (§8.1). |
-| 8 | Availability layer ✅ | `nflsim/availability.py`: QB familiarity + defensive starters out, fitted on out-of-sample residuals as a margin shift (§8.5). 2025: 13.38 → 12.89 RMSE, 59% → 63% winners. |
+| 8 | Availability layer ✅ | `nflsim/availability.py`: QB familiarity + defensive starters out, with a QB quality swing, fitted on out-of-sample residuals as a margin shift (§8.5). 2025: 13.38 → 12.75 RMSE, 59% → 63% winners. |
 
 Keep it as a **multi-page Streamlit app** — `recyards` becomes one page among
 several, sharing a common data/model utility layer.
@@ -469,13 +469,23 @@ rating if the box-score yardage needs its own anchor.*
    63.1% winners vs the closing line's 12.27 / 65.3%** — half the gap to the
    market closed, from one feature.
 
-   **Caveats / next.** The QB index says "did not take the dropbacks behind
-   this rating"; in the fit sample that was mostly injury backups, so a proven
-   starter who changed teams (2026: Tua to ATL, Cousins to LV) gets the same
-   average penalty until he has played. Weighting the index by the QB's own
-   prior efficiency vs the incumbent's is the obvious refinement. The
-   offensive line is not yet indexed (same feeds: `3WR 1TE` group lists OL,
-   snap counts have `offense_pct`).
+   **Refinement, same session.** The dummy says only "did not take the
+   dropbacks behind this rating", so a proven starter who changed teams would
+   be charged like an injury backup. A *quality swing* — `qb_idx × (starter
+   ANY/A − incumbents' ANY/A)`, ANY/A recency-weighted over the window and
+   regressed toward replacement level — was tested against it: with both in
+   the fit the swing is t = +3.4 and the dummy stays t = −6.1; swing alone is
+   worse than the dummy alone. So unfamiliarity costs something beyond
+   measured quality, and quality refines it. Both are in
+   (`QB_MARGIN_COEF = −7.74`, `QB_SWING_COEF = +3.29`, `DEF_MARGIN_COEF =
+   +12.36`); out of sample each direction improved a further 0.09 of RMSE.
+   **2025 harness: 12.75 RMSE / 63.1% winners vs the line's 12.27 / 65.3%**
+   (13.38 / 59.0% without the layer).
+
+   Still open: the offensive line is not indexed (same feeds: `3WR 1TE` group
+   lists OL, snap counts have `offense_pct`); and 2026 week 1 shows the limit
+   of the swing — Tua at ATL measures the same ANY/A as the incumbents he
+   replaced, so he takes the full unfamiliarity penalty until he has played.
 
 6. **Weather and roof.** nflverse schedules carry `roof`, `temp`, `wind`; pass
    volume and yards per attempt drop measurably in wind. Cheap multiplier.

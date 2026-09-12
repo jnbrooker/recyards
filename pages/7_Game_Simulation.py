@@ -138,9 +138,12 @@ if avail:
     for team in (home, away):
         a = avail.get(team, {})
         qb = a.get("qb_name") or "—"
-        qb_txt = (f"QB **{qb}** ({a.get('qb_share', 0):.0%} of recent dropbacks"
-                  + ("; unfamiliar — the offense rating was built by someone else)"
-                     if a.get("qb_idx", 0) > 0.5 else ")"))
+        qb_txt = f"QB **{qb}** ({a.get('qb_share', 0):.0%} of recent dropbacks"
+        if a.get("qb_idx", 0) > 0.5:
+            gap = float(a.get("qb_quality", np.nan)) - float(a.get("incumbent_quality", np.nan))
+            qb_txt += ("; unfamiliar — the offense rating was built by someone else"
+                       + (f", {gap:+.1f} ANY/A vs them" if np.isfinite(gap) else ""))
+        qb_txt += ")"
         miss = a.get("def_missing") or []
         def_txt = (f"defense missing {', '.join(miss)} (index {a.get('def_idx', 0):.2f})"
                    if miss else "defensive starters all available")
@@ -148,7 +151,8 @@ if avail:
     ms = AV.margin_shift(avail.get(home), avail.get(away))
     who = home if ms >= 0 else away
     lines.append(f"Net: margin shifted **{abs(ms):.1f} points toward {who}** "
-                 f"(QB familiarity {AV.QB_MARGIN_COEF:+.1f} and defensive starters "
+                 f"(QB familiarity {AV.QB_MARGIN_COEF:+.1f}, QB quality swing "
+                 f"{AV.QB_SWING_COEF:+.1f}/ANY/A and defensive starters "
                  f"{AV.DEF_MARGIN_COEF:+.1f} points of margin per unit of index, fitted "
                  "on 2024–25 out of sample; totals untouched).")
     st.caption("**Availability** — " + ("  " + chr(10)).join(lines))

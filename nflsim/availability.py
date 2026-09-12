@@ -27,6 +27,14 @@ either season). Fitted on 2024 and tested on 2025 the QB term alone takes
 margin RMSE 13.38 → 12.92 and winners 59.8% → 63.1%; the reverse direction
 agrees (13.66 → 12.88). The defensive term is directionally consistent and
 monotone by bin but only t ≈ 2 pooled; it adds ~0.04 of RMSE.
+
+The QB term has two parts. The familiarity DUMMY (`qb_idx`) is the main
+effect; the quality SWING (`qb_swing = qb_idx × (starter ANY/A − incumbents'
+ANY/A)`) refines it so a proven starter who changed teams is not charged the
+full backup penalty. With both in the fit the swing is t = +3.4 and the
+dummy stays t = −6.1; swing alone is worse than the dummy alone, so
+unfamiliarity costs something beyond measured quality. Both together take
+the out-of-sample RMSE a further 0.09 in each direction.
 """
 
 from __future__ import annotations
@@ -41,8 +49,9 @@ from . import data as D
 # n = 544 games). A side whose QB index is higher than its opponent's loses
 # QB_MARGIN_COEF x (difference) of margin; a side whose defense is missing more
 # starter importance gives up DEF_MARGIN_COEF x (difference).
-QB_MARGIN_COEF = -8.84      # t = -7.2
-DEF_MARGIN_COEF = 12.10     # t = +2.2
+QB_MARGIN_COEF = -7.74      # t = -6.1  (familiarity dummy)
+QB_SWING_COEF = 3.29        # t = +3.4  (x ANY/A gap, starter minus incumbents)
+DEF_MARGIN_COEF = 12.36     # t = +2.3
 
 DEFAULT_SNAP_SHARE = 0.7     # a listed starter with no snap history
 N_DEF_STARTERS = 12          # base front seven + secondary + nickel
@@ -100,26 +109,77 @@ def starting_qb(depth_off: pd.DataFrame, team: str, out_ids: set, as_of=None):
     return None, None
 
 
-def qb_index(wk_prior: pd.DataFrame, team: str, qb_id) -> dict:
-    """1 − this QB's share of the team's weighted dropbacks in the window."""
+# QB quality: adjusted net yards per attempt, recency-weighted over the
+# window and regressed toward a replacement level with QB_QUALITY_PRIOR_N
+# dropbacks-worth of prior, so a QB with no history is "a replacement", not
+# "league average".
+QB_QUALITY_PRIOR_N = 150.0
+REPLACEMENT_BELOW_LEAGUE = 0.8    # ANY/A below the league mean
+
+
+def qb_quality(wk_prior: pd.DataFrame) -> dict:
+    """player_id -> regressed ANY/A for every QB in the window, plus
+    "_LEAGUE_" (the league mean) and "_REPLACEMENT_"."""
+    q = wk_prior[wk_prior["position"] == "QB"]
+    need = {"attempts", "passing_yards", "passing_tds", "interceptions", "sacks", "sack_yards"}
+    if q.empty or not need <= set(q.columns):
+        return {"_LEAGUE_": 6.0, "_REPLACEMENT_": 6.0 - REPLACEMENT_BELOW_LEAGUE}
+    w = q["w"] if "w" in q.columns else pd.Series(1.0, index=q.index)
+    num = (q["passing_yards"] + 20 * q["passing_tds"] - 45 * q["interceptions"] - q["sack_yards"]) * w
+    den = (q["attempts"] + q["sacks"]) * w
+    lg = float(num.sum() / den.sum()) if den.sum() > 0 else 6.0
+    rep = lg - REPLACEMENT_BELOW_LEAGUE
+    g = pd.DataFrame({"num": num, "den": den, "pid": q["player_id"].astype(str)}).groupby("pid").sum()
+    out = ((g["num"] + rep * QB_QUALITY_PRIOR_N) / (g["den"] + QB_QUALITY_PRIOR_N)).to_dict()
+    out["_LEAGUE_"] = lg
+    out["_REPLACEMENT_"] = rep
+    return out
+
+
+def qb_index(wk_prior: pd.DataFrame, team: str, qb_id, quality: dict | None = None) -> dict:
+    """QB familiarity and quality swing for a team's starter.
+
+    qb_idx   = 1 − this QB's share of the team's weighted dropbacks in the
+               window (how much of the offense rating someone else built).
+    qb_swing = qb_idx × (starter's ANY/A − the other QBs' dropback-weighted
+               ANY/A): the familiarity gap signed and scaled by how much
+               better or worse the new man is than the men behind the rating.
+    """
     t = wk_prior[(wk_prior["recent_team"] == team) & (wk_prior["position"] == "QB")]
     col = "dropbacks" if "dropbacks" in t.columns else "attempts"
     w = t["w"] if "w" in t.columns else pd.Series(1.0, index=t.index)
     total = float((t[col] * w).sum())
+    quality = quality or {}
+    rep = float(quality.get("_REPLACEMENT_", 5.2))
     if qb_id is None or total <= 0:
         # no chart QB (index unknowable -> 0) or a team with no history (-> 1)
-        return dict(qb_idx=1.0 if qb_id is not None else 0.0, qb_share=0.0)
-    mine = t["player_id"].astype(str) == str(qb_id)
+        idx = 1.0 if qb_id is not None else 0.0
+        return dict(qb_idx=idx, qb_share=0.0, qb_swing=0.0,
+                    qb_quality=float(quality.get(str(qb_id), rep)) if qb_id else np.nan,
+                    incumbent_quality=np.nan)
+    pid = t["player_id"].astype(str)
+    mine = pid == str(qb_id)
     share = float((t.loc[mine, col] * w[mine]).sum()) / total
-    return dict(qb_idx=float(np.clip(1.0 - share, 0.0, 1.0)), qb_share=float(share))
+    idx = float(np.clip(1.0 - share, 0.0, 1.0))
+    # the other QBs behind the rating, weighted by the dropbacks they took
+    others = t[~mine]
+    ow = (others[col] * w[~mine])
+    if float(ow.sum()) > 0:
+        inc = float(sum(quality.get(p, rep) * x for p, x in zip(pid[~mine], ow)) / ow.sum())
+    else:
+        inc = float(quality.get(str(qb_id), rep))
+    mine_q = float(quality.get(str(qb_id), rep))
+    return dict(qb_idx=idx, qb_share=float(share), qb_swing=float(idx * (mine_q - inc)),
+                qb_quality=mine_q, incumbent_quality=inc)
 
 
 def team_indices(team: str, wk_prior: pd.DataFrame, depth_off: pd.DataFrame,
-                 depth_def: pd.DataFrame, out_ids: set, share: dict, as_of=None) -> dict:
+                 depth_def: pd.DataFrame, out_ids: set, share: dict, as_of=None,
+                 quality: dict | None = None) -> dict:
     """Both indices for one team, plus the names behind them."""
     qb_id, qb_name = starting_qb(depth_off, team, out_ids, as_of)
     out = dict(team=team, qb_id=qb_id, qb_name=qb_name)
-    out.update(qb_index(wk_prior, team, qb_id))
+    out.update(qb_index(wk_prior, team, qb_id, quality))
     out.update(def_index(def_starters(depth_def, team, as_of), out_ids, share))
     return out
 
@@ -130,8 +190,9 @@ def margin_shift(idx_a: dict | None, idx_b: dict | None) -> float:
     untouched and only the margin moves — the effect the data supports."""
     a, b = idx_a or {}, idx_b or {}
     dq = float(a.get("qb_idx", 0.0)) - float(b.get("qb_idx", 0.0))
+    ds = float(a.get("qb_swing", 0.0)) - float(b.get("qb_swing", 0.0))
     dd = float(b.get("def_idx", 0.0)) - float(a.get("def_idx", 0.0))
-    return float(QB_MARGIN_COEF * dq + DEF_MARGIN_COEF * dd)
+    return float(QB_MARGIN_COEF * dq + QB_SWING_COEF * ds + DEF_MARGIN_COEF * dd)
 
 
 # ---------------------------------------------------------------------------
@@ -148,11 +209,13 @@ def current_indices(live: dict, week: int | None = None) -> dict:
     snaps = D.load_snap_counts(tuple(sorted(set(seasons) | set(depth_seasons))))
     share = snap_shares(snaps, recency)
     inj = live["injuries"]
+    quality = qb_quality(live["wk"])
     out = {}
     teams = sorted(set(live["depth"]["team"].dropna())) if not live["depth"].empty else []
     for team in teams:
         ruled = D.players_ruled_out(inj, team, week=week)
-        out[team] = team_indices(team, live["wk"], live["depth"], depth_def, ruled, share)
+        out[team] = team_indices(team, live["wk"], live["depth"], depth_def, ruled, share,
+                                 quality=quality)
     return out
 
 
@@ -177,12 +240,14 @@ def historical_indices(score_seasons, n_prior: int = 2,
             progress(k / max(len(steps), 1), f"availability {S} week {w}")
         wk_prior = D.game_weights(B.before(wk_all, S, w), "recent_team", recency)
         share = snap_shares(B.before(snaps, S, w), recency)
+        quality = qb_quality(wk_prior)
         games = sched[(sched["season"] == S) & (sched["week"] == w)]
         for _, g in games.iterrows():
             as_of = pd.to_datetime(g["kickoff"], utc=True) if pd.notna(g["kickoff"]) else None
             for team in (g["home_team"], g["away_team"]):
                 ruled = D.players_ruled_out(inj, team, season=S, week=w)
-                r = team_indices(team, wk_prior, depth_off, depth_def, ruled, share, as_of)
+                r = team_indices(team, wk_prior, depth_off, depth_def, ruled, share, as_of,
+                                 quality=quality)
                 r.update(season=S, week=w, game_id=g["game_id"])
                 rows.append(r)
     return pd.DataFrame(rows)
@@ -202,17 +267,19 @@ def fit_margin(bt: pd.DataFrame, idx: pd.DataFrame) -> dict:
             continue
         rows.append(dict(resid=float(g["actual_margin"] - g["pred_margin"]),
                          dq=float(h["qb_idx"] - a["qb_idx"]),
+                         ds=float(h.get("qb_swing", 0.0) - a.get("qb_swing", 0.0)),
                          dd=float(a["def_idx"] - h["def_idx"])))
     d = pd.DataFrame(rows)
     if len(d) < 30:
         return dict(n=int(len(d)))
-    X = np.column_stack([np.ones(len(d)), d["dq"], d["dd"]])
+    X = np.column_stack([np.ones(len(d)), d["dq"], d["ds"], d["dd"]])
     beta, *_ = np.linalg.lstsq(X, d["resid"].values, rcond=None)
     resid = d["resid"].values - X @ beta
-    se = np.sqrt(np.diag(float((resid ** 2).sum() / max(len(d) - 3, 1)) * np.linalg.inv(X.T @ X)))
+    se = np.sqrt(np.diag(float((resid ** 2).sum() / max(len(d) - 4, 1)) * np.linalg.inv(X.T @ X)))
     return dict(n=int(len(d)), intercept=float(beta[0]),
                 qb_coef=float(beta[1]), qb_t=float(beta[1] / se[1]),
-                def_coef=float(beta[2]), def_t=float(beta[2] / se[2]), rows=d)
+                swing_coef=float(beta[2]), swing_t=float(beta[2] / se[2]),
+                def_coef=float(beta[3]), def_t=float(beta[3] / se[3]), rows=d)
 
 
 def fit(bt: pd.DataFrame, idx: pd.DataFrame) -> dict:
