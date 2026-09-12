@@ -68,6 +68,14 @@ else:
 use_inj = st.sidebar.toggle("Drop players ruled out", value=True,
                             help="Uses the latest injury report of the current "
                                  "season (Out and Doubtful).")
+_roof = str(game_row["roof"]) if game_row is not None and pd.notna(game_row.get("roof")) else "outdoors"
+_wind0 = float(game_row["wind"]) if game_row is not None and pd.notna(game_row.get("wind")) else 0.0
+wind = st.sidebar.number_input("Wind (mph)", 0.0, 40.0, _wind0, 1.0,
+                               disabled=_roof in T.INDOOR_ROOFS,
+                               help="Forecast wind at kickoff. Above 10 mph each mph takes "
+                                    f"{-T.WIND_COEF:.1f} points off the projected total "
+                                    "(fitted on 2024–25). nflverse only records wind after "
+                                    "the game, so type the forecast for an upcoming one.")
 n_sims = st.sidebar.select_slider("Simulations", [4000, 10000, 20000, 50000], value=20000)
 
 st.title("🏈 Game Simulation")
@@ -87,7 +95,8 @@ except ValueError as e:
 sim = G.simulate_game(ratings, ctx["wk"], r_home, r_away, home, away,
                       ctx["pass_vol"], ctx["rush_vol"], ctx["rush_def"],
                       ctx["lg_pass"], home=None if neutral else "a",
-                      n_sims=n_sims, seed=11, avail=ctx.get("avail"))
+                      n_sims=n_sims, seed=11, avail=ctx.get("avail"),
+                      wind=wind, roof=_roof)
 s = G.summarize(sim)
 
 fav, dog = (home, away) if s["mean_margin"] >= 0 else (away, home)
@@ -126,7 +135,9 @@ if game_row is not None:
             wx += f", wind {game_row['wind']:.0f} mph"
         if pd.notna(game_row.get("temp")):
             wx += f", {game_row['temp']:.0f}°F"
-        bits.append(f"Venue: {wx}.")
+        shift = sim.get("weather_shift", 0.0)
+        bits.append(f"Venue: {wx}." + (f" Wind takes **{-shift:.1f} points** off the total."
+                                         if shift < 0 else ""))
     if bits:
         st.caption(("  " + chr(10)).join(bits))
 

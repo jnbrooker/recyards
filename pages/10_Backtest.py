@@ -76,7 +76,8 @@ if team_cmp.empty:
 n_games = int(team_cmp["games"].max())
 st.caption(f"{n_games} games of {seasons_txt}, each predicted before kickoff from "
            f"{args[3]} prior season(s) plus the earlier weeks. Win probabilities use a "
-           f"normal margin with sd {B.MARGIN_SD}.")
+           f"normal margin with sd {B.MARGIN_SD}. Wind is priced from the recorded "
+           "value, i.e. as if the forecast had been perfect.")
 show = team_cmp[["margin_rmse", "margin_mae", "margin_bias", "su_acc", "log_loss",
                  "brier", "total_rmse", "total_bias", "ats_pct", "resid_sd"]].copy()
 show.columns = ["Margin RMSE", "Margin MAE", "Margin bias", "Winner %", "Log-loss",

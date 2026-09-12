@@ -155,10 +155,11 @@ def simulate_game(ratings: dict, wk: pd.DataFrame,
                   lg_pass: dict | None = None,
                   home: str | None = "a",
                   n_sims: int = 20000, seed: int | None = None,
-                  avail: dict | None = None) -> dict:
+                  avail: dict | None = None, wind=None, roof=None) -> dict:
     """Simulate the game `n_sims` times and return scores plus both box scores.
-    `avail` is `{team: availability indices}` (see `availability.py`) — the
-    same expected-points shift `teams.expected_points` applies."""
+    `avail` is `{team: availability indices}` (see `availability.py`) and
+    `wind` / `roof` the weather — the same shifts `teams.expected_points`
+    applies (availability on the margin, wind on the total)."""
     rng = np.random.default_rng(seed)
     n = int(n_sims)
 
@@ -171,6 +172,8 @@ def simulate_game(ratings: dict, wk: pd.DataFrame,
         from . import availability as AV
         shift_a = 0.5 * AV.margin_shift(avail.get(team_a), avail.get(team_b))
         shift_b = -shift_a
+    wx = 0.5 * T.weather_total_shift(wind, roof)
+    shift_a, shift_b = shift_a + wx, shift_b + wx
     half = 0.5 * float(ratings.get("hfa", T.HFA_DEFAULT))
     if home in ("a", team_a):
         shift_a, shift_b = shift_a + half, shift_b - half
@@ -184,9 +187,9 @@ def simulate_game(ratings: dict, wk: pd.DataFrame,
     drives_a = np.clip(np.round(base + rng.normal(0, 0.35, n)), 6, 16).astype(int)
     drives_b = np.clip(np.round(base + rng.normal(0, 0.35, n)), 6, 16).astype(int)
 
-    # 2. drives -> score
-    sa = _score_side(rng, drives_a, mix_a, ratings, team_b, pace["mean"])
-    sb = _score_side(rng, drives_b, mix_b, ratings, team_a, pace["mean"])
+    # 2. drives -> score, in sequence with the running score feeding back
+    sa, sb = _score_sides(rng, drives_a, drives_b, mix_a, mix_b, ratings,
+                          team_a, team_b, pace["mean"])
     # a defensive score is produced by the DEFENSE, so it belongs to the other team
     pts_a = sa["off_points"] + sb["takeaway_points"]
     pts_b = sb["off_points"] + sa["takeaway_points"]
@@ -202,43 +205,94 @@ def simulate_game(ratings: dict, wk: pd.DataFrame,
         drives_a=drives_a, drives_b=drives_b, box_a=box_a, box_b=box_b,
         mix_a=mix_a, mix_b=mix_b, pace=pace, n_sims=n, home=home,
         avail=avail, avail_shift_a=float(shift_a), avail_shift_b=float(shift_b),
+        weather_shift=float(2 * wx), wind=wind, roof=roof,
     )
 
 
-def _score_side(rng, drives: np.ndarray, mix: dict, r: dict, defense: str,
-                pace_mean: float) -> dict:
-    """Resolve one team's drives into touchdowns, field goals and points.
+# Game script within the game (roadmap 8.8). Drives are resolved in sequence,
+# alternating possessions, and a team's scoring rate on each drive is scaled
+# by exp(-LEAD_BETA x (lead - expected lead so far) / 7): a side a touchdown
+# ahead of where the ratings expected it to be scores at exp(-LEAD_BETA) of
+# its rate, a side a touchdown behind at exp(+LEAD_BETA). Centring on the
+# EXPECTED lead keeps the mean margin where the ratings put it (they are
+# fitted to actual points, which already include favourites sitting on
+# leads) and changes only the spread. Independent drives give a team-points
+# sd of ~9.6 (pure binomial); the real CONDITIONAL spread — the residual
+# around the model's own prediction, 2024-25 out of sample — is ~9.3 per
+# team, 12.8 on the margin, with the two teams' points correlated +0.05.
+# Leading teams sitting on the ball and trailing teams pressing produces
+# both, and LEAD_BETA is calibrated to those moments.
+LEAD_BETA = 0.03
+MAX_DRIVES = 16
 
-    Scoring rates are scaled by how many drives this simulation drew, so that
-    expected points stay pace-invariant (see PACE_POINTS_ELASTICITY). A 13-drive
-    game has the same expected points as an 8-drive one, spread thinner.
+
+def _score_sides(rng, drives_a: np.ndarray, drives_b: np.ndarray, mix_a: dict, mix_b: dict,
+                 r: dict, team_a: str, team_b: str, pace_mean: float) -> tuple[dict, dict]:
+    """Resolve both teams' drives into touchdowns, field goals and points,
+    drive by drive with the running score feeding back into the rates.
+
+    Scoring rates are also scaled by how many drives this simulation drew, so
+    expected points stay pace-invariant (see PACE_POINTS_ELASTICITY): a
+    13-drive game has the same expected points as an 8-drive one, spread thinner.
     """
-    p_to = mix["p_turnover"]
-    scale = np.clip((pace_mean / np.maximum(drives, 1))
-                    ** (1.0 - PACE_POINTS_ELASTICITY), *PACE_SCALE_CLIP)
-    p_td = np.clip(mix["p_td"] * scale, 1e-4, 0.8)
-    p_fg = np.clip(mix["p_fg"] * scale, 1e-4, 0.8)
+    n = len(drives_a)
 
-    n_td = rng.binomial(drives, p_td)
-    rest = drives - n_td
-    n_fg = rng.binomial(rest, np.clip(p_fg / np.maximum(1 - p_td, 1e-6), 0, 1))
-    rest2 = rest - n_fg
-    n_to = rng.binomial(rest2, np.clip(p_to / np.maximum(1 - p_td - p_fg, 1e-6), 0, 1))
+    def base(mix, drives):
+        scale = np.clip((pace_mean / np.maximum(drives, 1))
+                        ** (1.0 - PACE_POINTS_ELASTICITY), *PACE_SCALE_CLIP)
+        return (np.clip(mix["p_td"] * scale, 1e-4, 0.8),
+                np.clip(mix["p_fg"] * scale, 1e-4, 0.8),
+                np.full(n, float(mix["p_turnover"])))
 
-    xp = rng.binomial(n_td, XP_RATE)
-    off_points = 6 * n_td + xp + 3 * n_fg
+    sides = {}
+    for key, drives, mix in (("a", drives_a, mix_a), ("b", drives_b, mix_b)):
+        p_td, p_fg, p_to = base(mix, drives)
+        sides[key] = dict(drives=drives, p_td=p_td, p_fg=p_fg, p_to=p_to,
+                          n_td=np.zeros(n, int), n_fg=np.zeros(n, int), n_to=np.zeros(n, int),
+                          pts=np.zeros(n, int))
 
-    # Points this team's DEFENSE takes the other way, plus the league's
-    # return/safety residual that belongs to no drive at all.
-    d_rate = float(r["def_score_rate"].get(defense, r["lg_def_score"])) \
-        if hasattr(r["def_score_rate"], "get") else r["lg_def_score"]
-    n_def_td = rng.poisson(np.clip(d_rate * drives, 0, None))
-    n_other = rng.poisson(np.full(len(drives), max(r.get("lg_other_ppg", 0.0), 0.0) / 7.0))
-    take = n_def_td + n_other
-    takeaway_points = 6 * take + rng.binomial(take, XP_RATE)
+    # expected points per drive for each side (for the expected lead so far)
+    ppd = {key: T.TD_POINTS * sides[key]["p_td"] + T.FG_POINTS * sides[key]["p_fg"]
+           for key in ("a", "b")}
+    for k in range(MAX_DRIVES):
+        for key, other in (("a", "b"), ("b", "a")):
+            s, o = sides[key], sides[other]
+            live = s["drives"] > k
+            if not live.any():
+                continue
+            # this side has had k drives, the other k (or k+1) — expected lead now
+            exp_lead = ppd[key] * k - ppd[other] * (k if key == "a" else k + 1)
+            lead = (s["pts"] - o["pts"] - exp_lead) / 7.0
+            f = np.exp(-LEAD_BETA * lead) if LEAD_BETA else 1.0
+            p_td = np.clip(s["p_td"] * f, 1e-4, 0.85)
+            p_fg = np.clip(s["p_fg"] * f, 1e-4, 0.85)
+            scoring = p_td + p_fg
+            over = scoring > 0.9
+            if np.any(over):
+                p_td = np.where(over, p_td * 0.9 / scoring, p_td)
+                p_fg = np.where(over, p_fg * 0.9 / scoring, p_fg)
+            u = rng.random(n)
+            td = live & (u < p_td)
+            fg = live & ~td & (u < p_td + p_fg)
+            to = live & ~td & ~fg & (u < p_td + p_fg + s["p_to"])
+            s["n_td"] += td; s["n_fg"] += fg; s["n_to"] += to
+            xp = td & (rng.random(n) < XP_RATE)
+            s["pts"] += 6 * td + xp + 3 * fg
 
-    return dict(n_td=n_td, n_fg=n_fg, n_to=n_to, off_points=off_points,
-                takeaway_points=takeaway_points)
+    out = []
+    for key, defense, drives in (("a", team_b, drives_a), ("b", team_a, drives_b)):
+        s = sides[key]
+        # Points this team's DEFENSE takes the other way, plus the league's
+        # return/safety residual that belongs to no drive at all.
+        d_rate = float(r["def_score_rate"].get(defense, r["lg_def_score"])) \
+            if hasattr(r["def_score_rate"], "get") else r["lg_def_score"]
+        n_def_td = rng.poisson(np.clip(d_rate * drives, 0, None))
+        n_other = rng.poisson(np.full(n, max(r.get("lg_other_ppg", 0.0), 0.0) / 7.0))
+        take = n_def_td + n_other
+        takeaway_points = 6 * take + rng.binomial(take, XP_RATE)
+        out.append(dict(n_td=s["n_td"], n_fg=s["n_fg"], n_to=s["n_to"],
+                        off_points=s["pts"], takeaway_points=takeaway_points))
+    return out[0], out[1]
 
 
 def _side_box(rng, wk, roster, team, opponent, drives, score, margin,

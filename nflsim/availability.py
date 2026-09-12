@@ -49,9 +49,12 @@ from . import data as D
 # n = 544 games). A side whose QB index is higher than its opponent's loses
 # QB_MARGIN_COEF x (difference) of margin; a side whose defense is missing more
 # starter importance gives up DEF_MARGIN_COEF x (difference).
-QB_MARGIN_COEF = -7.74      # t = -6.1  (familiarity dummy)
-QB_SWING_COEF = 3.29        # t = +3.4  (x ANY/A gap, starter minus incumbents)
-DEF_MARGIN_COEF = 12.36     # t = +2.3
+# Refitted 2026-09-12 after the team ratings' shrinkage was corrected
+# (teams.RATING_PRIOR_N 200 -> 35): the familiarity dummy had been carrying
+# part of the ratings' missing spread and halved; the swing and defense held.
+QB_MARGIN_COEF = -4.66      # t = -3.7  (familiarity dummy)
+QB_SWING_COEF = 3.88        # t = +3.9  (x ANY/A gap, starter minus incumbents)
+DEF_MARGIN_COEF = 10.73     # t = +2.0
 # Offensive line: fitted at -4.6 margin per unit of own-line index difference
 # (t = -1.1, n = 544; +0.02 RMSE out of sample) — right sign, not distinguishable
 # from zero on two seasons, so it is DISPLAY-ONLY until a third season says

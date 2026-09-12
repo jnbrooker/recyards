@@ -42,10 +42,11 @@ from . import rushing as R
 from . import touchdowns as TD
 from . import qb as Q
 
-# Normal approximation to the margin distribution for win probabilities. The
-# drive engine's simulated margin sd is ~14.2 and the 2024-25 residual sd 12.7;
-# 13.5 sits between them. `team_metrics` also reports the fitted residual sd.
-MARGIN_SD = 13.5
+# Normal approximation to the margin distribution for win probabilities: the
+# 2024-25 out-of-sample residual sd of the calibrated model (12.8), which is
+# also what the drive engine's LEAD_BETA is tuned to reproduce.
+# `team_metrics` reports the fitted residual sd alongside.
+MARGIN_SD = 12.8
 
 # Which players are worth scoring: enough prior games to have priors, and
 # enough expected volume that the prop would exist.
@@ -117,14 +118,16 @@ def _score_weeks(sched: pd.DataFrame, score_seasons, weeks=None):
 
 def team_backtest(score_seasons, n_prior: int = 2,
                   recency: D.Recency = D.RECENCY_DEFAULT,
-                  weeks=None, progress=None, availability: bool = False) -> pd.DataFrame:
+                  weeks=None, progress=None, availability: bool = False,
+                  weather: bool = True) -> pd.DataFrame:
     """One row per scored game: model margin/total vs actual and the closing line.
 
     Ratings (and home field, and the scoring-level calibration) are refitted
     for every week on drives and finals from before that week only. With
     `availability`, the QB-familiarity / defensive-starter margin shift
     (`availability.py`, as knowable before each kickoff) is applied and the
-    indices are kept in the output.
+    indices are kept in the output. With `weather` (default), the recorded
+    wind is priced on the total — i.e. as if the forecast had been perfect.
     """
     seasons = window(score_seasons, n_prior)
     drives = D.load_drives(seasons)
@@ -151,7 +154,9 @@ def team_backtest(score_seasons, n_prior: int = 2,
             h, a = gm["home_team"], gm["away_team"]
             if h not in r["off"].index or a not in r["off"].index:
                 continue
-            e = T.expected_points(r, h, a, home="a")
+            e = T.expected_points(r, h, a, home="a",
+                                  wind=gm.get("wind") if weather else None,
+                                  roof=gm.get("roof") if weather else None)
             rows.append(dict(
                 season=S, week=w, game_id=gm["game_id"], home=h, away=a,
                 pred_home=e["points_a"], pred_away=e["points_b"],
@@ -162,6 +167,7 @@ def team_backtest(score_seasons, n_prior: int = 2,
                 line_margin=gm.get("spread_line", np.nan),
                 line_total=gm.get("total_line", np.nan),
                 drives_fit=int(r["drives"]), hfa=float(r["hfa"]),
+                weather_shift=float(e.get("weather_shift", 0.0)),
             ))
     out = pd.DataFrame(rows)
     if out.empty:

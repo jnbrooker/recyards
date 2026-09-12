@@ -41,7 +41,7 @@ import pandas as pd
 from . import data as D
 
 # Shrinkage: drives-worth of league-average prior on each rating.
-RATING_PRIOR_N = 200.0     # ~20 games of drives
+RATING_PRIOR_N = 35.0      # drives-worth; was 200 — see roadmap 8.8 (out-of-sample slope 1.97 → 1.0)
 RATE_PRIOR_N = 250.0       # outcome rates are noisier per drive
 PACE_PRIOR_N = 8.0         # games-worth of prior on pace
 
@@ -61,6 +61,27 @@ TO_CLIP = (0.02, 0.30)
 
 TD_POINTS = D.DRIVE_POINTS["Touchdown"]
 FG_POINTS = D.DRIVE_POINTS["Field goal"]
+
+# Weather (roadmap 8.6). Wind is the one weather variable with a signal in the
+# out-of-sample total residuals: -0.52 points of total per mph above 10 (t =
+# -1.6, same sign and size in 2024 and 2025, and in line with what is known
+# about wind and scoring); cold was non-monotone and domes showed nothing, so
+# only wind is priced, shrunk to -0.4/mph and capped at 25 mph. nflverse only
+# records wind after the game, so for an upcoming game it has to be a forecast.
+WIND_COEF = -0.4
+WIND_FREE_MPH = 10.0
+WIND_CAP_MPH = 25.0
+INDOOR_ROOFS = ("dome", "closed")
+
+
+def weather_total_shift(wind=None, roof=None) -> float:
+    """Points of expected TOTAL from the weather (0 indoors or unknown)."""
+    if roof is not None and str(roof).lower() in INDOOR_ROOFS:
+        return 0.0
+    if wind is None or not np.isfinite(float(wind)):
+        return 0.0
+    w = float(np.clip(float(wind), 0.0, WIND_CAP_MPH))
+    return float(WIND_COEF * max(w - WIND_FREE_MPH, 0.0))
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +347,8 @@ def game_pace(r: dict, team_a: str, team_b: str) -> dict:
 
 
 def expected_points(r: dict, team_a: str, team_b: str,
-                    home: str | None = None, avail: dict | None = None) -> dict:
+                    home: str | None = None, avail: dict | None = None,
+                    wind=None, roof=None) -> dict:
     """A first, non-simulated read on the game: expected points for each team.
 
     `home` names which side is at home ("a", "b", or a team abbreviation); pass
@@ -358,6 +380,10 @@ def expected_points(r: dict, team_a: str, team_b: str,
         shift_b = -shift_a
         pts_a, pts_b = pts_a + shift_a, pts_b + shift_b
 
+    # Weather moves the total, split evenly; the margin is untouched.
+    wx = 0.5 * weather_total_shift(wind, roof)
+    pts_a, pts_b = pts_a + wx, pts_b + wx
+
     # Home field is split evenly: the home side gains half, the road side loses
     # half, so the total is untouched and only the margin moves.
     half = 0.5 * float(r.get("hfa", HFA_DEFAULT))
@@ -372,7 +398,7 @@ def expected_points(r: dict, team_a: str, team_b: str,
                 points_a=float(pts_a), points_b=float(pts_b),
                 margin=float(pts_a - pts_b), total=float(pts_a + pts_b),
                 avail_shift_a=float(shift_a), avail_shift_b=float(shift_b),
-                a=a, b=b)
+                weather_shift=float(2 * wx), a=a, b=b)
 
 
 def strength_table(r: dict) -> pd.DataFrame:

@@ -521,13 +521,60 @@ rating if the box-score yardage needs its own anchor.*
    the same ANY/A as the incumbents he replaced, so he takes the full
    unfamiliarity penalty until he has played.
 
-6. **Weather and roof.** nflverse schedules carry `roof`, `temp`, `wind`; pass
-   volume and yards per attempt drop measurably in wind. Cheap multiplier.
+6. ~~**Weather and roof.**~~ *Evaluated and built 2026-09-12 — wind only.*
+   Regressing the out-of-sample total residuals on the schedule's weather:
+   wind above 10 mph costs **−0.52 points of total per mph** (t = −1.6,
+   same sign and size in both seasons, and in line with what is known about
+   wind and scoring); cold is non-monotone (32–45°F −3.4, below 32 +0.2) and
+   domes show nothing, so only wind is priced — `teams.weather_total_shift`,
+   shrunk to −0.4/mph and capped at 25 mph, applied to the total (both sides
+   equally) in `expected_points` and the engine. On the harness it is a
+   wash (2024 +0.01, 2025 −0.03 on total RMSE, 79 windy games): priced but
+   unproven. Practical limit: nflverse only records wind after the game, so
+   page 7 has a wind input (prefilled when the schedule has it) and an
+   upcoming game needs the forecast typed in; fantasy and pick'em use the
+   schedule value when present.
+
 7. ~~**The market line as a comparator, not an anchor.**~~ Done — pages 7 and 8
    show the closing spread/total beside the model, never feeding it in.
-8. **Within-game drive correlation.** Totals are still ~9% wider than the real
-   within-matchup spread because drives are exchangeable; leading teams stop
-   pushing in real games.
+
+8. ~~**Within-game drive correlation.**~~ *Done 2026-09-12, and it turned
+   into the biggest calibration fix of the day.* Evaluating the engine's
+   spread against the harness's residuals exposed two things:
+
+   - **The team ratings were under-dispersed by half.** Out of sample, actual
+     margin regressed on predicted margin had a slope of **1.97** in both
+     seasons: `RATING_PRIOR_N = 200` drives of shrinkage (on recency-weighted
+     drives, which shrinks harder still) was far too much. Grid on 2024–25:
+     200 → 50 takes margin RMSE 13.52 → 13.26, winners 61.1% → 63.9%,
+     log-loss 0.655 → 0.643; 25 gives slope 0.97. Set to **35** (slope 1.03).
+     The availability coefficients had absorbed part of the missing spread
+     and were refitted on the corrected residuals: QB familiarity −7.74 →
+     **−4.66** (t = −3.7), quality swing **+3.88** (t = 3.9), defense
+     **+10.73** (t = 2.0). Final, both seasons out of sample:
+
+     | | margin RMSE | winners | log-loss | closing line |
+     |---|---|---|---|---|
+     | 2024 | **12.71** | 68.0% | 0.604 | 12.61 / 71.3% / 0.592 |
+     | 2025 | **12.79** | 62.0% | 0.644 | 12.27 / 65.3% / 0.610 |
+
+     Pooled the model is ~0.3 points of RMSE behind the market, from ~1.2 at
+     the start of the day; in 2024 it is within 0.1.
+
+   - **The engine's spread was ~9% too wide on margins.** Independent drives
+     give a team-points sd of ~9.6 (pure binomial); the real *conditional*
+     spread — residuals around the model's own prediction — is 9.3 per team,
+     12.8 on the margin, with the two teams' points correlated +0.05. Real
+     games are less variable than independent drives because leading teams
+     sit on the ball and trailing teams press. `game._score_sides` now
+     resolves drives in sequence, alternating possessions, with each side's
+     scoring rate scaled by `exp(−LEAD_BETA × (lead − expected lead so far)
+     / 7)`. Centring on the *expected* lead is essential: centring on zero
+     compressed the mean margin by 0.8 points, double-counting behaviour the
+     ratings (fitted to actual points) already contain. `LEAD_BETA = 0.03`
+     reproduces the targets (margin sd 12.72, team 9.28, corr +0.06, mean
+     shift +0.04); totals remain ~3% wide. The harness's win-probability sd
+     is 12.8 to match. A 7-point favourite is now 70.8% rather than 68.6%.
 
 *Decisions locked so far: offense-only box score · QB-perspective sacks & INTs ·
 fully self-contained scoring (no Vegas anchor).*
