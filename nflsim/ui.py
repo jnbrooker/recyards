@@ -146,6 +146,93 @@ def recency_caption(wk: pd.DataFrame | None, recency, shares: dict | None = None
                        f"**{shares[latest]:.0%}** of the model; {tail}.")
 
 
+@st.cache_data(ttl=6 * 3600, show_spinner="Loading play-by-play, depth charts and injuries…")
+def cached_context(seasons: tuple[int, ...], recency) -> dict:
+    """The full game-engine context (`game.prepare`), shared by every page
+    that offers the game view — one download and one set of ratings per
+    (seasons, recency) for the whole app."""
+    from . import game as G
+    return G.prepare(tuple(sorted(seasons)), recency=recency)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Building rosters…")
+def cached_team_roster(seasons: tuple[int, ...], recency, team: str,
+                       use_injuries: bool) -> pd.DataFrame:
+    from . import game as G
+    return RO.roster_for(cached_context(seasons, recency), team, use_injuries)
+
+
+def view_picker(key: str = "view") -> str:
+    """Game view (a real fixture: opponent, home/away, availability and game
+    script from the engine) or Season view (the player's typical game vs a
+    chosen defense)."""
+    return st.sidebar.radio(
+        "View", ["Game", "Season"], horizontal=True, key=f"{key}_view",
+        help="**Game**: pick a fixture; the opponent, home field, who is playing "
+             "(QB familiarity, defensive starters out) and the game script — a "
+             "team expected to trail runs less — all come from the game engine.  \n"
+             "**Season**: the player's typical game, against whichever defense you "
+             "pick. Closer to a season-long average.")
+
+
+def game_picker(ctx: dict, seasons, recency, positions: list[str], key: str = "game") -> dict:
+    """Week → game → side → player, from the live rosters. Returns the roster
+    row plus the fixture: team, opponent, is_home, game_row, use_injuries."""
+    from . import data as D
+    sched = D.load_schedule((int(ctx["depth_seasons"][-1]),))
+    if sched.empty:
+        st.sidebar.error("The schedule did not load."); st.stop()
+    weeks = sorted(sched["week"].unique().tolist())
+    cur = D.current_week(sched)
+    week = st.sidebar.selectbox("Week", weeks, index=weeks.index(cur) if cur in weeks else 0,
+                                key=f"{key}_week")
+    wg = sched[sched["week"] == week].reset_index(drop=True)
+    labels = [D.game_label(r) for _, r in wg.iterrows()]
+    unplayed = [i for i, r in wg.iterrows() if not bool(r["played"])]
+    pick = st.sidebar.selectbox("Game", labels, index=unplayed[0] if unplayed else 0,
+                                key=f"{key}_game")
+    game_row = wg.iloc[labels.index(pick)]
+    home, away = game_row["home_team"], game_row["away_team"]
+    use_inj = st.sidebar.toggle("Drop players ruled out", value=True, key=f"{key}_inj")
+    frames = []
+    for team in (home, away):
+        try:
+            frames.append(cached_team_roster(tuple(sorted(seasons)), recency, team, use_inj))
+        except ValueError:
+            continue
+    if not frames:
+        st.sidebar.error("No usable depth charts for this game."); st.stop()
+    pool = pd.concat(frames, ignore_index=True)
+    pool = pool[pool["position"].isin(positions)].copy()
+    pool["_order"] = pool["position"].map({p: i for i, p in enumerate(positions)})
+    pool["_side"] = (pool["team"] == away).astype(int)      # home first
+    pool = pool.sort_values(["_side", "_order", "depth"])
+    pool["label"] = [RO.player_label(r) for _, r in pool.iterrows()]
+    if pool.empty:
+        st.sidebar.error(f"No {'/'.join(positions)} on either depth chart."); st.stop()
+    label = st.sidebar.selectbox(
+        "Player", pool["label"].tolist(), key=f"{key}_player",
+        help="Both teams' depth charts, home team first. Tags: OUT / DOUBTFUL / Q "
+             "from the latest injury report; 'no history' = role prior only.")
+    row = pool[pool["label"] == label].iloc[0]
+    team = row["team"]
+    return dict(row=row, team=team, opp=away if team == home else home,
+                is_home=(team == home), game_row=game_row, week=int(week),
+                use_injuries=use_inj)
+
+
+def script_caption(f: dict, game_row, what: str, typical: float, this_game: float,
+                   player_typical: float, player_game: float) -> str:
+    """One line on what the game view changed for this player."""
+    side = "home" if f.get("is_home", True) else "away"
+    fav = f["team"] if f["exp_margin"] >= 0 else f["opp"]
+    return (f"**Game view — {f['team']} vs {f['opp']}:** expected margin "
+            f"{fav} by {abs(f['exp_margin']):.1f} ({f['team']} win {f['win']:.0%}), "
+            f"{f['team']} projected {f['points_for']:.1f} points (typical {f['typical_points']:.1f}). "
+            f"Team {what} {typical:.1f} → **{this_game:.1f}** in this game; the player's expected "
+            f"{what} {player_typical:.1f} → **{player_game:.1f}**.")
+
+
 def cached_live(seasons: tuple[int, ...], recency=None) -> dict:
     from . import data as D
     return RO.load_live(tuple(sorted(seasons)), recency=recency or D.RECENCY_DEFAULT)

@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-from nflsim import data as D, rushing as R
+from nflsim import data as D, rushing as R, game as G
 from nflsim import roster as RO, ui as UI
 
 st.set_page_config(page_title="Rushing Yards Simulator", page_icon="🏈", layout="wide")
@@ -56,6 +56,7 @@ def get_live_team_vol(seasons, recency):
 
 st.sidebar.header("Setup")
 seasons, recency = UI.priors_picker("Seasons used to build priors")
+view = UI.view_picker("rush")
 
 try:
     wk = get_weekly(tuple(seasons), recency)
@@ -71,30 +72,33 @@ UI.recency_caption(wk, recency)
 
 players, defenses, team_vol, def_profiles = get_derived(tuple(seasons), recency)
 
-use_live = st.sidebar.toggle(
-    "Pick from live depth charts", value=True,
-    help="Current-season depth chart and injury report. The player's usage share is "
-         "redistributed when teammates are ruled out, and team volume follows his "
-         "CURRENT team, not the one in his history.")
-live_row = None
-if use_live:
-    use_inj = st.sidebar.toggle("Drop players ruled out", value=True)
-    rosters = get_rosters(tuple(seasons), recency, use_inj)
-    if rosters.empty:
-        st.sidebar.error("Depth charts did not load — using history only."); use_live = False
-    else:
-        live_row = UI.pick_player(rosters, ['RB', 'QB', 'WR', 'FB'], key='rush')
-        player_id = live_row["player_id"]
-if not use_live:
-    player_label = st.sidebar.selectbox(
-        "Rusher", players["label"].tolist(),
-        help="Only players with 40+ carries in the selected seasons are listed.")
-    player_row = players[players["label"] == player_label].iloc[0]
-    player_id = player_row["player_id"]
-
-
-opp = st.sidebar.selectbox("Opponent defense", defenses,
-                           index=defenses.index("SF") if "SF" in defenses else 0)
+live_row, game, ctx = None, None, None
+if view == "Game":
+    ctx = UI.cached_context(tuple(seasons), recency)
+    game = UI.game_picker(ctx, seasons, recency, ['RB', 'QB', 'WR', 'FB'], key='rush')
+    live_row, player_id, opp = game["row"], game["row"]["player_id"], game["opp"]
+else:
+    use_live = st.sidebar.toggle(
+        "Pick from live depth charts", value=True,
+        help="Current-season depth chart and injury report. The player's usage share is "
+             "redistributed when teammates are ruled out, and team volume follows his "
+             "CURRENT team, not the one in his history.")
+    if use_live:
+        use_inj = st.sidebar.toggle("Drop players ruled out", value=True)
+        rosters = get_rosters(tuple(seasons), recency, use_inj)
+        if rosters.empty:
+            st.sidebar.error("Depth charts did not load — using history only."); use_live = False
+        else:
+            live_row = UI.pick_player(rosters, ['RB', 'QB', 'WR', 'FB'], key='rush')
+            player_id = live_row["player_id"]
+    if not use_live:
+        player_label = st.sidebar.selectbox(
+            "Rusher", players["label"].tolist(),
+            help="Only players with 40+ carries in the selected seasons are listed.")
+        player_row = players[players["label"] == player_label].iloc[0]
+        player_id = player_row["player_id"]
+    opp = st.sidebar.selectbox("Opponent defense", defenses,
+                               index=defenses.index("SF") if "SF" in defenses else 0)
 line = st.sidebar.number_input("Prop line (rushing yards)", 0.0, 250.0, 59.5, 0.5)
 
 st.sidebar.divider()
@@ -119,6 +123,14 @@ if live_row is not None:
     pri["mu_share"] = UI.live_share(live_row, "carry_share")
 pos = pri["position"]
 tv = team_vol.get(pri["team"], team_vol["_LEAGUE_"])
+factors = None
+if game is not None:
+    gr = game["game_row"]
+    factors = G.script_factors(ctx, game["team"], opp, home="a" if game["is_home"] else "b",
+                               wind=gr.get("wind"), roof=gr.get("roof"))
+    factors["is_home"] = game["is_home"]
+    tv_typical = tv
+    tv = factors["carries"]
 dprof = def_profiles.get(opp) if use_def else None
 
 sim = R.simulate(pri, tv, dprof, n_sims=n_sims, def_shrink=shrink, seed=7)
@@ -128,6 +140,9 @@ st.title("🏈 Rushing Yards Simulator")
 if live_row is not None:
     UI.status_warning(live_row)
     st.caption(UI.role_caption(live_row, "carry_share", "carries"))
+if factors is not None:
+    st.caption(UI.script_caption(factors, game["game_row"], "carries", tv_typical[0], tv[0],
+                                 tv_typical[0] * pri["mu_share"], tv[0] * pri["mu_share"]))
 st.caption(f"**{pri['name']}** ({pos}, {pri['team']}) vs **{opp}** defense — "
            f"{pri['games']} games of history, {n_sims:,} simulations")
 

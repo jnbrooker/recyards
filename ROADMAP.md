@@ -622,6 +622,24 @@ rating if the box-score yardage needs its own anchor.*
      shift +0.04); totals remain ~3% wide. The harness's win-probability sd
      is 12.8 to match. A 7-point favourite is now 70.8% rather than 68.6%.
 
+9. **Game view on the single-stat pages.** *(Added 2026-09-12.)* A prop is
+   priced for one game, so pages 1–5 now have a **Game / Season** view.
+   *Game*: pick week → fixture → player (both depth charts); the opponent,
+   home field, availability, wind and the **pre-game script** come from the
+   engine — the team's expected carries / dropbacks in this game via the
+   measured elasticities on the model's expected margin (`game.script_factors`:
+   carries +0.113 per point, se 0.039; dropbacks flat), and on the TD page the
+   per-touch rates scale with this game's expected points over the team's
+   typical. *Season*: the old flow, any player vs any defense.
+
+   Measuring those elasticities also recalibrated the engine: pass share
+   moves −0.0034 per point of *realised* margin but only −0.0011 per point of
+   the model's *expected* margin (the realised slope includes the reverse
+   direction — teams that throw lose by more), so the hand-set
+   `GAME_SCRIPT_BETA = 0.006` overstated the script 2–4×; it is 0.002 now,
+   between the two. Judkins as a 14-point road dog: 13.8 carries in season
+   view, 12.8 in game view, where the old engine had him at 11.1.
+
 ## 9. Maintenance
 
 Several constants are fitted on out-of-sample residuals and rest on two

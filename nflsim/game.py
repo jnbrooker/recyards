@@ -66,9 +66,23 @@ PACE_POINTS_ELASTICITY = 0.0     # expected points are pace-invariant
 PACE_VOLUME_ELASTICITY = 0.344   # plays ~ drives ** 0.344
 PACE_SCALE_CLIP = (0.55, 1.8)
 
-# Game script: extra pass share per point of deficit.
-GAME_SCRIPT_BETA = 0.006
+# Game script: extra pass share per point of deficit, applied to the REALISED
+# margin in each simulation. Measured on 2024-25 (roadmap 8.9): pass share
+# moves -0.0034 per point of realised margin, but only -0.0011 per point of the
+# model's pre-game EXPECTED margin — the realised slope includes the reverse
+# direction (teams that throw more lose by more). 0.002 sits between the two
+# so the engine's mean volume shift for an expected 14-point dog (~3 pp) is
+# near the measured 1.5 pp while within-sim correlation stays realistic. The
+# hand-set 0.006 it replaces overstated the script ~2-4x.
+GAME_SCRIPT_BETA = 0.002
 PASS_FRAC_CLIP = (0.25, 0.80)
+
+# Pre-game script for the single-stat pages' GAME VIEW: how a team's volume
+# moves with the model's expected margin, measured on 2024-25 out-of-sample
+# expectations (carries +0.113 per point, se 0.039; dropbacks -0.006, se
+# 0.044 — i.e. flat).
+SCRIPT_CARRIES_PER_POINT = 0.113
+SCRIPT_DROPBACKS_PER_POINT = 0.0
 
 XP_RATE = 0.96              # so a touchdown averages T.TD_POINTS
 
@@ -501,6 +515,37 @@ def prepare(seasons: tuple[int, ...], depth_seasons: tuple[int, ...] | None = No
     except Exception:
         ctx["avail"] = {}
     return ctx
+
+
+def script_factors(ctx: dict, team: str, opp: str, home: str | None = "a",
+                   wind=None, roof=None) -> dict:
+    """The pre-game view of one matchup for the single-stat pages: expected
+    margin and win probability (ratings + availability + home field + wind),
+    the team's expected carries / dropbacks / targets in THIS game vs its
+    typical game (`SCRIPT_*_PER_POINT`), and a touchdown factor — this game's
+    expected points over the team's typical points, which scales per-touch
+    TD rates (more scoring drives, more red-zone touches)."""
+    r = ctx["ratings"]
+    e = T.expected_points(r, team, opp, home=home, avail=ctx.get("avail"), wind=wind, roof=roof)
+    margin = float(e["margin"])
+    mu_db, sd_db = ctx["pass_vol"].get(team, ctx["pass_vol"]["_LEAGUE_"])
+    mu_car, sd_car = ctx["rush_vol"].get(team, ctx["rush_vol"]["_LEAGUE_"])
+    car = max(mu_car + SCRIPT_CARRIES_PER_POINT * margin, 8.0)
+    db = max(mu_db + SCRIPT_DROPBACKS_PER_POINT * margin, 12.0)
+    tv = ctx["team_vol"].get(team, ctx["team_vol"]["_LEAGUE_"])
+    tgt_per_db = tv["targets"] / max(tv["dropbacks"], 1e-6)
+    typical = (r["lg_ppd"] + float(r["off"].get(team, 0.0))) * r["lg_pace"] + float(r.get("lg_other_ppg", 0.0))
+    td_factor = float(np.clip(e["points_a"] / max(typical, 1e-6), 0.6, 1.5))
+    from math import erf, sqrt
+    win = 0.5 * (1 + erf(margin / 12.8 / sqrt(2)))
+    return dict(team=team, opp=opp, exp_margin=margin, win=float(win),
+                points_for=float(e["points_a"]), points_against=float(e["points_b"]),
+                carries=(float(car), float(sd_car)), carries_typical=float(mu_car),
+                dropbacks=(float(db), float(sd_db)), dropbacks_typical=float(mu_db),
+                targets=(float(db * tgt_per_db), float(sd_db * tgt_per_db)),
+                targets_typical=float(mu_db * tgt_per_db),
+                td_factor=td_factor, typical_points=float(typical),
+                avail_shift=float(e.get("avail_shift_a", 0.0)), weather_shift=float(e.get("weather_shift", 0.0)))
 
 
 def roster_for(ctx: dict, team: str, use_injuries: bool = True,

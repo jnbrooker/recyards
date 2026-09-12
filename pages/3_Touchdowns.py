@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-from nflsim import data as D, touchdowns as T
+from nflsim import data as D, touchdowns as T, game as G
 from nflsim import roster as RO, ui as UI
 
 st.set_page_config(page_title="Touchdowns Simulator", page_icon="🏈", layout="wide")
@@ -49,6 +49,7 @@ def get_live_team_vol(seasons, recency):
 
 st.sidebar.header("Setup")
 seasons, recency = UI.priors_picker("Seasons used to build priors")
+view = UI.view_picker("td")
 
 try:
     wk = get_weekly(tuple(seasons), recency)
@@ -64,30 +65,33 @@ UI.recency_caption(wk, recency)
 
 players, defenses, lg, def_profiles = get_derived(tuple(seasons), recency)
 
-use_live = st.sidebar.toggle(
-    "Pick from live depth charts", value=True,
-    help="Current-season depth chart and injury report. The player's usage share is "
-         "redistributed when teammates are ruled out, and team volume follows his "
-         "CURRENT team, not the one in his history.")
-live_row = None
-if use_live:
-    use_inj = st.sidebar.toggle("Drop players ruled out", value=True)
-    rosters = get_rosters(tuple(seasons), recency, use_inj)
-    if rosters.empty:
-        st.sidebar.error("Depth charts did not load — using history only."); use_live = False
-    else:
-        live_row = UI.pick_player(rosters, ['RB', 'WR', 'TE', 'QB', 'FB'], key='td')
-        player_id = live_row["player_id"]
-if not use_live:
-    player_label = st.sidebar.selectbox(
-        "Player", players["label"].tolist(),
-        help="Players with 30+ combined carries and catches in the selected seasons.")
-    player_row = players[players["label"] == player_label].iloc[0]
-    player_id = player_row["player_id"]
-
-
-opp = st.sidebar.selectbox("Opponent defense", defenses,
-                           index=defenses.index("SF") if "SF" in defenses else 0)
+live_row, game, ctx = None, None, None
+if view == "Game":
+    ctx = UI.cached_context(tuple(seasons), recency)
+    game = UI.game_picker(ctx, seasons, recency, ['RB', 'WR', 'TE', 'QB', 'FB'], key='td')
+    live_row, player_id, opp = game["row"], game["row"]["player_id"], game["opp"]
+else:
+    use_live = st.sidebar.toggle(
+        "Pick from live depth charts", value=True,
+        help="Current-season depth chart and injury report. The player's usage share is "
+             "redistributed when teammates are ruled out, and team volume follows his "
+             "CURRENT team, not the one in his history.")
+    if use_live:
+        use_inj = st.sidebar.toggle("Drop players ruled out", value=True)
+        rosters = get_rosters(tuple(seasons), recency, use_inj)
+        if rosters.empty:
+            st.sidebar.error("Depth charts did not load — using history only."); use_live = False
+        else:
+            live_row = UI.pick_player(rosters, ['RB', 'WR', 'TE', 'QB', 'FB'], key='td')
+            player_id = live_row["player_id"]
+    if not use_live:
+        player_label = st.sidebar.selectbox(
+            "Player", players["label"].tolist(),
+            help="Players with 30+ combined carries and catches in the selected seasons.")
+        player_row = players[players["label"] == player_label].iloc[0]
+        player_id = player_row["player_id"]
+    opp = st.sidebar.selectbox("Opponent defense", defenses,
+                               index=defenses.index("SF") if "SF" in defenses else 0)
 line = st.sidebar.number_input("TD line", 0.5, 3.5, 0.5, 1.0,
                                help="0.5 = anytime TD. 1.5 = two or more, etc.")
 
@@ -114,6 +118,22 @@ if live_row is not None:
     pri = RO.scale_volume_priors(pri, "mu_car", "var_car",
         UI.live_share(live_row, "carry_share") * tv["carries"])
 pos = pri["position"]
+factors = None
+if game is not None:
+    gr = game["game_row"]
+    factors = G.script_factors(ctx, game["team"], opp, home="a" if game["is_home"] else "b",
+                               wind=gr.get("wind"), roof=gr.get("roof"))
+    factors["is_home"] = game["is_home"]
+    typical = dict(rec=pri["mu_rec"], car=pri["mu_car"], p_rec=pri["p_rec_td"], p_rush=pri["p_rush_td"])
+    # volume follows the game script; per-touch conversion follows this
+    # game's expected scoring vs the team's typical (more scoring drives, more
+    # red-zone touches)
+    k_db = factors["dropbacks"][0] / max(factors["dropbacks_typical"], 1e-6)
+    k_car = factors["carries"][0] / max(factors["carries_typical"], 1e-6)
+    pri = RO.scale_volume_priors(pri, "mu_rec", "var_rec", pri["mu_rec"] * k_db)
+    pri = RO.scale_volume_priors(pri, "mu_car", "var_car", pri["mu_car"] * k_car)
+    pri["p_rec_td"] = float(np.clip(pri["p_rec_td"] * factors["td_factor"], 0.0, 0.5))
+    pri["p_rush_td"] = float(np.clip(pri["p_rush_td"] * factors["td_factor"], 0.0, 0.4))
 dprof = def_profiles.get((opp, pos)) if use_def else None
 sim = T.simulate(pri, dprof, n_sims=n_sims, def_shrink=shrink, seed=7)
 s = T.summarize(sim, line)
@@ -123,6 +143,14 @@ if live_row is not None:
     UI.status_warning(live_row)
     st.caption(UI.role_caption(live_row, "target_share", "targets") + "  " + chr(10)
                + UI.role_caption(live_row, "carry_share", "carries"))
+if factors is not None:
+    fav = factors["team"] if factors["exp_margin"] >= 0 else factors["opp"]
+    st.caption(f"**Game view — {factors['team']} vs {factors['opp']}:** expected margin {fav} by "
+               f"{abs(factors['exp_margin']):.1f} ({factors['team']} win {factors['win']:.0%}), "
+               f"{factors['team']} projected {factors['points_for']:.1f} points (typical "
+               f"{factors['typical_points']:.1f}). Expected receptions {typical['rec']:.1f} → "
+               f"**{pri['mu_rec']:.1f}**, carries {typical['car']:.1f} → **{pri['mu_car']:.1f}**; "
+               f"TD rates ×{factors['td_factor']:.2f} for this game's scoring outlook.")
 st.caption(f"**{pri['name']}** ({pos}, {pri['team']}) vs **{opp}** defense — "
            f"rushing + receiving, {pri['games']} games of history, {n_sims:,} simulations")
 

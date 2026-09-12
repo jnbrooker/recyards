@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-from nflsim import data as D, qb as Q
+from nflsim import data as D, qb as Q, game as G
 from nflsim import roster as RO, ui as UI
 
 st.set_page_config(page_title="QB Sacks Simulator", page_icon="🏈", layout="wide")
@@ -43,6 +43,7 @@ def get_live_team_vol(seasons, recency):
 
 st.sidebar.header("Setup")
 seasons, recency = UI.priors_picker("Seasons used to build priors")
+view = UI.view_picker("qb")
 try:
     wk = get_weekly(tuple(seasons), recency)
 except ValueError as e:
@@ -58,28 +59,33 @@ UI.recency_caption(wk, recency)
 qbs, defenses, lg, def_profiles = get_derived(tuple(seasons), recency)
 ttt = get_ttt(tuple(seasons), recency)
 
-use_live = st.sidebar.toggle(
-    "Pick from live depth charts", value=True,
-    help="Current-season depth chart and injury report. The player's usage share is "
-         "redistributed when teammates are ruled out, and team volume follows his "
-         "CURRENT team, not the one in his history.")
-live_row = None
-if use_live:
-    use_inj = st.sidebar.toggle("Drop players ruled out", value=True)
-    rosters = get_rosters(tuple(seasons), recency, use_inj)
-    if rosters.empty:
-        st.sidebar.error("Depth charts did not load — using history only."); use_live = False
-    else:
-        live_row = UI.pick_player(rosters, ['QB'], key='qb')
-        player_id = live_row["player_id"]
-if not use_live:
-    player_label = st.sidebar.selectbox("Quarterback", qbs["label"].tolist(),
-                                        help="QBs with 120+ attempts in the selected seasons.")
-    player_row = qbs[qbs["label"] == player_label].iloc[0]
-    player_id = player_row["player_id"]
+live_row, game, ctx = None, None, None
+if view == "Game":
+    ctx = UI.cached_context(tuple(seasons), recency)
+    game = UI.game_picker(ctx, seasons, recency, ['QB'], key='qb')
+    live_row, player_id, opp = game["row"], game["row"]["player_id"], game["opp"]
+else:
+    use_live = st.sidebar.toggle(
+        "Pick from live depth charts", value=True,
+        help="Current-season depth chart and injury report. The player's usage share is "
+             "redistributed when teammates are ruled out, and team volume follows his "
+             "CURRENT team, not the one in his history.")
+    if use_live:
+        use_inj = st.sidebar.toggle("Drop players ruled out", value=True)
+        rosters = get_rosters(tuple(seasons), recency, use_inj)
+        if rosters.empty:
+            st.sidebar.error("Depth charts did not load — using history only."); use_live = False
+        else:
+            live_row = UI.pick_player(rosters, ['QB'], key='qb')
+            player_id = live_row["player_id"]
+    if not use_live:
+        player_label = st.sidebar.selectbox("Quarterback", qbs["label"].tolist(),
+                                            help="QBs with 120+ attempts in the selected seasons.")
+        player_row = qbs[qbs["label"] == player_label].iloc[0]
+        player_id = player_row["player_id"]
+    opp = st.sidebar.selectbox("Opponent defense", defenses,
+                               index=defenses.index("SF") if "SF" in defenses else 0)
 
-opp = st.sidebar.selectbox("Opponent defense", defenses,
-                           index=defenses.index("SF") if "SF" in defenses else 0)
 line = st.sidebar.number_input("Sacks line", 0.5, 8.5, 2.5, 1.0,
                                help="Prop line for sacks taken. 2.5 = three or more.")
 st.sidebar.divider()
@@ -97,11 +103,23 @@ except ValueError:
     st.error(f"{live_row['name']} has no passing history in the selected seasons."); st.stop()
 if live_row is not None:
     pri["team"] = live_row["team"]
+factors = None
+if game is not None:
+    gr = game["game_row"]
+    factors = G.script_factors(ctx, game["team"], opp, home="a" if game["is_home"] else "b",
+                               wind=gr.get("wind"), roof=gr.get("roof"))
+    factors["is_home"] = game["is_home"]
+    typical_vol = pri["mu_db"]
+    k = factors["dropbacks"][0] / max(factors["dropbacks_typical"], 1e-6)
+    pri = RO.scale_volume_priors(pri, "mu_db", "var_db", pri["mu_db"] * k)
 dprof = def_profiles.get(opp) if use_def else None
 sim = Q.simulate_sacks(pri, dprof, lg, n_sims=n_sims, def_shrink=shrink, seed=7)
 s = Q.summarize(sim, line)
 
 st.title("🏈 QB Sacks Simulator")
+if factors is not None:
+    st.caption(UI.script_caption(factors, game["game_row"], "dropbacks",
+                                 factors["dropbacks_typical"], factors["dropbacks"][0], typical_vol, pri["mu_db"]))
 if live_row is not None:
     UI.status_warning(live_row)
     st.caption(f"**{live_row['team']} QB{int(live_row['depth'])}**" + (f" · history is from **{live_row['prev_team']}**" if live_row.get("prev_team") and live_row["prev_team"] != live_row["team"] else ""))

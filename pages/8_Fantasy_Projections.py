@@ -16,9 +16,8 @@ from nflsim import ui as UI
 st.set_page_config(page_title="Fantasy Projections", page_icon="🏈", layout="wide")
 
 
-@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Loading play-by-play, depth charts and injuries…")
 def get_context(seasons, recency):
-    return G.prepare(tuple(sorted(seasons)), recency=recency)
+    return UI.cached_context(tuple(sorted(seasons)), recency)
 
 
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner=False)
