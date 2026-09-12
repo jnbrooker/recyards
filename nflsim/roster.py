@@ -312,11 +312,14 @@ def _player_row(pl: pd.Series, h: pd.DataFrame, totals: pd.DataFrame,
         own_car = _share_from_counts(h, totals, "carries")
         # the snap prior is per game appeared; make it unconditional too
         avail = _stint_appearance_rate(h, totals)
+        avail_rate = avail
         if snap_share is not None:
             tgt_prior = _blend(0.5, SNAP_TARGET_SLOPE.get(pos, 0.01) * snap_share * avail, rank_tgt, rank_tgt, depth == 1)
             car_prior = _blend(0.5, SNAP_CARRY_SLOPE.get(pos, 0.005) * snap_share * avail, rank_car, rank_car, depth == 1)
         tgt = _blend(blend, _safe(own_tgt, tgt_prior), tgt_prior, rank_tgt, depth == 1)
         car = _blend(blend, _safe(own_car, car_prior), car_prior, rank_car, depth == 1)
+        b_tgt = _history_weight(blend, _safe(own_tgt, tgt_prior), rank_tgt, depth == 1)
+        b_car = _history_weight(blend, _safe(own_car, car_prior), rank_car, depth == 1)
 
         # Efficiency rates on recency-weighted totals, regressed toward league.
         tg_tot, rec_tot = _wsum(h, "targets"), _wsum(h, "receptions")
@@ -336,6 +339,8 @@ def _player_row(pl: pd.Series, h: pd.DataFrame, totals: pd.DataFrame,
         prev_team = str(h["recent_team"].iloc[-1])
     else:
         tgt, car = tgt_prior, car_prior
+        b_tgt = b_car = 0.0
+        avail_rate = 1.0
         catch, ypt = lg["catch"], lg["ypt"]
         rec_td, rush_td = lg["rec_td"], lg["rush_td"]
         from . import touchdowns as TDm
@@ -359,6 +364,11 @@ def _player_row(pl: pd.Series, h: pd.DataFrame, totals: pd.DataFrame,
         player_id=str(pl["player_id"]), name=name, position=pos, depth=depth,
         games=games, from_history=bool(games), blend=float(blend),
         prev_team=prev_team, snap_share=snap_share, role_source=role_source,
+        b_tgt=float(b_tgt), b_car=float(b_car),
+        # games appeared / team games during his stints: the shares above are
+        # UNCONDITIONAL (missed games count as zero); divide by this for
+        # "if he plays" (the single-stat pages do, via ui.live_share)
+        avail_rate=float(avail_rate),
         target_share=float(max(tgt, 0.0)), carry_share=float(max(car, 0.0)),
         catch_rate=float(np.clip(catch, 0.30, 0.90)),
         ypt=float(np.clip(ypt, 3.0, 14.0)),
@@ -393,6 +403,17 @@ def _blend(weight: float, own: float, prior: float, anchor: float,
     return b * own + (1 - b) * prior
 
 
+def _history_weight(weight: float, own: float, anchor: float, top_slot: bool) -> float:
+    """The weight `_blend` puts on history — how much evidence sits behind a
+    share (0 = pure prior). Used to decide who gives way when a group
+    over- or under-fills."""
+    if own <= 0 or anchor <= 0:
+        return 0.0
+    if top_slot and own >= anchor:
+        return float(weight)
+    return float(weight * (min(own, anchor) / max(own, anchor)) ** CONSISTENCY_POW)
+
+
 def team_group_shares(wk: pd.DataFrame, team: str) -> dict:
     """The team's own split of carries and targets by position group,
     recency-weighted and shrunk toward league over GROUP_PRIOR_GAMES."""
@@ -412,26 +433,47 @@ def team_group_shares(wk: pd.DataFrame, team: str) -> dict:
     return out
 
 
+def _fit_group(vals: np.ndarray, evidence: np.ndarray, want: float) -> np.ndarray:
+    """Scale a group's shares to sum to `want`, taking the adjustment from the
+    least-evidenced shares first: each share moves in proportion to
+    (1 - evidence), so a star's well-measured 34% is not cut to make room for
+    a fifth receiver's guessed slot. Falls back to proportional scaling for
+    whatever the low-evidence shares cannot absorb."""
+    tot = float(vals.sum())
+    if tot <= 0:
+        return vals
+    gap = want - tot
+    give = vals * (1.0 - np.clip(evidence, 0.0, 1.0))
+    if gap < 0:
+        # shrink: the low-evidence mass can absorb at most its own size
+        absorb = min(-gap, float(give.sum()) * 0.95)
+        out = vals - give * (absorb / give.sum() if give.sum() > 0 else 0.0)
+        rest = -gap - absorb
+        return out * (1.0 - rest / max(out.sum(), 1e-9)) if rest > 0 else out
+    out = vals + give * (gap / give.sum()) if give.sum() > 0 else vals
+    return out * (want / out.sum())
+
+
 def allocate_shares(r: pd.DataFrame, group_shares: dict | None = None) -> pd.DataFrame:
     """Turn per-player blended shares into a roster allocation: each position
-    group normalised to its share of the team's touches. Operates on
-    `target_share` / `carry_share` of the ACTIVE players in `r`; inactive
-    players get zero."""
+    group fitted to its share of the team's touches, low-evidence shares giving
+    way first (`_fit_group`). Operates on `target_share` / `carry_share` of the
+    ACTIVE players in `r`; inactive players get zero."""
     r = r.copy()
     act = r["active"].values.astype(bool)
-    for col, key, league in (("carry_share", "carries", LEAGUE_CARRY_GROUP),
-                             ("target_share", "targets", LEAGUE_TARGET_GROUP)):
+    for col, bcol, key, league in (("carry_share", "b_car", "carries", LEAGUE_CARRY_GROUP),
+                                   ("target_share", "b_tgt", "targets", LEAGUE_TARGET_GROUP)):
         gs = (group_shares or {}).get(key, league)
         new = np.zeros(len(r))
         present = {}
         for pos, g in r[act].groupby("position"):
-            present[pos] = (g.index, g[col].values.astype(float))
+            ev = g[bcol].values.astype(float) if bcol in g.columns else np.zeros(len(g))
+            present[pos] = (g.index, g[col].values.astype(float), ev)
         # groups the roster lacks (no FB listed) give their share back pro rata
         total_share = sum(gs.get(p, 0.0) for p in present) or 1.0
-        for pos, (idx, vals) in present.items():
+        for pos, (idx, vals, ev) in present.items():
             want = gs.get(pos, 0.0) / total_share
-            tot = vals.sum()
-            new[r.index.get_indexer(idx)] = vals / tot * want if tot > 0 else 0.0
+            new[r.index.get_indexer(idx)] = _fit_group(vals, ev, want)
         r[col] = new
     return r
 

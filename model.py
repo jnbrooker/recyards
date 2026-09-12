@@ -196,15 +196,20 @@ def player_priors(wk: pd.DataFrame, player_id: str, lg: dict | None = None) -> d
     w = p["w"].values                            # recency weight per game
     n_eff = float(allg["w"].sum())               # games-worth of weighted history
 
-    # Target share: fraction of the team's targets this player draws, over
-    # EVERY game he appeared in — a zero-target game while active is a real
-    # outcome (the backtest scores it, and a prop would have paid on it), and
-    # leaving those out overstated mid-tier receivers' volume by ~15%.
-    ts_all = allg["target_share"].fillna(0.0).values
-    if not np.isfinite(ts_all).any() or allg["target_share"].isna().all():
-        ts_all = (allg["targets"] / max(allg["targets"].sum(), 1) * len(allg)).values
+    # Target share: the player's (weighted) targets over his team's (weighted)
+    # targets across EVERY game he appeared in — a zero-target game while
+    # active is a real outcome (the backtest scores it, and a prop would have
+    # paid on it), and leaving those out overstated mid-tier receivers' volume
+    # by ~15%. Volume-weighted rather than a mean of per-game shares: only
+    # share x mean team targets then reproduces his actual targets per game
+    # (a per-game mean runs high for a receiver whose share peaks in his
+    # team's low-volume games). Same definition as the roster layer.
+    team_t = (wk.groupby(["recent_team", "season", "week"])["targets"].sum()
+                .rename("team_tgt").reset_index())
+    ag = allg.merge(team_t, on=["recent_team", "season", "week"], how="left")
+    den = float((ag["team_tgt"].fillna(0.0) * ag["w"]).sum())
     ts = p["target_share"].fillna(0.0).values     # targeted games, for the spread
-    mu_ts_raw = _wmean(ts_all, allg["w"].values)
+    mu_ts_raw = float((ag["targets"] * ag["w"]).sum() / den) if den > 0 else _wmean(ts, w)
     mu_ts = ((mu_ts_raw * n_eff + prior["ts"] * TS_PRIOR_N) / (n_eff + TS_PRIOR_N)
              if n_eff + TS_PRIOR_N > 0 else mu_ts_raw)
     # sampling noise on a share of ~T team targets: Poisson on the player's

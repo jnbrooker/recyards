@@ -209,11 +209,21 @@ of carries and were projected 45%; WR1s 25% and projected 22%**.
    down. A player's own share is unconditional the same way: his touches over
    the team's touches in every game of his stint, missed games included.
 3. *Renormalisation was over the whole roster.* Each position group is now
-   normalised to the team's own split of touches (shrunk toward league), so
-   the backfield cannot absorb the QB's carries. Depth-order pooling was
-   tested and made no difference, so it is not there.
+   fitted to the team's own split of touches (shrunk toward league), so the
+   backfield cannot absorb the QB's carries — and the adjustment is taken
+   from the **least-evidenced shares first** (`_fit_group`): when five
+   listed receivers over-fill the group, the guessed WR4/WR5 slots give way,
+   not a WR1's measured 34%. Depth-order pooling was tested and made no
+   difference, so it is not there.
 
-Role backtest, 2025: RB1 carry-share error −14%, all carries −7%, targets
+   *Two paths, one definition.* The single-stat pages simulate "if he plays",
+   so `ui.live_share` divides the roster's unconditional share by the
+   player's appearance rate; and the props path's own share is now the same
+   volume-weighted quantity (targets ÷ team targets across his games) as the
+   roster's — a mean of per-game shares ran ~10% high for receivers whose
+   share peaks in their team's low-volume games.
+
+Role backtest, 2025: RB1 carry-share error −15%, all carries −7%, targets
 level; projected RB1 share 0.455 → 0.51 (actual 0.55; the residual is
 mostly that the backtest's "actual" conditions on playing while the
 projection does not), WR1 0.216 → 0.235. Selection-free level check, PPR
