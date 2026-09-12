@@ -52,6 +52,11 @@ from . import data as D
 QB_MARGIN_COEF = -7.74      # t = -6.1  (familiarity dummy)
 QB_SWING_COEF = 3.29        # t = +3.4  (x ANY/A gap, starter minus incumbents)
 DEF_MARGIN_COEF = 12.36     # t = +2.3
+# Offensive line: fitted at -4.6 margin per unit of own-line index difference
+# (t = -1.1, n = 544; +0.02 RMSE out of sample) — right sign, not distinguishable
+# from zero on two seasons, so it is DISPLAY-ONLY until a third season says
+# otherwise. The index is still computed and shown.
+OL_MARGIN_COEF = 0.0
 
 DEFAULT_SNAP_SHARE = 0.7     # a listed starter with no snap history
 N_DEF_STARTERS = 12          # base front seven + secondary + nickel
@@ -84,17 +89,37 @@ def def_starters(depth_def: pd.DataFrame, team: str, as_of=None) -> pd.DataFrame
     return snap[snap["depth"] == 1].head(N_DEF_STARTERS + 2).reset_index(drop=True)
 
 
-def def_index(starters: pd.DataFrame, out_ids: set, share: dict) -> dict:
-    """Share of the defensive starters' importance that is ruled out."""
+def _unit_index(starters: pd.DataFrame, out_ids: set, share: dict, prefix: str) -> dict:
+    """Share of a unit's starters' (snap-weighted) importance that is ruled out."""
     if starters is None or starters.empty:
-        return dict(def_idx=0.0, def_missing=[], n_starters=0, known=False)
+        return {f"{prefix}_idx": 0.0, f"{prefix}_missing": [], f"n_{prefix}": 0}
     imp = np.array([float(share.get(str(p), DEFAULT_SNAP_SHARE)) for p in starters["player_id"]])
     out = np.array([str(p) in out_ids for p in starters["player_id"]])
     total = float(imp.sum())
     missing = [f"{n} ({pos})" for n, pos, o in
                zip(starters["player_name"], starters["position"], out) if o]
-    return dict(def_idx=float(imp[out].sum() / total) if total > 0 else 0.0,
-                def_missing=missing, n_starters=int(len(starters)), known=True)
+    return {f"{prefix}_idx": float(imp[out].sum() / total) if total > 0 else 0.0,
+            f"{prefix}_missing": missing, f"n_{prefix}": int(len(starters))}
+
+
+def def_index(starters: pd.DataFrame, out_ids: set, share: dict) -> dict:
+    """Share of the defensive starters' importance that is ruled out."""
+    d = _unit_index(starters, out_ids, share, "def")
+    d["n_starters"] = d.pop("n_def")
+    return d
+
+
+def ol_starters(depth_ol: pd.DataFrame, team: str, as_of=None) -> pd.DataFrame:
+    """The five offensive-line starters on the team's chart as of a date."""
+    snap = D.depth_chart_snapshot(depth_ol, team, as_of)
+    if snap.empty:
+        return snap
+    return snap[snap["depth"] == 1].reset_index(drop=True)
+
+
+def ol_index(starters: pd.DataFrame, out_ids: set, share: dict) -> dict:
+    """Share of the line starters' (offensive-snap-weighted) importance ruled out."""
+    return _unit_index(starters, out_ids, share, "ol")
 
 
 def starting_qb(depth_off: pd.DataFrame, team: str, out_ids: set, as_of=None):
@@ -175,12 +200,17 @@ def qb_index(wk_prior: pd.DataFrame, team: str, qb_id, quality: dict | None = No
 
 def team_indices(team: str, wk_prior: pd.DataFrame, depth_off: pd.DataFrame,
                  depth_def: pd.DataFrame, out_ids: set, share: dict, as_of=None,
-                 quality: dict | None = None) -> dict:
-    """Both indices for one team, plus the names behind them."""
+                 quality: dict | None = None, depth_ol: pd.DataFrame | None = None,
+                 off_share: dict | None = None) -> dict:
+    """All indices for one team, plus the names behind them."""
     qb_id, qb_name = starting_qb(depth_off, team, out_ids, as_of)
     out = dict(team=team, qb_id=qb_id, qb_name=qb_name)
     out.update(qb_index(wk_prior, team, qb_id, quality))
     out.update(def_index(def_starters(depth_def, team, as_of), out_ids, share))
+    if depth_ol is not None and not depth_ol.empty:
+        out.update(ol_index(ol_starters(depth_ol, team, as_of), out_ids, off_share or {}))
+    else:
+        out.update(ol_idx=0.0, ol_missing=[], n_ol=0)
     return out
 
 
@@ -192,7 +222,9 @@ def margin_shift(idx_a: dict | None, idx_b: dict | None) -> float:
     dq = float(a.get("qb_idx", 0.0)) - float(b.get("qb_idx", 0.0))
     ds = float(a.get("qb_swing", 0.0)) - float(b.get("qb_swing", 0.0))
     dd = float(b.get("def_idx", 0.0)) - float(a.get("def_idx", 0.0))
-    return float(QB_MARGIN_COEF * dq + QB_SWING_COEF * ds + DEF_MARGIN_COEF * dd)
+    dl = float(a.get("ol_idx", 0.0)) - float(b.get("ol_idx", 0.0))
+    return float(QB_MARGIN_COEF * dq + QB_SWING_COEF * ds + DEF_MARGIN_COEF * dd
+                 + OL_MARGIN_COEF * dl)
 
 
 # ---------------------------------------------------------------------------
@@ -206,8 +238,10 @@ def current_indices(live: dict, week: int | None = None) -> dict:
     seasons, depth_seasons = live["seasons"], live["depth_seasons"]
     recency = live.get("recency", D.RECENCY_DEFAULT)
     depth_def = D.load_depth_charts(depth_seasons, side="defense")
+    depth_ol = D.load_depth_charts(depth_seasons, side="oline")
     snaps = D.load_snap_counts(tuple(sorted(set(seasons) | set(depth_seasons))))
     share = snap_shares(snaps, recency)
+    off_share = snap_shares(snaps, recency, col="offense_pct")
     inj = live["injuries"]
     quality = qb_quality(live["wk"])
     out = {}
@@ -215,7 +249,7 @@ def current_indices(live: dict, week: int | None = None) -> dict:
     for team in teams:
         ruled = D.players_ruled_out(inj, team, week=week)
         out[team] = team_indices(team, live["wk"], live["depth"], depth_def, ruled, share,
-                                 quality=quality)
+                                 quality=quality, depth_ol=depth_ol, off_share=off_share)
     return out
 
 
@@ -230,6 +264,7 @@ def historical_indices(score_seasons, n_prior: int = 2,
     wk_all = D.load_weekly(seasons)
     depth_off = D.load_depth_charts(tuple(int(s) for s in score_seasons), side="offense")
     depth_def = D.load_depth_charts(tuple(int(s) for s in score_seasons), side="defense")
+    depth_ol = D.load_depth_charts(tuple(int(s) for s in score_seasons), side="oline")
     inj = D.load_injuries(tuple(int(s) for s in score_seasons))
     snaps = D.load_snap_counts(seasons)
     sched = D.load_schedule(tuple(int(s) for s in score_seasons))
@@ -239,7 +274,9 @@ def historical_indices(score_seasons, n_prior: int = 2,
         if progress:
             progress(k / max(len(steps), 1), f"availability {S} week {w}")
         wk_prior = D.game_weights(B.before(wk_all, S, w), "recent_team", recency)
-        share = snap_shares(B.before(snaps, S, w), recency)
+        snaps_prior = B.before(snaps, S, w)
+        share = snap_shares(snaps_prior, recency)
+        off_share = snap_shares(snaps_prior, recency, col="offense_pct")
         quality = qb_quality(wk_prior)
         games = sched[(sched["season"] == S) & (sched["week"] == w)]
         for _, g in games.iterrows():
@@ -247,7 +284,7 @@ def historical_indices(score_seasons, n_prior: int = 2,
             for team in (g["home_team"], g["away_team"]):
                 ruled = D.players_ruled_out(inj, team, season=S, week=w)
                 r = team_indices(team, wk_prior, depth_off, depth_def, ruled, share, as_of,
-                                 quality=quality)
+                                 quality=quality, depth_ol=depth_ol, off_share=off_share)
                 r.update(season=S, week=w, game_id=g["game_id"])
                 rows.append(r)
     return pd.DataFrame(rows)

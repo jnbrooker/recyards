@@ -386,6 +386,7 @@ _DEFENSE_GROUPS = ("Base 3-4 D", "Base 4-3 D", "DEF", "Defense")
 DEF_POSITIONS = {"DE", "DT", "NT", "LDE", "RDE", "LDT", "RDT", "EDGE",
                  "LB", "ILB", "MLB", "OLB", "WLB", "SLB", "LILB", "RILB", "LOLB", "ROLB",
                  "CB", "LCB", "RCB", "NB", "NCB", "DB", "S", "FS", "SS"}
+OL_POSITIONS = {"LT", "LG", "C", "RG", "RT"}
 
 
 @ttl_cache(maxsize=8)
@@ -393,7 +394,7 @@ def load_depth_charts(seasons: tuple[int, ...], side: str = "offense") -> pd.Dat
     """Depth charts, normalised across feed versions.
 
     `side` is "offense" (skill positions only — what the game engine allocates
-    to), "defense" (every defensive slot, for the availability layer), or
+    to), "oline" (the five line slots), "defense" (every defensive slot), or
     "all". The current release is a stream of dated snapshots (`dt`) with
     `pos_abb` and `pos_rank`; older ones were weekly with `position` /
     `depth_team`. Both are mapped onto: team, player_id, player_name,
@@ -422,11 +423,16 @@ def load_depth_charts(seasons: tuple[int, ...], side: str = "offense") -> pd.Dat
     if "pos_grp" in dc.columns and side != "all":
         # group filter only where the row carries a group (the newer feed);
         # older rows fall through to the position filter below
-        want = _OFFENSE_GROUPS if side == "offense" else _DEFENSE_GROUPS
+        want = _OFFENSE_GROUPS if side in ("offense", "oline") else _DEFENSE_GROUPS
         keep = dc["pos_grp"].isna() | dc["pos_grp"].astype(str).isin(want)
         dc, team = dc[keep], team[keep]
 
-    pos = _coalesce("pos_abb", "position")
+    # slot label: the newer feed's pos_abb; the older feed's depth_position
+    # (LT/LG/C/RG/RT for linemen, where `position` is only T/G/C)
+    pos = _coalesce("pos_abb", "depth_position", "position")
+    if "position" in dc.columns:
+        blank = pos.isna() | (pos.astype(str).str.strip() == "")
+        pos = pos.where(~blank, dc["position"])
     depth = _coalesce("pos_rank", "depth_team")
     pid = _coalesce("gsis_id", "player_id")
     if pos is None or depth is None or pid is None or team is None:
@@ -455,6 +461,8 @@ def load_depth_charts(seasons: tuple[int, ...], side: str = "offense") -> pd.Dat
 
     if side == "offense":
         out = out[out["position"].isin(SKILL_POSITIONS)]
+    elif side == "oline":
+        out = out[out["position"].isin(OL_POSITIONS)]
     elif side == "defense":
         out = out[out["position"].isin(DEF_POSITIONS)]
     return out.dropna(subset=["player_id", "depth"]).reset_index(drop=True)

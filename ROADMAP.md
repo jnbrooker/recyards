@@ -482,10 +482,17 @@ rating if the box-score yardage needs its own anchor.*
    **2025 harness: 12.75 RMSE / 63.1% winners vs the line's 12.27 / 65.3%**
    (13.38 / 59.0% without the layer).
 
-   Still open: the offensive line is not indexed (same feeds: `3WR 1TE` group
-   lists OL, snap counts have `offense_pct`); and 2026 week 1 shows the limit
-   of the swing — Tua at ATL measures the same ANY/A as the incumbents he
-   replaced, so he takes the full unfamiliarity penalty until he has played.
+   **Offensive line — indexed, display-only.** Same construction (five line
+   slots from the `3WR 1TE` group / `depth_position`, offensive snap shares).
+   A line starter is out in 20% of team-games. Fitted alongside the other
+   terms: −4.6 margin per unit of own-line index difference, **t = −1.1**,
+   +0.02 RMSE out of sample either direction. Right sign, not distinguishable
+   from zero on two seasons, so `OL_MARGIN_COEF = 0`; page 7 names the missing
+   linemen with "shown but not priced". Revisit with a third season.
+
+   Still open: 2026 week 1 shows the limit of the swing — Tua at ATL measures
+   the same ANY/A as the incumbents he replaced, so he takes the full
+   unfamiliarity penalty until he has played.
 
 6. **Weather and roof.** nflverse schedules carry `roof`, `temp`, `wind`; pass
    volume and yards per attempt drop measurably in wind. Cheap multiplier.

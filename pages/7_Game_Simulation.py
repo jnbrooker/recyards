@@ -147,7 +147,10 @@ if avail:
         miss = a.get("def_missing") or []
         def_txt = (f"defense missing {', '.join(miss)} (index {a.get('def_idx', 0):.2f})"
                    if miss else "defensive starters all available")
-        lines.append(f"**{team}:** {qb_txt}; {def_txt}.")
+        ol = a.get("ol_missing") or []
+        ol_txt = (f"; line missing {', '.join(ol)} (index {a.get('ol_idx', 0):.2f}, "
+                  "shown but not priced — the fitted effect is within noise)" if ol else "")
+        lines.append(f"**{team}:** {qb_txt}; {def_txt}{ol_txt}.")
     ms = AV.margin_shift(avail.get(home), avail.get(away))
     who = home if ms >= 0 else away
     lines.append(f"Net: margin shifted **{abs(ms):.1f} points toward {who}** "
