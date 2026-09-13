@@ -79,6 +79,17 @@ if key:
 go_fetch = st.sidebar.button("Fetch this week's lines", type="primary",
                              disabled=not key or not markets or n_events == 0)
 
+st.sidebar.caption("Predictions are frozen when a line is recorded. After a model change, "
+                   "re-project the lines whose games have not started; started or settled "
+                   "lines keep the prediction they were graded on.")
+go_reproj = st.sidebar.button("Re-project unplayed lines")
+if go_reproj:
+    bar = st.progress(0.0, text="Re-projecting…")
+    led0, n = P.reproject_unplayed(P.load_ledger(), ctx,
+                                   progress=lambda f, t: bar.progress(min(f, 1.0), text=t))
+    bar.empty(); P.save_ledger(led0)
+    st.success(f"Re-projected {n} unplayed lines with the current model.")
+
 if go_fetch:
     bar = st.progress(0.0, text="Fetching…")
     rosters = get_rosters(tuple(seasons), recency)
@@ -98,9 +109,17 @@ if led.empty:
             "moment, and the actual stat fills in once the game has been played.")
     st.stop()
 
-# settle anything now playable, and fill predictions the fetch could not (e.g. context missing)
+# settle anything now playable; re-project unplayed lines predicted by an older
+# model version (started / settled lines keep the prediction they were graded on)
 wk_all = D.load_weekly(tuple(sorted(set(int(s) for s in led["season"].dropna().unique()))), recency)
 led = P.fill_actuals(led, wk_all)
+bar = st.progress(0.0, text="Checking predictions against the current model…")
+led, n_stale = P.reproject_unplayed(led, ctx, only_stale=True,
+                                    progress=lambda f, t: bar.progress(min(f, 1.0), text=t))
+bar.empty()
+if n_stale:
+    st.info(f"The model changed since {n_stale} unplayed lines were projected — they have been "
+            f"re-projected with version `{P.model_version()}`. Started and settled lines are untouched.")
 if led["pred_mean"].isna().any() and led["player_id"].notna().any():
     led = P.predict_missing(led, ctx)
 P.save_ledger(led)

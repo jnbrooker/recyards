@@ -26,6 +26,7 @@ Credit control: the events list is free; each event-odds call costs
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import json
 import re
 import urllib.parse
@@ -70,9 +71,23 @@ LEDGER_COLS = [
     "season", "week", "game_id", "home", "away", "commence", "event_id",
     "bookmaker", "market", "player", "player_id", "team", "line",
     "over_price", "under_price", "fetched_at",
-    "pred_mean", "pred_median", "p_over", "predicted_at",
+    "pred_mean", "pred_median", "p_over", "predicted_at", "model_version",
     "actual", "result",
 ]
+
+
+def model_version() -> str:
+    """A short hash of the model's source. Stored with every prediction so
+    that, after a code change, lines whose games have not started are
+    re-projected automatically and lines already started or settled keep the
+    prediction they were graded on."""
+    root = Path(__file__).resolve().parent
+    h = hashlib.sha1()
+    for f in sorted(list(root.glob("*.py")) + [root.parent / "model.py"]):
+        if f.name in ("props.py", "backtest.py", "calibrate.py", "ui.py"):
+            continue
+        h.update(f.read_bytes())
+    return h.hexdigest()[:10]
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +312,8 @@ def predict_missing(led: pd.DataFrame, ctx: dict, progress=None) -> pd.DataFrame
     """Freeze Game-view predictions for ledger rows that have none."""
     led = led.copy()
     led["predicted_at"] = led["predicted_at"].astype(object)
+    led["model_version"] = led["model_version"].astype(object)
+    version = model_version()
     todo = led.index[led["pred_mean"].isna() & led["player_id"].notna()]
     cache = {}
     for i, idx in enumerate(todo):
@@ -318,7 +335,28 @@ def predict_missing(led: pd.DataFrame, ctx: dict, progress=None) -> pd.DataFrame
         led.loc[idx, "pred_median"] = float(np.median(x))
         led.loc[idx, "p_over"] = float((x >= 1).mean()) if row["market"] == "player_anytime_td" else float((x > line).mean())
         led.loc[idx, "predicted_at"] = pd.Timestamp.now(tz="UTC")
+        led.loc[idx, "model_version"] = version
     return led
+
+
+def reproject_unplayed(led: pd.DataFrame, ctx: dict, progress=None,
+                       only_stale: bool = False) -> tuple[pd.DataFrame, int]:
+    """Re-freeze predictions for lines whose game has NOT kicked off (a model
+    fix should reach them; anything started or settled stays as it was).
+    `only_stale` limits it to predictions made by an older model version.
+    Returns (ledger, rows re-projected)."""
+    led = led.copy()
+    now = pd.Timestamp.now(tz="UTC")
+    commence = pd.to_datetime(led["commence"], utc=True, errors="coerce")
+    open_ = led["result"].isna() & led["player_id"].notna() & (commence.isna() | (commence > now))
+    if only_stale:
+        open_ &= led["model_version"].astype(str) != model_version()
+    if not open_.any():
+        return led, 0
+    for c in ("pred_mean", "pred_median", "p_over", "predicted_at"):
+        led.loc[open_, c] = np.nan
+    led = predict_missing(led, ctx, progress)
+    return led, int(open_.sum())
 
 
 # ---------------------------------------------------------------------------

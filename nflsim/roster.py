@@ -486,13 +486,22 @@ def allocate_shares(r: pd.DataFrame, group_shares: dict | None = None) -> pd.Dat
         for pos, (idx, vals, ev) in present.items():
             want = gs.get(pos, 0.0) / total_share
             new[r.index.get_indexer(idx)] = _fit_group(vals, ev, want)
-        old = r[col].values.astype(float)
         ccol = col + "_cond"
         if ccol in r.columns:
-            # the same per-player adjustment (teammates out, group fit) applies
-            # to the conditional share the single-stat pages use
-            ratio = np.where(old > 0, new / np.where(old > 0, old, 1.0), 0.0)
-            r[ccol] = np.where(act, r[ccol].values.astype(float) * ratio, 0.0)
+            # The conditional shares ("if he plays") are fitted as their own
+            # group. They must NOT inherit the unconditional fit's ratio: a
+            # group under-fills in unconditional terms precisely because its
+            # players missed games, and that boost applied to a share that is
+            # already conditional over-projected returning starters by 30%+.
+            newc = np.zeros(len(r))
+            for pos, (idx, vals, ev) in present.items():
+                want = gs.get(pos, 0.0) / total_share
+                cvals = r.loc[idx, ccol].values.astype(float)
+                # only trim an over-filled group; an under-fill here just means
+                # not every listed slot is a full-time player
+                tot = cvals.sum()
+                newc[r.index.get_indexer(idx)] = _fit_group(cvals, ev, want) if tot > want else cvals
+            r[ccol] = np.where(act, newc, 0.0)
         r[col] = new
     return r
 
