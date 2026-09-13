@@ -74,16 +74,16 @@ def status_warning(row: pd.Series) -> None:
 
 
 def live_share(row: pd.Series, share_col: str) -> float:
-    """The share to simulate with on a single-stat page — "if he plays":
-    the live (redistributed) share if active, own history if ruled out, either
-    way conditional on playing (the roster's shares are unconditional, with a
-    player's historically missed games counted as zero; that haircut belongs
-    in a season projection, not a game he is simulated to be in)."""
-    avail = float(row.get("avail_rate", 1.0) or 1.0)
-    avail = min(max(avail, 0.5), 1.0)
-    if bool(row.get("active", True)) and float(row[share_col]) > 0:
-        return float(row[share_col]) / avail
-    return float(row.get(f"own_{share_col}", row[share_col])) / avail
+    """The share to simulate with on a single-stat page — "if he plays": the
+    player's share IN THE GAMES HE PLAYED, blended and redistributed exactly
+    like the roster's unconditional share (`*_cond` columns). The roster's own
+    share counts his historically missed games as zero — right for a season
+    projection, wrong for a game he is simulated to be in. Live if active, own
+    history if ruled out."""
+    cond = f"{share_col}_cond"
+    if bool(row.get("active", True)) and float(row.get(cond, row[share_col])) > 0:
+        return float(row.get(cond, row[share_col]))
+    return float(row.get(f"own_{cond}", row.get(f"own_{share_col}", row[share_col])))
 
 
 def priors_picker(label: str = "Seasons used to build priors",

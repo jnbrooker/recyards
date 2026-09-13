@@ -6,6 +6,12 @@
       "runtimeExecutable": "streamlit",
       "runtimeArgs": ["run", "Home.py", "--server.port", "8501", "--server.headless", "true"],
       "port": 8501
+    },
+    {
+      "name": "football",
+      "runtimeExecutable": "/Users/jamesbrooker/football-pred/.venv/bin/streamlit",
+      "runtimeArgs": ["run", "/Users/jamesbrooker/football-pred/Home.py", "--server.port", "8502", "--server.headless", "true"],
+      "port": 8502
     }
   ]
 }

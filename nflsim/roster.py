@@ -260,6 +260,8 @@ def build_roster(wk: pd.DataFrame, snapshot: pd.DataFrame, team: str,
     # page insists on simulating someone who is listed out.
     r["own_target_share"] = r["target_share"]
     r["own_carry_share"] = r["carry_share"]
+    r["own_target_share_cond"] = r["target_share_cond"]
+    r["own_carry_share_cond"] = r["carry_share_cond"]
 
     # Depth-chart order within each position group, group normalised to the
     # team's split of touches; inactive players carry zero share.
@@ -320,6 +322,14 @@ def _player_row(pl: pd.Series, h: pd.DataFrame, totals: pd.DataFrame,
         car = _blend(blend, _safe(own_car, car_prior), car_prior, rank_car, depth == 1)
         b_tgt = _history_weight(blend, _safe(own_tgt, tgt_prior), rank_tgt, depth == 1)
         b_car = _history_weight(blend, _safe(own_car, car_prior), rank_car, depth == 1)
+        # the same blend with his share IN THE GAMES HE PLAYED: what the
+        # single-stat pages simulate ("if he plays"); the prior is the slot's
+        # value for a player who is playing (rank prior / its appearance rate
+        # is ~ the conditional slot share, which is what the table nearly is)
+        own_tgt_c = _share_when_playing(h, totals, "targets")
+        own_car_c = _share_when_playing(h, totals, "carries")
+        tgt_c = _blend(blend, _safe(own_tgt_c, tgt_prior), tgt_prior, rank_tgt, depth == 1)
+        car_c = _blend(blend, _safe(own_car_c, car_prior), car_prior, rank_car, depth == 1)
 
         # Efficiency rates on recency-weighted totals, regressed toward league.
         tg_tot, rec_tot = _wsum(h, "targets"), _wsum(h, "receptions")
@@ -339,6 +349,7 @@ def _player_row(pl: pd.Series, h: pd.DataFrame, totals: pd.DataFrame,
         prev_team = str(h["recent_team"].iloc[-1])
     else:
         tgt, car = tgt_prior, car_prior
+        tgt_c, car_c = tgt_prior, car_prior
         b_tgt = b_car = 0.0
         avail_rate = 1.0
         catch, ypt = lg["catch"], lg["ypt"]
@@ -351,7 +362,7 @@ def _player_row(pl: pd.Series, h: pd.DataFrame, totals: pd.DataFrame,
         prev_team = ""
 
     if pos == "QB":
-        tgt = 0.0            # a QB is not a target; trick plays are noise
+        tgt = tgt_c = 0.0    # a QB is not a target; trick plays are noise
     rush_priors = None
     if car > 0.02 and games:
         try:
@@ -370,6 +381,7 @@ def _player_row(pl: pd.Series, h: pd.DataFrame, totals: pd.DataFrame,
         # "if he plays" (the single-stat pages do, via ui.live_share)
         avail_rate=float(avail_rate),
         target_share=float(max(tgt, 0.0)), carry_share=float(max(car, 0.0)),
+        target_share_cond=float(max(tgt_c, 0.0)), carry_share_cond=float(max(car_c, 0.0)),
         catch_rate=float(np.clip(catch, 0.30, 0.90)),
         ypt=float(np.clip(ypt, 3.0, 14.0)),
         rec_td_rate=float(np.clip(rec_td, 0.005, 0.30)),
@@ -474,6 +486,13 @@ def allocate_shares(r: pd.DataFrame, group_shares: dict | None = None) -> pd.Dat
         for pos, (idx, vals, ev) in present.items():
             want = gs.get(pos, 0.0) / total_share
             new[r.index.get_indexer(idx)] = _fit_group(vals, ev, want)
+        old = r[col].values.astype(float)
+        ccol = col + "_cond"
+        if ccol in r.columns:
+            # the same per-player adjustment (teammates out, group fit) applies
+            # to the conditional share the single-stat pages use
+            ratio = np.where(old > 0, new / np.where(old > 0, old, 1.0), 0.0)
+            r[ccol] = np.where(act, r[ccol].values.astype(float) * ratio, 0.0)
         r[col] = new
     return r
 
@@ -493,6 +512,16 @@ def _share_from_counts(h: pd.DataFrame, totals: pd.DataFrame, col: str) -> float
         span = t[(ts >= stamp.min()) & (ts <= stamp.max())]
         den += float((span[tcol] * span["w"]).sum())
     return num / den if den > 0 else 0.0
+
+
+def _share_when_playing(h: pd.DataFrame, totals: pd.DataFrame, col: str) -> float:
+    """The CONDITIONAL share: his touches over the team's touches in the games
+    he appeared in — what to simulate when he is known to be playing."""
+    tcol = "team_tgt" if col == "targets" else "team_car"
+    j = h.merge(totals.drop(columns="w", errors="ignore"),
+                on=["recent_team", "season", "week"], how="left")
+    den = float((j[tcol] * j["w"]).sum())
+    return float((j[col] * j["w"]).sum() / den) if den > 0 else 0.0
 
 
 def _stint_appearance_rate(h: pd.DataFrame, totals: pd.DataFrame) -> float:
