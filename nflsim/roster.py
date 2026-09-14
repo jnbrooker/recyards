@@ -167,8 +167,11 @@ def team_games(wk: pd.DataFrame, **sums) -> pd.DataFrame:
     recency weight `w`, e.g. `team_games(wk, tgt=("targets", "sum"))`."""
     if "w" not in wk.columns:
         wk = wk.assign(w=1.0)
-    return (wk.groupby(["recent_team", "season", "week"], as_index=False)
-              .agg(**dict(sums), w=("w", "first")))
+    aggs = dict(sums, w=("w", "first"))
+    for c in ("w_tgt", "w_car"):            # usage weights ride along when stamped
+        if c in wk.columns:
+            aggs[c] = (c, "first")
+    return (wk.groupby(["recent_team", "season", "week"], as_index=False).agg(**aggs))
 
 
 def team_volumes(wk: pd.DataFrame) -> dict:
@@ -512,14 +515,17 @@ def _share_from_counts(h: pd.DataFrame, totals: pd.DataFrame, col: str) -> float
     first to last appearance with each team — so a game he missed counts as
     zero, the way the slot priors are measured."""
     tcol = "team_tgt" if col == "targets" else "team_car"
-    num = float((h[col] * h["w"]).sum())
+    wcol = "w_tgt" if col == "targets" else "w_car"       # usage memory, not rate memory
+    if wcol not in h.columns or wcol not in totals.columns:
+        wcol = "w"
+    num = float((h[col] * h[wcol]).sum())
     den = 0.0
     for team, g in h.groupby("recent_team"):
         stamp = g["season"] * 100 + g["week"]
         t = totals[totals["recent_team"] == team]
         ts = t["season"] * 100 + t["week"]
         span = t[(ts >= stamp.min()) & (ts <= stamp.max())]
-        den += float((span[tcol] * span["w"]).sum())
+        den += float((span[tcol] * span[wcol]).sum())
     return num / den if den > 0 else 0.0
 
 
@@ -527,10 +533,13 @@ def _share_when_playing(h: pd.DataFrame, totals: pd.DataFrame, col: str) -> floa
     """The CONDITIONAL share: his touches over the team's touches in the games
     he appeared in — what to simulate when he is known to be playing."""
     tcol = "team_tgt" if col == "targets" else "team_car"
-    j = h.merge(totals.drop(columns="w", errors="ignore"),
+    wcol = "w_tgt" if col == "targets" else "w_car"
+    if wcol not in h.columns:
+        wcol = "w"
+    j = h.merge(totals.drop(columns=["w", "w_tgt", "w_car"], errors="ignore"),
                 on=["recent_team", "season", "week"], how="left")
-    den = float((j[tcol] * j["w"]).sum())
-    return float((j[col] * j["w"]).sum() / den) if den > 0 else 0.0
+    den = float((j[tcol] * j[wcol]).sum())
+    return float((j[col] * j[wcol]).sum() / den) if den > 0 else 0.0
 
 
 def _stint_appearance_rate(h: pd.DataFrame, totals: pd.DataFrame) -> float:

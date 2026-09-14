@@ -207,7 +207,10 @@ def player_rush_priors(wk: pd.DataFrame, player_id: str,
     share_all = (allg["carries"] / allg["team_car"].clip(lower=1)).clip(0, 1).values
     w_all = allg["w"].values
     n_eff = float(w_all.sum())
-    mu_share_raw = D.wmean(share_all, w_all)
+    # carry share has a ~1.5-game memory (data.Recency.carry_half_life): whoever
+    # had the backfield last week has it this week. Regression still keys off
+    # n_eff from the rate weights.
+    mu_share_raw = D.wmean(share_all, D.usage_weight(allg, "carries"))
     mu_share = ((mu_share_raw * n_eff + prior["share"] * SHARE_PRIOR_N) / (n_eff + SHARE_PRIOR_N)
                 if n_eff + SHARE_PRIOR_N > 0 else mu_share_raw)
     share = (p["carries"] / p["team_car"]).clip(0, 1).values

@@ -258,12 +258,18 @@ def fetch_week(api_key: str, ctx: dict, sched: pd.DataFrame, rosters: pd.DataFra
 # Frozen predictions (Game view, exactly as the pages compute them)
 # ---------------------------------------------------------------------------
 
-def _samples(ctx: dict, market: str, row: pd.Series, n_sims: int = 20000):
+def _samples(ctx: dict, market: str, row: pd.Series, n_sims: int = 20000,
+             memo: dict | None = None):
+    """Simulated samples for one ledger row. `memo` (per prediction pass) holds
+    each team's roster so a slate of 100 lines builds two rosters, not 100."""
     from . import game as G, roster as RO, rushing as R, touchdowns as TDm, ui as UI
     import model as M
     team, opp = row["team"], (row["away"] if row["team"] == row["home"] else row["home"])
     is_home = row["team"] == row["home"]
-    roster = RO.roster_for(ctx, team, True)
+    memo = memo if memo is not None else {}
+    if ("roster", team) not in memo:
+        memo[("roster", team)] = RO.roster_for(ctx, team, True)
+    roster = memo[("roster", team)]
     rr = roster[roster["player_id"].astype(str) == str(row["player_id"])]
     if rr.empty:
         return None
@@ -315,7 +321,7 @@ def predict_missing(led: pd.DataFrame, ctx: dict, progress=None) -> pd.DataFrame
     led["model_version"] = led["model_version"].astype(object)
     version = model_version()
     todo = led.index[led["pred_mean"].isna() & led["player_id"].notna()]
-    cache = {}
+    cache, memo = {}, {}
     for i, idx in enumerate(todo):
         row = led.loc[idx]
         if progress:
@@ -323,7 +329,7 @@ def predict_missing(led: pd.DataFrame, ctx: dict, progress=None) -> pd.DataFrame
         key = (row["game_id"], row["market"], str(row["player_id"]))
         if key not in cache:
             try:
-                cache[key] = _samples(ctx, row["market"], row)
+                cache[key] = _samples(ctx, row["market"], row, memo=memo)
             except Exception:
                 cache[key] = None
         x = cache[key]

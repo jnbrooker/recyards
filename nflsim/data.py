@@ -92,12 +92,28 @@ class Recency(NamedTuple):
     season_decay: float = 0.85   # weight multiplier per season of age
     half_life: float = 12.0      # games; a game this many back counts half.
                                  # inf = seasons as flat blocks (no game decay)
+    # Usage has a much shorter memory than efficiency. On raw shares (2024-25,
+    # an exponentially weighted share predicting the NEXT game's share; 6,569
+    # receiver-games, 2,375 rusher-games) the best half-life is 3 games for
+    # targets and 1.5 for carries, and flat memory is 6% / 21% worse. Inside the
+    # model - where the share is also regressed toward the slot prior - the
+    # out-of-sample optimum (2025 wks 2-9) is 5 games for both: receiving MAE
+    # 22.50 -> 22.33, rushing 24.88 -> 23.95, both now beating a trailing
+    # average, with top-quartile bias halved. At 5 games, week 1 of a season
+    # carries ~15% of a role's weight against two prior seasons (7% for a rate
+    # at half_life 12). Rates (catch rate, yards per target, TD per touch) keep
+    # `half_life`; these apply to shares and per-game volume only.
+    target_half_life: float = 5.0
+    carry_half_life: float = 5.0
 
 
 RECENCY_DEFAULT = Recency()
 
 RECENCY_PRESETS = {
-    "Long memory": Recency(season_decay=0.7, half_life=float("inf")),
+    # Long memory reproduces the pre-2026-09 flat curve, usage included, so it
+    # is the clean "before" for any A/B.
+    "Long memory": Recency(season_decay=0.7, half_life=float("inf"),
+                           target_half_life=float("inf"), carry_half_life=float("inf")),
     "Balanced": RECENCY_DEFAULT,
     "Recent form": Recency(season_decay=0.7, half_life=6.0),
 }
@@ -124,21 +140,37 @@ def game_weights(df: pd.DataFrame, team_col: str,
     r = Recency(*recency)
     out = df.copy()
     if season_col not in out.columns or out.empty:
-        out["season_w"] = 1.0
-        out["w"] = 1.0
+        for c in ("season_w", "w", "w_tgt", "w_car"):
+            out[c] = 1.0
         return out
     season = pd.to_numeric(out[season_col], errors="coerce")
     latest = int(season.max())
     sw = np.power(float(r.season_decay), (latest - season).clip(lower=0).astype(float))
-    w = sw.to_numpy(dtype=float).copy()
-    if (np.isfinite(r.half_life) and r.half_life > 0
-            and week_col in out.columns and team_col in out.columns):
+    sw = sw.to_numpy(dtype=float)
+
+    ago = None
+    if week_col in out.columns and team_col in out.columns:
         stamp = season * 100 + pd.to_numeric(out[week_col], errors="coerce")
-        ago = stamp.groupby(out[team_col]).rank(method="dense", ascending=False) - 1.0
-        w *= np.power(0.5, ago.to_numpy(dtype=float) / float(r.half_life))
-    out["season_w"] = sw.to_numpy(dtype=float)
-    out["w"] = w
+        ago = (stamp.groupby(out[team_col]).rank(method="dense", ascending=False) - 1.0
+               ).to_numpy(dtype=float)
+
+    def decay(hl):
+        if ago is None or not (np.isfinite(hl) and hl > 0):
+            return sw.copy()
+        return sw * np.power(0.5, ago / float(hl))
+
+    out["season_w"] = sw
+    out["w"] = decay(r.half_life)             # rates and everything else
+    out["w_tgt"] = decay(r.target_half_life)  # target share / receiving volume
+    out["w_car"] = decay(r.carry_half_life)   # carry share / rushing volume
     return out
+
+
+def usage_weight(df: pd.DataFrame, kind: str) -> np.ndarray:
+    """The usage weight column for `kind` ('targets' or 'carries'), falling back
+    to `w` on a frame stamped before the usage half-lives existed."""
+    col = "w_tgt" if kind == "targets" else "w_car"
+    return (df[col] if col in df.columns else df["w"]).to_numpy(dtype=float)
 
 
 def weight_shares(df: pd.DataFrame, team_col: str = "recent_team") -> dict:

@@ -189,10 +189,11 @@ def player_td_priors(wk: pd.DataFrame, player_id: str, lg: dict,
     # --- expected volume per game (mean & variance for the NB draw) ---
     rec_g = p["receptions"].values
     car_g = p["carries"].values
-    mu_rec = D.wmean(rec_g, w) if len(rec_g) else 0.0
-    mu_car = D.wmean(car_g, w) if len(car_g) else 0.0
-    var_rec = np.average((rec_g - mu_rec) ** 2, weights=w) if len(rec_g) > 1 else mu_rec
-    var_car = np.average((car_g - mu_car) ** 2, weights=w) if len(car_g) > 1 else mu_car
+    w_t, w_c = D.usage_weight(p, "targets"), D.usage_weight(p, "carries")   # volume = usage
+    mu_rec = D.wmean(rec_g, w_t) if len(rec_g) else 0.0
+    mu_car = D.wmean(car_g, w_c) if len(car_g) else 0.0
+    var_rec = np.average((rec_g - mu_rec) ** 2, weights=w_t) if len(rec_g) > 1 else mu_rec
+    var_car = np.average((car_g - mu_car) ** 2, weights=w_c) if len(car_g) > 1 else mu_car
 
     # --- regressed conversion rates (on recency-weighted totals) ---
     rec_tot = _wsum(p, "receptions")

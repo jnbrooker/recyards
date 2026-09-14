@@ -650,6 +650,77 @@ rating if the box-score yardage needs its own anchor.*
     accumulates from the first fetch — the free tier has no historical props.
     Re-fetching near kickoff records the closing line, the honest benchmark.
 
+11. **Week 1 post-mortem: the prop distributions were too skewed, and usage
+    needs its own memory.** *(2026-09-14, after settling the 1,167 week-1 lines.)*
+
+    **What the ledger said.** Model MAE 20.4 vs the line's 19.7 — the *means*
+    were fine. But overs hit 54% while the model put P(over) > 0.5 on only 17%
+    of lines: `P(actual > model median)` was 0.64 when a calibrated median
+    gives 0.50. The frozen projections had a median/mean ratio of 0.67
+    (receiving); real game logs sit at 0.75–0.95 depending on volume, ~0.10
+    higher at every tier. The props page picks on the median, so it said
+    "under" on 83% of lines. That was the tough week — shape, not level.
+
+    **Cause, by stage.** Real per-game receiving yards have CV 0.80; the
+    model's had 1.05. Targets were drawn `Poisson(team × share)` — a share of
+    a fixed number of attempts is Binomial, `(1 − share)` less variance, and
+    the Poisson over-dispersed target counts 13% (CV 0.62 vs 0.56). The SD
+    floors (`MIN_TS_SD` 0.03 etc.) bound for 50–70% of players and implied a
+    21% game-to-game wobble in role on top of the sampling noise already drawn.
+    And `YPR_CV = 1.10` is a Gamma with shape < 1 (mode at zero): the measured
+    within-player per-catch CV is 0.82–0.86 (204 receivers). Even at 0.86 an
+    iid Gamma-sum is more right-skewed than real game logs at the same CV
+    (catches and yards per catch are not independent within a game), so
+    `YPR_CV` is now an *effective* 0.65, chosen on the out-of-sample shape.
+    Rushing's shape was already close (coverage 80%, median 0.49) and was left.
+
+    **Usage vs efficiency memory.** Week 1's largest misses were role
+    surprises (Golden 3 → 12 targets; the market had him at 41.5 to the
+    model's 22): 40% of week-1 error variance was target volume (7.7 yards per
+    unexpected target). Measured 2023→25, week-1 share deserves ~25% of the
+    weight on a target role and ~50% on a carry role against a full prior
+    season; on raw shares the best exponential half-life is 3 games (targets)
+    and 1.5 (carries), flat memory 6% / 21% worse. The single `half_life`
+    (12) gave week 1 8%. So `Recency` now carries `target_half_life` and
+    `carry_half_life`, `game_weights` stamps `w_tgt` / `w_car`, and every share
+    and per-game-volume estimate (`model.player_priors`,
+    `rushing.player_rush_priors`, `roster._share_from_counts` /
+    `_share_when_playing`, `touchdowns` volume) uses them; rates keep `w`.
+    The regression toward the slot prior still keys off `n_eff` from `w`, so
+    the change moves *which games a role leans on*, not how hard it is
+    regressed. Swept inside the model, out of sample (2025 weeks 2–9, 2 000
+    sims), **5 games for both** beat the raw optima:
+
+    | receiving (973 games) | MAE | naive | RMSE | bias | corr | cover80 | over_median | CRPS |
+    |---|---|---|---|---|---|---|---|---|
+    | before (1.10 / Poisson / floors / HL ∞) | 22.47 | 22.64 | 29.78 | −0.82 | 0.481 | 0.864 | 0.555 | 16.10 |
+    | shape fixes only | 22.48 | 22.64 | 29.80 | −0.75 | 0.480 | 0.829 | 0.529 | 15.98 |
+    | **shape + usage HL 5** | **22.33** | 22.54 | **29.35** | +0.15 | **0.498** | **0.825** | **0.502** | **15.66** |
+
+    | rushing (418 games) | MAE | naive | RMSE | corr | cover80 | over_median |
+    |---|---|---|---|---|---|---|
+    | before (HL ∞) | 24.88 | 24.88 | 33.47 | 0.469 | 0.795 | 0.496 |
+    | **usage HL 5** | **23.95** | 24.75 | **32.49** | **0.505** | 0.809 | 0.507 |
+
+    Both models now beat a trailing average on the mean for the first time,
+    and the receiving median is calibrated in every projection quartile
+    (0.51 / 0.53 / 0.51 / 0.47). Carry HL 1.5 over-reacted inside the model
+    (top-quartile bias +8.8); 5 is the compromise the harness picked.
+
+    **Lessons for the harness.** `over_median` and `cover80` were already
+    reported and read 0.555 / 0.864 on the shipped configuration; the pages
+    pick on the median, so those two numbers are the props page's hit rate in
+    disguise and should gate a release. The week-1 ledger predictions stay
+    frozen (that is the point of the ledger); the version stamp changes from
+    here.
+
+    **Still open.** The top projection quartile still runs +3.4 (receiving)
+    and +6 (rushing) high — the slot-prior regression pulls stars down and
+    then the usage memory pushes recent big games up; a level-aware prior is
+    the fix. Rushing's game-level spread is also ~20% wide in-sample (yards CV
+    0.81 vs 0.68) even though its coverage is fine out of sample; worth the
+    same per-stage decomposition when there is time.
+
 ## 9. Maintenance
 
 Several constants are fitted on out-of-sample residuals and rest on two

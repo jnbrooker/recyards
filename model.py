@@ -42,9 +42,9 @@ FALLBACK_AIR_SD = 1.0        # completed air yards per catch std (yards)
 # Floors on the game-to-game (between-game) spread of each rate once the
 # sampling noise the simulator draws itself has been removed — see
 # `nflsim.data.between_sd`. The raw per-game SDs are mostly sampling noise.
-MIN_TS_SD = 0.03
-MIN_CATCH_SD = 0.04
-MIN_AIR_SD = 0.8
+MIN_TS_SD = 0.015
+MIN_CATCH_SD = 0.02
+MIN_AIR_SD = 0.4
 
 # Regression toward the positional mean (roadmap 8.1b). A player's own history
 # is not taken at face value: his target share is blended with the position's
@@ -59,7 +59,17 @@ EFF_PRIOR_N = 20.0
 # Per-catch yards are very right-skewed (a 5-yard slant vs a 60-yard bomb),
 # so we model them with a Gamma. This is the coefficient of variation of a
 # single catch's yardage; ~1.1 matches league-wide yards-per-reception spread.
-YPR_CV = 1.10
+TARGETS_BINOMIAL = True   # Binomial(team attempts, share); False = Poisson (old)
+YPR_CV = 0.65   # EFFECTIVE per-catch CV. The measured within-player per-catch CV is
+                # 0.82-0.86 (204 receivers, 2024-25), but an iid Gamma-sum over the
+                # catches is more right-skewed than real game logs at the same CV
+                # (catches and yards per catch are not independent within a game),
+                # so the value that reproduces the real GAME-level shape is lower.
+                # Out of sample (2025 wks 2-9, 973 receiver-games): 0.65 gives 80%
+                # bands covering 81.7% and P(actual > median) 0.505; the old 1.10
+                # gave 86.4% and 0.555 - the median sat ~15% under the mean and the
+                # props page, which picks on the median, said "under" on 83% of
+                # week-1 lines while 54% went over.
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -207,9 +217,14 @@ def player_priors(wk: pd.DataFrame, player_id: str, lg: dict | None = None) -> d
     team_t = (wk.groupby(["recent_team", "season", "week"])["targets"].sum()
                 .rename("team_tgt").reset_index())
     ag = allg.merge(team_t, on=["recent_team", "season", "week"], how="left")
-    den = float((ag["team_tgt"].fillna(0.0) * ag["w"]).sum())
+    # Usage weights: a role's evidence decays over ~3 games, far faster than a
+    # rate's (see data.Recency). The regression toward the positional prior
+    # still keys off `n_eff` from the rate weights, so a short usage memory
+    # changes WHICH games the share leans on, not how hard it is regressed.
+    w_use = _D.usage_weight(ag, "targets")
+    den = float((ag["team_tgt"].fillna(0.0).to_numpy() * w_use).sum())
     ts = p["target_share"].fillna(0.0).values     # targeted games, for the spread
-    mu_ts_raw = float((ag["targets"] * ag["w"]).sum() / den) if den > 0 else _wmean(ts, w)
+    mu_ts_raw = float((ag["targets"].to_numpy() * w_use).sum() / den) if den > 0 else _wmean(ts, w)
     mu_ts = ((mu_ts_raw * n_eff + prior["ts"] * TS_PRIOR_N) / (n_eff + TS_PRIOR_N)
              if n_eff + TS_PRIOR_N > 0 else mu_ts_raw)
     # sampling noise on a share of ~T team targets: Poisson on the player's
@@ -416,7 +431,14 @@ def simulate(priors: dict,
     a_ts, b_ts = _beta_params(priors["mu_ts"], priors["sd_ts"])
     ts = rng.beta(a_ts, b_ts, n)
     exp_targets = team_tgt * ts
-    targets = rng.poisson(np.clip(exp_targets, 0, None))     # integer targets
+    # A share of a fixed number of team attempts is Binomial, not Poisson: the
+    # variance is (1 - share) smaller, and Poisson here over-dispersed target
+    # counts by ~13% against real game logs (CV 0.62 vs 0.56).
+    if TARGETS_BINOMIAL:
+        targets = rng.binomial(np.clip(np.round(team_tgt), 1, None).astype(int),
+                               np.clip(ts, 0.0, 1.0))
+    else:                                       # the pre-2026-09-14 draw, kept for A/B
+        targets = rng.poisson(np.clip(exp_targets, 0, None))
 
     # --- 3. how many are caught ---------------------------------------------
     catch_mu = float(np.clip(priors["mu_catch"] * m_catch, 0.05, 0.98))
