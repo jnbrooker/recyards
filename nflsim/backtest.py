@@ -119,7 +119,7 @@ def _score_weeks(sched: pd.DataFrame, score_seasons, weeks=None):
 def team_backtest(score_seasons, n_prior: int = 2,
                   recency: D.Recency = D.RECENCY_DEFAULT,
                   weeks=None, progress=None, availability: bool = False,
-                  weather: bool = True) -> pd.DataFrame:
+                  weather: bool = True, method: str | None = None) -> pd.DataFrame:
     """One row per scored game: model margin/total vs actual and the closing line.
 
     Ratings (and home field, and the scoring-level calibration) are refitted
@@ -135,6 +135,7 @@ def team_backtest(score_seasons, n_prior: int = 2,
     sched = D.load_schedule(tuple(int(s) for s in score_seasons))
     if drives.empty or sched.empty:
         return pd.DataFrame()
+    plays = D.load_plays(seasons) if (method or T.RATING_METHOD) in ("epa", "blend") else pd.DataFrame()
 
     steps = list(_score_weeks(sched, score_seasons, weeks))
     rows = []
@@ -145,8 +146,10 @@ def team_backtest(score_seasons, n_prior: int = 2,
         if d.empty:
             continue
         d = D.game_weights(d, "posteam", recency)
+        pl = (D.game_weights(before(plays, S, w), "posteam", recency)
+              if not plays.empty else None)
         try:
-            r = T.team_ratings(d, before(games, S, w))
+            r = T.team_ratings(d, before(games, S, w), plays=pl, method=method)
         except ValueError:
             continue
         wk_games = sched[(sched["season"] == S) & (sched["week"] == w) & sched["played"]]

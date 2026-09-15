@@ -88,10 +88,19 @@ def cover_prob(hist: pd.DataFrame, market_sp: float, pool_sp: float, side: str) 
         p_home = 0.5 * (1 - erf(z / sqrt(2)))          # P(m > pool_sp) under N(market_sp, sd)
         return (p_home if side == "home" else 1 - p_home), 0.0, 0
     m, w = k
-    win = (m > pool_sp) if side == "home" else (m < pool_sp)
-    push = np.isclose(m, pool_sp)
     W = w.sum()
-    return float((w * win).sum() / W), float((w * push).sum() / W), int(round(W))
+    # The market's own number is 50/50 by definition (its vig-free price); the
+    # handful of historical games at exactly this spread would otherwise put a
+    # spurious 3-6 point "edge" on one side. So history supplies only the SHIFT:
+    # how much more often the side covers the pool's number than the market's.
+    def f(x):
+        win = (m > x) if side == "home" else (m < x)
+        return float((w * win).sum() / W), float((w * np.isclose(m, x)).sum() / W)
+    p_pool, push_pool = f(float(pool_sp))
+    p_mkt, push_mkt = f(float(market_sp))
+    base = 0.5 * (1.0 - push_mkt)
+    p = base + (p_pool - p_mkt)
+    return float(np.clip(p, 0.02, 0.98)), push_pool, int(round(W))
 
 
 def win_prob(hist: pd.DataFrame, market_sp: float, side: str) -> tuple[float, float]:
@@ -122,8 +131,12 @@ def total_prob(hist: pd.DataFrame, market_tot: float, pool_tot: float, side: str
         p_over = 0.5 * (1 - erf(z / sqrt(2)))
         return (p_over if side == "over" else 1 - p_over), 0.0
     t = float(market_tot) + hist["res_t"].dropna().to_numpy(float)
-    win = (t > pool_tot) if side == "over" else (t < pool_tot)
-    return float(win.mean()), float(np.isclose(t, pool_tot).mean())
+    def f(x):
+        win = (t > x) if side == "over" else (t < x)
+        return float(win.mean()), float(np.isclose(t, x).mean())
+    p_pool, push_pool = f(float(pool_tot))
+    p_mkt, push_mkt = f(float(market_tot))
+    return float(np.clip(0.5 * (1 - push_mkt) + (p_pool - p_mkt), 0.02, 0.98)), push_pool
 
 
 # ---------------------------------------------------------------------------

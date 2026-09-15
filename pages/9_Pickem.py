@@ -12,7 +12,9 @@ import streamlit as st
 
 import plotly.graph_objects as go
 
-from nflsim import data as D, game as G, pickem as P, backtest as B
+import os
+
+from nflsim import data as D, game as G, pickem as P, backtest as B, market as MK
 from nflsim import ui as UI
 
 st.set_page_config(page_title="Pick'em", page_icon="🏈", layout="wide")
@@ -33,6 +35,19 @@ def get_slate(seasons, recency, week, n_sims, use_injuries):
     sched = get_schedule(ctx["depth_seasons"][-1])
     games = sched[sched["week"] == int(week)]
     return P.simulate_slate(ctx, games, n_sims=n_sims, use_injuries=use_injuries)
+
+
+def _api_key():
+    try:
+        k = st.secrets.get("ODDS_API_KEY", "")
+    except Exception:
+        k = ""
+    return k or os.environ.get("ODDS_API_KEY", "")
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner="Loading 15 seasons of closing lines…")
+def get_history():
+    return MK.load_history()
 
 
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Refitting the model week by week for past games…")
@@ -74,12 +89,23 @@ parlay_odds = st.sidebar.number_input("Fixed 3-team parlay price", 100, 2000, P.
                                       disabled=parlay_pricing.startswith("true"))
 
 st.sidebar.divider()
-market_w = st.sidebar.slider(
-    "Lean on the market", 0.0, 1.0, 0.5, 0.05,
-    help="0 = grade every pick on the pure model. 1 = centre each game where the "
-         "line is and keep only the model's shape. The model's ratings are shrunk "
-         "toward average, so it sees games as closer than the market does — which "
-         "flatters every underdog. Blending is the honest hedge against that.")
+source_lbl = st.sidebar.radio(
+    "Probabilities from", ["Market + history (recommended)", "Game engine"], index=0,
+    help="**Market + history**: each side's chance is P(the pool's line is beaten | the "
+         "market's line), read off 4,000+ games at the same closing spread — so it knows "
+         "that 14.5% of games land on 3, and that +3.5 against a market of +3 is a 59% "
+         "pick, not 50%. Six-point teaser legs that cross 3 and 7 price themselves. This is "
+         "how a pool priced at openers is beaten.  \n**Game engine**: the model's own "
+         "simulation, blended toward the market — on 2025 the model's disagreement with "
+         "the closing line carried no information (slope 0.01), so use this only to see "
+         "what the engine thinks.")
+source = "market" if source_lbl.startswith("Market") else "engine"
+market_w = 1.0
+if source == "engine":
+    market_w = st.sidebar.slider(
+        "Lean on the market", 0.0, 1.0, 0.5, 0.05,
+        help="0 = grade every pick on the pure model. 1 = centre each game where the "
+             "line is and keep only the model's shape.")
 
 # --- run ----------------------------------------------------------------------
 sims = get_slate(tuple(seasons), recency, int(week), int(n_sims), use_inj)
@@ -95,27 +121,66 @@ if games.empty:
     st.info("No games left to pick this week."); st.stop()
 
 # --- lines, editable ----------------------------------------------------------
-st.subheader("Lines")
-st.caption("Seeded from the closing market. **Overwrite them with your pool's numbers.** "
-           "Home spread: positive means the home team is favoured by that many "
-           "(CHI −3 at CAR → −3.0).")
+st.subheader("Lines: the pool's numbers against the market's")
+st.caption("**Your pool's lines** (editable — type in exactly what the pool posts) are graded "
+           "against the **market's** current lines. A pool that prices at openers hands you "
+           "half-points across 3 and 7 all week; that gap is where the edge is. Home spread: "
+           "positive = home favoured (CHI −3 at CAR → −3.0).")
 seed_lines = P.default_lines(games)
+mkey = f"market_{week}"
+c_fetch, c_reset, c_info = st.columns([1, 1, 3])
+with c_fetch:
+    if st.button("Fetch current market lines", disabled=not _api_key(),
+                 help="The Odds API, same key as the props page (~3 credits). Median of "
+                      "every book's spread / total / moneyline."):
+        try:
+            raw, quota = MK.fetch_game_lines(_api_key())
+            st.session_state[mkey] = MK.consensus_lines(raw)
+            st.session_state[mkey + "_at"] = pd.Timestamp.now(tz="UTC")
+            st.session_state[mkey + "_quota"] = quota
+        except Exception as e:
+            st.error(f"Fetch failed: {e}")
+with c_reset:
+    if st.button("Reset pool lines to market"):
+        st.session_state.pop(f"lines_{week}_{exclude_played}", None)
+with c_info:
+    if not _api_key():
+        st.caption("Set `ODDS_API_KEY` (secrets or environment) to fetch live market lines; "
+                   "until then the market columns use the schedule feed's current line.")
+    elif mkey in st.session_state:
+        q = st.session_state.get(mkey + "_quota", {}) or {}
+        st.caption(f"Market lines fetched {st.session_state[mkey + '_at']:%a %H:%M} UTC across "
+                   f"{int(st.session_state[mkey]['books'].median())} books · API credits left "
+                   f"{q.get('remaining', '?')}")
+if mkey in st.session_state:
+    seed_lines = P.apply_market(seed_lines, st.session_state[mkey])
+
 key = f"lines_{week}_{exclude_played}"
-if st.button("Reset to closing lines"):
-    st.session_state.pop(key, None)
 edited = st.data_editor(
-    seed_lines[["Game", "spread_home", "total", "ml_home", "ml_away"]],
+    seed_lines[["Game", "spread_home", "mkt_spread_home", "total", "mkt_total",
+                "ml_home", "mkt_ml_home", "ml_away", "mkt_ml_away"]],
     key=key, hide_index=True, width="stretch",
     column_config={
         "Game": st.column_config.TextColumn(disabled=True),
-        "spread_home": st.column_config.NumberColumn("Home spread", step=0.5, format="%.1f"),
-        "total": st.column_config.NumberColumn("Total", step=0.5, format="%.1f"),
-        "ml_home": st.column_config.NumberColumn("Home ML", step=5, format="%d"),
-        "ml_away": st.column_config.NumberColumn("Away ML", step=5, format="%d"),
+        "spread_home": st.column_config.NumberColumn("Pool home spread", step=0.5, format="%.1f"),
+        "mkt_spread_home": st.column_config.NumberColumn("Market", step=0.5, format="%.1f"),
+        "total": st.column_config.NumberColumn("Pool total", step=0.5, format="%.1f"),
+        "mkt_total": st.column_config.NumberColumn("Market", step=0.5, format="%.1f"),
+        "ml_home": st.column_config.NumberColumn("Pool home ML", step=5, format="%d"),
+        "mkt_ml_home": st.column_config.NumberColumn("Market", step=5, format="%d"),
+        "ml_away": st.column_config.NumberColumn("Pool away ML", step=5, format="%d"),
+        "mkt_ml_away": st.column_config.NumberColumn("Market", step=5, format="%d"),
     })
 lines = seed_lines.copy()
-for c in ("spread_home", "total", "ml_home", "ml_away"):
+for c in ("spread_home", "total", "ml_home", "ml_away",
+          "mkt_spread_home", "mkt_total", "mkt_ml_home", "mkt_ml_away"):
     lines[c] = edited[c].values
+hist = get_history() if source == "market" else None
+n_number_edges = int(((lines["spread_home"] != lines["mkt_spread_home"])
+                      | (lines["total"] != lines["mkt_total"])).sum())
+if source == "market":
+    st.caption(f"{n_number_edges} of {len(lines)} games have a pool number different from the "
+               "market's." + (" Edit the pool columns, or fetch the market, to find them." if n_number_edges == 0 else ""))
 
 # --- which games carry the totals --------------------------------------------
 n_required = len(games) + 3
@@ -125,7 +190,8 @@ prelim = P.build_card(sims, lines, mode=mode_key, juice=int(juice), teaser_pts=f
                       teaser_odds=int(teaser_odds),
                       parlay_pricing="true" if parlay_pricing.startswith("true") else "fixed",
                       parlay_odds=int(parlay_odds), n_slots=int(n_slots),
-                      exclude_played=exclude_played, market_weight=float(market_w))
+                      exclude_played=exclude_played, market_weight=float(market_w),
+                      source=source, hist=hist)
 auto_ou = prelim["card"].loc[prelim["card"]["slot"] == "Total", "game_id"].tolist()
 game_opts = dict(zip(lines["Game"], lines["game_id"]))
 ou_pick = st.multiselect(
@@ -140,7 +206,7 @@ res = P.build_card(sims, lines, mode=mode_key, juice=int(juice), teaser_pts=floa
                    parlay_pricing="true" if parlay_pricing.startswith("true") else "fixed",
                    parlay_odds=int(parlay_odds), n_slots=int(n_slots),
                    exclude_played=exclude_played, market_weight=float(market_w),
-                   ou_games=ou_games)
+                   ou_games=ou_games, source=source, hist=hist)
 card = res["card"]
 for n in res["notes"]:
     st.warning(n)
@@ -156,9 +222,16 @@ c2.metric("Same card at market prices", f"{res['market_exp']:.1f}",
 c3.metric("Expected wins", f"{card['p'].sum():.1f} of {len(card)}")
 
 disp = P.card_display(card)
-st.dataframe(disp.style.format({"Model P": "{:.1%}", "Push": "{:.1%}", "Market P": "{:.1%}",
-                                "Edge": "{:+.1%}", "Exp. pts": "{:.1f}"}),
+fmt = {"P(win)": "{:.1%}", "Push": "{:.1%}", "Price implies": "{:.1%}",
+       "Edge": "{:+.1%}", "Exp. pts": "{:.1f}", "Number vs market": "{:+.1f}"}
+st.dataframe(disp.style.format({k: v for k, v in fmt.items() if k in disp.columns}),
              hide_index=True, width="stretch", height=min(760, 38 * len(disp) + 40))
+if source == "market":
+    st.caption("**Number vs market** is how many points better than the market's line the pool "
+               "is giving you on that side (a 6-point teaser shows the teased line's chance "
+               "directly). **P(win)** comes from history at the market's spread; **Edge** is "
+               "P(win) minus what the price implies. With the pool at the market's numbers, "
+               "sides sit at ~50% and only the teaser legs that cross 3 and 7 carry an edge.")
 if mode_key == "odds":
     st.caption("Odds-weighted scoring puts long shots and parlays at the top because their "
                "payout is large — that is the highest **expected** return, but it is also "
@@ -188,13 +261,13 @@ with st.expander("All candidates, ranked"):
 # --- how the card has done --------------------------------------------------------
 st.subheader("How the card has done")
 st.caption(
-    "Every played week is replayed **honestly**: the ratings, home field, availability "
-    "and scoring calibration are refit on games before that week only, each game's "
-    "distribution is the harness's (Normal, sd 12.8 on the margin and 13.4 on the total), "
-    "the card is built with the pool rules and market lean set above against the closing "
-    "lines, and graded against the final scores. Totals slots use the model's best games "
-    "(the pool's actual choices are unknown). Pushes score zero; a parlay with a pushed leg "
-    "counts as lost.")
+    "Every played week is replayed **honestly** with the probability source chosen above. "
+    "Engine: ratings, home field, availability and calibration refit on games before that "
+    "week only (Normal, sd 12.8 on the margin, 13.4 on the total). Market + history: closing "
+    "lines and the empirical distributions from seasons before that one. The pool's lines are "
+    "the closing lines here — history has no openers — so **no number edge is available in "
+    "the replay**; it measures calibration and slot selection only. Totals slots use the "
+    "model's best games. Pushes score zero; a parlay with a pushed leg counts as lost.")
 season_now = int(ctx["depth_seasons"][-1])
 hist_seasons = st.multiselect("Seasons to replay", [season_now, season_now - 1],
                               default=[season_now],
@@ -207,8 +280,9 @@ if hist_seasons:
               teaser_odds=int(teaser_odds),
               parlay_pricing="true" if parlay_pricing.startswith("true") else "fixed",
               parlay_odds=int(parlay_odds), n_slots=int(n_slots))
-    hw, hp = P.card_history(bt, hsched, market_weight=float(market_w), **kw)
-    mw, _ = P.card_history(bt, hsched, market_weight=1.0, **kw)
+    hw, hp = P.card_history(bt, hsched, market_weight=float(market_w), source=source,
+                            hist=get_history() if source == "market" else None, **kw)
+    mw, _ = P.card_history(bt, hsched, market_weight=1.0, source="engine", **kw)
     if hw.empty:
         st.info("No played weeks to replay yet.")
     else:
@@ -218,10 +292,11 @@ if hist_seasons:
         c1.metric("Points scored", f"{pts:,.0f}", delta=f"{pts - exp:+,.0f} vs expected",
                   delta_color="normal", help=f"The card expected {exp:,.0f}; at pure market "
                                              f"prices it would have expected {mkt:,.0f}.")
-        c2.metric("Market-only card", f"{mpts:,.0f}",
-                  delta=f"{pts - mpts:+,.0f} model vs market", delta_color="normal",
-                  help="The same rules with the market lean at 100% — every game centred on "
-                       "the closing line. The honest baseline: is the model adding anything?")
+        c2.metric("Engine card at 100% market lean", f"{mpts:,.0f}",
+                  delta=f"{pts - mpts:+,.0f} vs it", delta_color="normal",
+                  help="The engine's shape centred on the closing line — the old page's best "
+                       "case. In the replay the pool's lines ARE the closing lines, so no "
+                       "number edge exists; the difference is calibration and teaser selection.")
         c3.metric("Wins", f"{int(hw['wins'].sum())} of {int(hw['picks'].sum())}",
                   delta=f"{hw['wins'].sum() - hw['exp_wins'].sum():+.1f} vs expected",
                   delta_color="normal")

@@ -770,6 +770,8 @@ _PBP_KEEP = [
     # who touched the ball (goal-line role for touchdowns)
     "rusher_player_id", "receiver_player_id", "pass_attempt", "complete_pass",
     "rush_touchdown", "pass_touchdown",
+    # play-level efficiency (EPA rating layer)
+    "qb_dropback", "passer_player_id", "interception", "fumble_lost", "pass", "rush", "wp",
 ]
 
 # Thresholds defining a stuffed / explosive run.
@@ -950,6 +952,44 @@ DRIVE_POINTS = {
 _DEAD_DRIVE_RESULTS = {"End of half", "End of game"}
 
 TURNOVER_RESULTS = {"Turnover", "Opp touchdown"}
+
+
+# Garbage time: plays with the game effectively decided are dropped from the
+# efficiency ratings (they measure a team's disinterest, not its strength).
+GARBAGE_WP = 0.04
+
+
+def load_plays(seasons: tuple[int, ...],
+               recency: Recency = RECENCY_DEFAULT) -> pd.DataFrame:
+    """One row per offensive play (pass or run, regular season) for the EPA
+    rating layer: season, week, game_id, posteam, defteam, is_pass, epa,
+    success, turnover, passer_id, garbage, plus the recency weights (keyed on
+    the offense's schedule). Empty frame if the feed lacks EPA."""
+    raw = load_pbp_raw(seasons)
+    need = {"posteam", "defteam", "epa", "play_type"}
+    if raw.empty or not need <= set(raw.columns):
+        return pd.DataFrame()
+    d = raw[raw["play_type"].isin(["pass", "run"]) & raw["posteam"].notna()
+            & raw["defteam"].notna()].copy()
+    for f in ("qb_kneel", "qb_spike", "two_point_attempt"):
+        if f in d.columns:
+            d = d[pd.to_numeric(d[f], errors="coerce").fillna(0) != 1]
+    d["epa"] = pd.to_numeric(d["epa"], errors="coerce")
+    d = d.dropna(subset=["epa"])
+    out = pd.DataFrame({
+        "season": d["season"].astype(int), "week": d["week"].astype(int),
+        "game_id": d["game_id"], "posteam": d["posteam"], "defteam": d["defteam"],
+        "is_pass": (d["play_type"] == "pass").astype(int),
+        "epa": d["epa"].astype(float),
+        "success": pd.to_numeric(d.get("success"), errors="coerce").fillna(0).astype(float),
+        "turnover": ((pd.to_numeric(d.get("interception"), errors="coerce").fillna(0) == 1)
+                     | (pd.to_numeric(d.get("fumble_lost"), errors="coerce").fillna(0) == 1)).astype(int),
+        "passer_id": d.get("passer_player_id"),
+    })
+    wp = pd.to_numeric(d.get("wp"), errors="coerce")
+    out["garbage"] = ((wp < GARBAGE_WP) | (wp > 1 - GARBAGE_WP)).fillna(False).to_numpy()
+    out = out.reset_index(drop=True)
+    return game_weights(out, "posteam", recency)
 
 
 def load_drives(seasons: tuple[int, ...],

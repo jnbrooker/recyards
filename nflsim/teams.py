@@ -105,8 +105,77 @@ def _shrunk_mean(num: pd.Series, den: pd.Series, prior_n: float,
 # The rating solve
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# EPA rating layer (v2): per-play efficiency, turnover luck regressed
+# ---------------------------------------------------------------------------
+# Points per drive carries red-zone and turnover variance that does not
+# persist. Per-play EPA on NON-turnover plays, with each team's turnover rate
+# regressed hard toward league and charged at the league's average turnover
+# cost, is the standard improvement and predicts future margins better. Pass
+# and rush are rated separately (offense and defense) so a matchup can weight
+# them by its expected pass rate. Garbage-time plays are dropped.
+
+RATING_METHOD = "blend"          # "points" (drive-based), "epa", or "blend" of the two
+EPA_BLEND = 0.5                  # weight on the EPA layer in a blend
+EPA_PRIOR_N = 350.0              # plays-worth of league prior on each EPA rating
+TO_PRIOR_N = 1500.0              # plays-worth of prior on a turnover rate (very noisy)
+EPA_SCALE = 1.0                  # points-per-drive per (EPA/play x plays/drive); harness-fitted
+PLAYS_PER_DRIVE = 5.9
+
+
+def _solve_epa(d: pd.DataFrame, teams: list, val: str, iters: int) -> tuple[pd.Series, pd.Series]:
+    """SRS-style joint solve of offense / defense on a per-play value."""
+    lg = float((d[val] * d["w"]).sum() / d["w"].sum())
+    off = pd.Series(0.0, index=teams); dfn = pd.Series(0.0, index=teams)
+    _, off_den = _wsum_by(d["posteam"], d[val], d["w"]); off_den = off_den.reindex(teams).fillna(0.0)
+    _, def_den = _wsum_by(d["defteam"], d[val], d["w"]); def_den = def_den.reindex(teams).fillna(0.0)
+    for _ in range(int(iters)):
+        resid = d[val] - lg - d["defteam"].map(dfn).astype(float)
+        num, _ = _wsum_by(d["posteam"], resid, d["w"])
+        new_off = _shrunk_mean(num.reindex(teams).fillna(0.0), off_den, EPA_PRIOR_N); new_off -= new_off.mean()
+        resid = d[val] - lg - d["posteam"].map(new_off).astype(float)
+        num, _ = _wsum_by(d["defteam"], resid, d["w"])
+        new_def = _shrunk_mean(num.reindex(teams).fillna(0.0), def_den, EPA_PRIOR_N); new_def -= new_def.mean()
+        off = SOLVE_DAMPING * new_off + (1 - SOLVE_DAMPING) * off
+        dfn = SOLVE_DAMPING * new_def + (1 - SOLVE_DAMPING) * dfn
+    return off, dfn
+
+
+def epa_ratings(plays: pd.DataFrame, teams: list, iters: int = SOLVE_ITERS) -> dict:
+    """Offense / defense EPA-per-play ratings (overall, pass, rush) with
+    turnover luck regressed, in EPA/play above league. Positive offense = good;
+    positive defense = allows more = bad (same convention as `off` / `dfn`)."""
+    d = plays[~plays["garbage"]].copy()
+    d["w"] = d["w"].astype(float)
+    # turnover luck: rate the plays WITHOUT their turnover outcome, then charge a
+    # regressed turnover rate at the league's average turnover cost
+    to = d["turnover"] == 1
+    to_cost = float((d.loc[to, "epa"] * d.loc[to, "w"]).sum() / max(d.loc[to, "w"].sum(), 1e-9))
+    nt = d[~to]
+    lg_to = float((d["turnover"] * d["w"]).sum() / d["w"].sum())
+    out = {}
+    for key, sub in (("all", nt), ("pass", nt[nt["is_pass"] == 1]), ("rush", nt[nt["is_pass"] == 0])):
+        off, dfn = _solve_epa(sub, teams, "epa", iters)
+        out[f"off_{key}"], out[f"def_{key}"] = off, dfn
+    # regressed turnover rates, offense (giveaways) and defense (takeaways)
+    for side, col in (("off", "posteam"), ("def", "defteam")):
+        num, den = _wsum_by(d[col], d["turnover"] - lg_to, d["w"])
+        rate = _shrunk_mean(num.reindex(teams).fillna(0.0), den.reindex(teams).fillna(0.0), TO_PRIOR_N)
+        out[f"{side}_to"] = rate                       # above league, per play
+    # net EPA/play above league, turnover-charged: giveaways cost the offense,
+    # takeaways credit the defense
+    out["off"] = out["off_all"] + out["off_to"] * to_cost * (-1)      # more giveaways -> lower
+    out["dfn"] = out["def_all"] + out["def_to"] * to_cost * (+1)      # more takeaways -> lower allowed
+    out["off"] -= out["off"].mean(); out["dfn"] -= out["dfn"].mean()
+    out["lg_epa"] = float((nt["epa"] * nt["w"]).sum() / nt["w"].sum())
+    out["to_cost"] = to_cost; out["lg_to"] = lg_to
+    out["plays"] = int(len(d))
+    return out
+
+
 def team_ratings(drives: pd.DataFrame, games: pd.DataFrame | None = None,
-                 iters: int = SOLVE_ITERS) -> dict:
+                 iters: int = SOLVE_ITERS, plays: pd.DataFrame | None = None,
+                 method: str | None = None) -> dict:
     """Opponent-adjusted offensive and defensive strength from a drive table.
 
     Returns a dict with, per team: `off` / `def` (points per drive above league,
@@ -154,6 +223,17 @@ def team_ratings(drives: pd.DataFrame, games: pd.DataFrame | None = None,
         off = SOLVE_DAMPING * new_off + (1 - SOLVE_DAMPING) * off
         dfn = SOLVE_DAMPING * new_def + (1 - SOLVE_DAMPING) * dfn
 
+    method = method or RATING_METHOD
+    epa = None
+    if method in ("epa", "blend") and plays is not None and not plays.empty:
+        epa = epa_ratings(plays, teams, iters)
+        # EPA/play above league -> points per drive above league
+        off_e = (epa["off"] * PLAYS_PER_DRIVE * EPA_SCALE).reindex(teams).fillna(0.0)
+        dfn_e = (epa["dfn"] * PLAYS_PER_DRIVE * EPA_SCALE).reindex(teams).fillna(0.0)
+        a = EPA_BLEND if method == "blend" else 1.0
+        off = a * off_e + (1 - a) * off
+        dfn = a * dfn_e + (1 - a) * dfn
+
     rates = _rate_ratings(d, teams, dict(td=lg_td, fg=lg_fg, to=lg_to))
     pace = _pace(d, teams)
     raw = _raw_rates(d, teams)
@@ -169,7 +249,7 @@ def team_ratings(drives: pd.DataFrame, games: pd.DataFrame | None = None,
         off_to=rates["off_to"], def_to=rates["def_to"],
         def_score_rate=rates["def_score_rate"], lg_def_score=rates["lg_def_score"],
         lg_other_ppg=other, sched_off=sched_off, sched_def=sched_def,
-        hfa=HFA_DEFAULT,
+        hfa=HFA_DEFAULT, method=(method if epa is not None else "points"), epa=epa,
         raw=raw, drives=int(len(d)), seasons=sorted(d["season"].unique().tolist()),
     )
     # Home field is measured against the ratings themselves, so it has to be
