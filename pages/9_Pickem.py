@@ -10,7 +10,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from nflsim import data as D, game as G, pickem as P
+import plotly.graph_objects as go
+
+from nflsim import data as D, game as G, pickem as P, backtest as B
 from nflsim import ui as UI
 
 st.set_page_config(page_title="Pick'em", page_icon="🏈", layout="wide")
@@ -31,6 +33,13 @@ def get_slate(seasons, recency, week, n_sims, use_injuries):
     sched = get_schedule(ctx["depth_seasons"][-1])
     games = sched[sched["week"] == int(week)]
     return P.simulate_slate(ctx, games, n_sims=n_sims, use_injuries=use_injuries)
+
+
+@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Refitting the model week by week for past games…")
+def get_team_backtest(seasons, recency):
+    """Out-of-sample margin and total for every played game: ratings, home
+    field, availability and calibration refit on games BEFORE each week."""
+    return B.team_backtest(list(seasons), recency=recency, availability=True)
 
 
 # --- sidebar ----------------------------------------------------------------
@@ -175,6 +184,97 @@ with st.expander("All candidates, ranked"):
     st.dataframe(show.style.format({"P": "{:.1%}", "Push": "{:.1%}", "Market P": "{:.1%}",
                                     "Edge": "{:+.1%}", "Value / conf pt": "{:.3f}"}),
                  hide_index=True, width="stretch", height=500)
+
+# --- how the card has done --------------------------------------------------------
+st.subheader("How the card has done")
+st.caption(
+    "Every played week is replayed **honestly**: the ratings, home field, availability "
+    "and scoring calibration are refit on games before that week only, each game's "
+    "distribution is the harness's (Normal, sd 12.8 on the margin and 13.4 on the total), "
+    "the card is built with the pool rules and market lean set above against the closing "
+    "lines, and graded against the final scores. Totals slots use the model's best games "
+    "(the pool's actual choices are unknown). Pushes score zero; a parlay with a pushed leg "
+    "counts as lost.")
+season_now = int(ctx["depth_seasons"][-1])
+hist_seasons = st.multiselect("Seasons to replay", [season_now, season_now - 1],
+                              default=[season_now],
+                              help="Add last season for a sample big enough to mean something — "
+                                   "one week is noise either way.")
+if hist_seasons:
+    bt = get_team_backtest(tuple(sorted(hist_seasons)), recency)
+    hsched = D.load_schedule(tuple(sorted(hist_seasons)))
+    kw = dict(mode=mode_key, juice=int(juice), teaser_pts=float(teaser_pts),
+              teaser_odds=int(teaser_odds),
+              parlay_pricing="true" if parlay_pricing.startswith("true") else "fixed",
+              parlay_odds=int(parlay_odds), n_slots=int(n_slots))
+    hw, hp = P.card_history(bt, hsched, market_weight=float(market_w), **kw)
+    mw, _ = P.card_history(bt, hsched, market_weight=1.0, **kw)
+    if hw.empty:
+        st.info("No played weeks to replay yet.")
+    else:
+        pts, exp, mkt = hw["points"].sum(), hw["expected"].sum(), hw["market_expected"].sum()
+        mpts = mw["points"].sum()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Points scored", f"{pts:,.0f}", delta=f"{pts - exp:+,.0f} vs expected",
+                  delta_color="normal", help=f"The card expected {exp:,.0f}; at pure market "
+                                             f"prices it would have expected {mkt:,.0f}.")
+        c2.metric("Market-only card", f"{mpts:,.0f}",
+                  delta=f"{pts - mpts:+,.0f} model vs market", delta_color="normal",
+                  help="The same rules with the market lean at 100% — every game centred on "
+                       "the closing line. The honest baseline: is the model adding anything?")
+        c3.metric("Wins", f"{int(hw['wins'].sum())} of {int(hw['picks'].sum())}",
+                  delta=f"{hw['wins'].sum() - hw['exp_wins'].sum():+.1f} vs expected",
+                  delta_color="normal")
+        gp = hp[(hp["slot"] == "Game pick") & (hp["result"].isin(["win", "loss"]))]
+        c4.metric("Game picks hit", f"{(gp['result'] == 'win').mean():.1%}" if len(gp) else "—",
+                  help=f"{len(gp)} single game picks (ATS or underdog ML), pushes excluded. "
+                       "Breakeven at −110 is 52.4%; a moneyline dog is expected to hit far less.")
+
+        show = hw[["season", "week", "games", "points", "expected", "market_expected", "wins",
+                   "picks", "exp_wins", "top5_wins", "game_pick_hit", "totals_hit",
+                   "combos_won", "cum_points", "cum_expected"]].rename(columns={
+            "season": "Season", "week": "Week", "games": "Games", "points": "Points",
+            "expected": "Expected", "market_expected": "Market exp.", "wins": "Wins",
+            "picks": "Picks", "exp_wins": "Exp. wins", "top5_wins": "Top-5 wins",
+            "game_pick_hit": "Game picks", "totals_hit": "Totals", "combos_won": "Combos won",
+            "cum_points": "Cum. points", "cum_expected": "Cum. expected"})
+        st.dataframe(show.style.format({"Points": "{:.0f}", "Expected": "{:.0f}",
+                                        "Market exp.": "{:.0f}", "Exp. wins": "{:.1f}",
+                                        "Game picks": "{:.0%}", "Totals": "{:.0%}",
+                                        "Cum. points": "{:.0f}", "Cum. expected": "{:.0f}"},
+                                       na_rep="—"),
+                     hide_index=True, width="stretch")
+
+        if len(hw) > 1:
+            x = [f"{s}-{w:02d}" for s, w in zip(hw["season"], hw["week"])]
+            fig = go.Figure()
+            fig.add_scatter(x=x, y=hw["cum_points"], name="Model card, realised",
+                            mode="lines+markers", line=dict(color="#2e7d5b", width=3))
+            fig.add_scatter(x=x, y=hw["cum_expected"], name="Model card, expected",
+                            mode="lines", line=dict(color="#2e7d5b", dash="dot"))
+            fig.add_scatter(x=x, y=mw["cum_points"], name="Market-only card, realised",
+                            mode="lines+markers", line=dict(color="#888", width=2))
+            fig.update_layout(height=360, yaxis_title="Cumulative points",
+                              legend=dict(orientation="h", y=1.12),
+                              margin=dict(t=20, b=40, l=60, r=20))
+            st.plotly_chart(fig, width="stretch")
+
+        st.caption(
+            "Read the gap between **expected** and **realised** as the model's optimism about "
+            "the sides it picks: when you always take the side the model likes, its stated "
+            "probability on that side runs high (selection). If the model card is not beating "
+            "the market-only card over a season, the model is not adding to the market for "
+            "this pool — that is the honest test, and one week cannot pass or fail it.")
+
+        with st.expander("Each week's graded card"):
+            for (S, w), g in hp.groupby(["season", "week"]):
+                st.markdown(f"**{S} week {w}** — {g['points'].sum():.0f} points, "
+                            f"{int((g['result'] == 'win').sum())} of {len(g)} won")
+                gd = pd.DataFrame({"Conf": g["confidence"], "Slot": g["slot"], "Pick": g["text"],
+                                   "Model P": g["p"], "Price": [P.to_american(x) for x in g["dec"]],
+                                   "Result": g["result"], "Points": g["points"]})
+                st.dataframe(gd.style.format({"Model P": "{:.1%}", "Points": "{:.1f}"}),
+                             hide_index=True, width="stretch", height=min(480, 38 * len(gd) + 40))
 
 st.caption("The card maximises expected points: picks are sorted by expected points per "
            "confidence point and confidence is handed out in that order, which is optimal "

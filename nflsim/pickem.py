@@ -128,7 +128,7 @@ def default_lines(games: pd.DataFrame) -> pd.DataFrame:
         ml_h, ml_a = g.get("home_moneyline"), g.get("away_moneyline")
         if (pd.isna(ml_h) or pd.isna(ml_a)) and pd.notna(sp):
             ml_h, ml_a = spread_to_moneyline(float(sp))
-        rows.append(dict(
+        row = dict(
             game_id=g["game_id"], Game=f"{g['away_team']} @ {g['home_team']}",
             home=g["home_team"], away=g["away_team"],
             spread_home=float(sp) if pd.notna(sp) else 0.0,
@@ -136,8 +136,32 @@ def default_lines(games: pd.DataFrame) -> pd.DataFrame:
             ml_home=int(ml_h) if pd.notna(ml_h) else -110,
             ml_away=int(ml_a) if pd.notna(ml_a) else -110,
             played=bool(g.get("played", False)),
-        ))
+        )
+        # the market's own numbers: what the pool's lines are judged AGAINST.
+        # Seeded equal to the pool columns; a live fetch or an edit separates them.
+        row.update(mkt_spread_home=row["spread_home"], mkt_total=row["total"],
+                   mkt_ml_home=row["ml_home"], mkt_ml_away=row["ml_away"])
+        rows.append(row)
     return pd.DataFrame(rows)
+
+
+def apply_market(lines: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
+    """Overwrite the mkt_* columns from a consensus-lines frame (home, away,
+    spread_home, total, ml_home, ml_away). Pool columns are left alone."""
+    if market is None or market.empty:
+        return lines
+    out = lines.copy()
+    key = market.set_index(["home", "away"])
+    for i, r in out.iterrows():
+        k = (r["home"], r["away"])
+        if k not in key.index:
+            continue
+        m = key.loc[k]
+        for src, dst in (("spread_home", "mkt_spread_home"), ("total", "mkt_total"),
+                         ("ml_home", "mkt_ml_home"), ("ml_away", "mkt_ml_away")):
+            if pd.notna(m.get(src)):
+                out.loc[i, dst] = float(m[src]) if src in ("spread_home", "total") else int(m[src])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +225,59 @@ def game_candidates(sim: dict, line: pd.Series, juice: int = DEFAULT_JUICE,
     return c
 
 
+def market_candidates(hist: pd.DataFrame, game_id: str, home: str, away: str,
+                      line: pd.Series, juice: int = DEFAULT_JUICE,
+                      teaser_pts: float = DEFAULT_TEASER_POINTS) -> list[dict]:
+    """Every bettable side of one game, priced by the market and history
+    (`nflsim.market`): P(the POOL's line is beaten | the MARKET's line).
+
+    `line` carries the pool's numbers (spread_home, total, ml_home, ml_away)
+    and the market's (mkt_*). When they are equal a side is ~50% and the only
+    value in the game is a Wong teaser leg; when the pool's number is better,
+    the probability moves by the key-number mass between the two.
+    """
+    from . import market as MK
+    sp, tot = float(line["spread_home"]), float(line["total"])
+    msp = float(line.get("mkt_spread_home", sp)); mtot = float(line.get("mkt_total", tot))
+    ml_home, ml_away = int(line["ml_home"]), int(line["ml_away"])
+    mml_h, mml_a = line.get("mkt_ml_home", ml_home), line.get("mkt_ml_away", ml_away)
+    fav, dog = (home, away) if msp > 0 else (away, home) if msp < 0 else (None, None)
+    if fav is None:
+        dog = home if ml_home > ml_away else away
+
+    def side(kind, team, p, push, odds, text, n=0, extra=None):
+        d = dict(game_id=game_id, home=home, away=away, kind=kind, team=team, text=text,
+                 p=float(p), p_push=float(push), odds=int(odds), dec=to_decimal(odds),
+                 market_p=implied_prob(odds), model_margin=msp, model_total=mtot,
+                 line_margin=sp, line_total=tot, n_hist=int(n), source="market")
+        d.update(extra or {})
+        return d
+
+    c = []
+    for team, sd in ((home, "home"), (away, "away")):
+        p, pu, n = MK.cover_prob(hist, msp, sp, sd)
+        txt = f"{team} {(-sp if sd == 'home' else sp):+g}" if sp != 0 else f"{team} PK"
+        c.append(side("ATS", team, p, pu, juice, txt, n,
+                      dict(number_edge=float(sp - msp) * (-1 if sd == "home" else 1))))
+    # moneyline: the market's vig-free price is the truth when we have one
+    if pd.notna(mml_h) and pd.notna(mml_a):
+        ph, pa = MK.vig_free(mml_h, mml_a)
+        tie = 0.0
+    else:
+        ph, tie = MK.win_prob(hist, msp, "home"); pa = 1 - ph - tie
+    c.append(side("ML", home, ph, tie, ml_home, f"{home} ML {ml_home:+d}", 0, dict(is_dog=home == dog)))
+    c.append(side("ML", away, pa, tie, ml_away, f"{away} ML {ml_away:+d}", 0, dict(is_dog=away == dog)))
+    for kind, sd in (("OVER", "over"), ("UNDER", "under")):
+        p, pu = MK.total_prob(hist, mtot, tot, sd)
+        c.append(side(kind, None, p, pu, juice, f"{kind.title()} {tot:g}", 0,
+                      dict(number_edge=float(mtot - tot) if sd == "over" else float(tot - mtot))))
+    for team, sd, tl in ((home, "home", sp - teaser_pts), (away, "away", sp + teaser_pts)):
+        p, pu, n = MK.cover_prob(hist, msp, tl, sd)
+        txt = f"{team} {(-tl if sd == 'home' else tl):+g} (teased)"
+        c.append(side("TEASER", team, p, pu, juice, txt, n))
+    return c
+
+
 def _value(p: float, dec: float, mode: str) -> float:
     """Expected points per confidence point."""
     return p * dec if mode == "odds" else p
@@ -225,9 +302,17 @@ def build_card(sims: dict, lines: pd.DataFrame, mode: str = "flat",
                teaser_odds: int = DEFAULT_TEASER_ODDS,
                parlay_pricing: str = "true", parlay_odds: int = DEFAULT_PARLAY_ODDS,
                n_slots: int = N_SLOTS, exclude_played: bool = False,
-               market_weight: float = 0.0, ou_games: list | None = None) -> dict:
+               market_weight: float = 0.0, ou_games: list | None = None,
+               source: str = "engine", hist: pd.DataFrame | None = None) -> dict:
     """Choose the picks and assign confidence. Returns the card and the full
-    candidate table so the reasoning is inspectable."""
+    candidate table so the reasoning is inspectable.
+
+    `source`: 'engine' prices every side from the simulated games in `sims`
+    (blended toward the market by `market_weight`); 'market' prices them from
+    the market's lines and the empirical margin/total distributions in `hist`
+    (`nflsim.market`) — the pool's numbers graded against the market's. With
+    'market', `sims` only needs game_id / home / away / played per game.
+    """
     lines = lines.set_index("game_id")
     cands = []
     for gid, sim in sims.items():
@@ -235,7 +320,11 @@ def build_card(sims: dict, lines: pd.DataFrame, mode: str = "flat",
             continue
         if exclude_played and sim.get("played"):
             continue
-        cands.extend(game_candidates(sim, lines.loc[gid], juice, teaser_pts, market_weight))
+        if source == "market":
+            cands.extend(market_candidates(hist, gid, sim["home"], sim["away"],
+                                           lines.loc[gid], juice, teaser_pts))
+        else:
+            cands.extend(game_candidates(sim, lines.loc[gid], juice, teaser_pts, market_weight))
     cand = pd.DataFrame(cands)
     if cand.empty:
         return dict(card=pd.DataFrame(), candidates=cand, notes=["No games to pick."])
@@ -269,7 +358,10 @@ def build_card(sims: dict, lines: pd.DataFrame, mode: str = "flat",
         picks.append(dict(slot=name, game_id="+".join(l["game_id"] for l in legs),
                           kind="PARLAY", team=None, text=" / ".join(l["text"] for l in legs),
                           p=p, p_push=0.0, odds=0, dec=pay, market_p=1.0 / pay, payout=pay,
-                          value=_value(p, pay, mode), edge=p - 1.0 / pay))
+                          value=_value(p, pay, mode), edge=p - 1.0 / pay,
+                          legs=[dict(game_id=l["game_id"], kind=l["kind"], team=l["team"],
+                                     line_margin=l["line_margin"], line_total=l["line_total"])
+                                for l in legs]))
 
     # 3. totals: the pool names the games (ou_games); the model picks over or
     #    under on each. Without a list, the best-value games fill the slots.
@@ -305,7 +397,7 @@ def build_card(sims: dict, lines: pd.DataFrame, mode: str = "flat",
     return dict(card=card, candidates=cand, notes=notes,
                 total_exp=float(card["exp_points"].sum()),
                 market_exp=float(card["market_exp"].sum()),
-                mode=mode, market_weight=float(market_weight))
+                mode=mode, market_weight=float(market_weight), source=source)
 
 
 def game_view(candidates: pd.DataFrame) -> pd.DataFrame:
@@ -334,11 +426,160 @@ def card_display(card: pd.DataFrame) -> pd.DataFrame:
         "Conf": card["confidence"],
         "Slot": card["slot"],
         "Pick": card["text"],
-        "Model P": card["p"],
+        "P(win)": card["p"],
         "Push": card["p_push"],
         "Price": [to_american(x) for x in card["dec"]],
-        "Market P": card["market_p"],
+        "Price implies": card["market_p"],
         "Edge": card["edge"],
         "Exp. pts": card["exp_points"],
     })
+    if "number_edge" in card.columns:
+        d.insert(3, "Number vs market", card["number_edge"].fillna(0.0))
     return d
+
+
+# ---------------------------------------------------------------------------
+# Grading a card against real results, and replaying past weeks honestly
+# ---------------------------------------------------------------------------
+# A past week's card is rebuilt from the team backtest (`backtest.team_backtest`):
+# for every game the model's margin and total with the ratings, home field,
+# availability and calibration refit on games BEFORE that week, and the closing
+# line. The engine's full simulation cannot be replayed for a past week (depth
+# charts and injury reports are as-of-now), so each game's distribution is the
+# harness's own: Normal around the model's margin (sd MARGIN_SD) and total
+# (sd HIST_TOTAL_SD, the 2025 out-of-sample residual), independent - which is
+# what page 10 scores too. Pushes score zero. A parlay with a pushed leg counts
+# as lost (pools differ; this is the conservative reading).
+
+HIST_TOTAL_SD = 13.4
+HIST_SAMPLES = 8000
+
+
+def settle(kind: str, team, home: str, away: str, line_margin: float, line_total: float,
+           hs: float, as_: float, teaser_pts: float = DEFAULT_TEASER_POINTS) -> str:
+    """'win' / 'loss' / 'push' for one side given the final score."""
+    m, t = float(hs) - float(as_), float(hs) + float(as_)
+    sp, tot = float(line_margin), float(line_total)
+    if kind == "ATS":
+        edge = (m - sp) if team == home else (sp - m)
+    elif kind == "ML":
+        edge = m if team == home else -m
+    elif kind == "TEASER":
+        edge = (m - (sp - teaser_pts)) if team == home else ((sp + teaser_pts) - m)
+    elif kind == "OVER":
+        edge = t - tot
+    elif kind == "UNDER":
+        edge = tot - t
+    else:
+        return "loss"
+    return "win" if edge > 0 else "loss" if edge < 0 else "push"
+
+
+def grade_card(card: pd.DataFrame, scores: dict, mode: str,
+               teaser_pts: float = DEFAULT_TEASER_POINTS) -> pd.DataFrame:
+    """Add `result` and `points` to a card.
+
+    `scores`: game_id -> (home_score, away_score, home, away). Points =
+    confidence (x payout in odds mode) on a win, else 0. A pick whose game has
+    no score yet is 'open'.
+    """
+    out = card.copy()
+    results, points = [], []
+    for _, r in out.iterrows():
+        if r["kind"] == "PARLAY":
+            legs = r.get("legs") or []
+            res = []
+            for l in legs:
+                if l["game_id"] not in scores:
+                    res.append("open"); continue
+                hs, as_, home, away = scores[l["game_id"]]
+                res.append(settle(l["kind"], l["team"], home, away,
+                                  l["line_margin"], l["line_total"], hs, as_, teaser_pts))
+            result = ("open" if "open" in res
+                      else "win" if res and all(x == "win" for x in res) else "loss")
+        elif r["game_id"] in scores:
+            hs, as_, home, away = scores[r["game_id"]]
+            result = settle(r["kind"], r["team"], home, away, r["line_margin"],
+                            r["line_total"], hs, as_, teaser_pts)
+        else:
+            result = "open"
+        pay = float(r["payout"]) if mode == "odds" else 1.0
+        results.append(result)
+        points.append(float(r["confidence"]) * pay if result == "win" else 0.0)
+    out["result"] = results
+    out["points"] = points
+    return out
+
+
+def history_sims(bt_week: pd.DataFrame, n: int = HIST_SAMPLES, seed: int = 5,
+                 margin_sd: float | None = None) -> dict:
+    """Per-game (margin, total) samples from the backtest's out-of-sample
+    predictions, in the same shape `simulate_slate` returns."""
+    from . import backtest as B
+    rng = np.random.default_rng(seed)
+    msd = float(margin_sd if margin_sd is not None else B.MARGIN_SD)
+    out = {}
+    for _, g in bt_week.iterrows():
+        m = rng.normal(float(g["pred_margin"]), msd, n)
+        t = rng.normal(float(g["pred_total"]), HIST_TOTAL_SD, n)
+        out[g["game_id"]] = dict(
+            game_id=g["game_id"], home=g["home"], away=g["away"],
+            pts_home=(t + m) / 2.0, pts_away=(t - m) / 2.0, played=True,
+            home_score=g["actual_home"], away_score=g["actual_away"])
+    return out
+
+
+def card_history(bt: pd.DataFrame, sched: pd.DataFrame, mode: str = "odds",
+                 juice: int = DEFAULT_JUICE, teaser_pts: float = DEFAULT_TEASER_POINTS,
+                 teaser_odds: int = DEFAULT_TEASER_ODDS, parlay_pricing: str = "true",
+                 parlay_odds: int = DEFAULT_PARLAY_ODDS, n_slots: int = N_SLOTS,
+                 market_weight: float = 0.0,
+                 n_samples: int = HIST_SAMPLES, source: str = "engine",
+                 hist: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Rebuild and grade the card for every (season, week) in a team backtest.
+
+    Returns (weeks, picks): one summary row per week, and every graded pick.
+    Totals slots are filled by the model's best-value games (the pool's actual
+    choices for past weeks are unknown).
+    """
+    if bt is None or bt.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    weeks, picks = [], []
+    sched = sched.set_index("game_id")
+    for (S, w), g in bt.groupby(["season", "week"]):
+        sims = history_sims(g, n_samples, seed=int(S * 100 + w))
+        gids = [gid for gid in g["game_id"] if gid in sched.index]
+        if not gids:
+            continue
+        lines = default_lines(sched.loc[gids].reset_index())
+        h = hist[hist["season"] < int(S)] if (source == "market" and hist is not None) else hist
+        res = build_card(sims, lines, mode=mode, juice=juice, teaser_pts=teaser_pts,
+                         teaser_odds=teaser_odds, parlay_pricing=parlay_pricing,
+                         parlay_odds=parlay_odds, n_slots=n_slots, market_weight=market_weight,
+                         source=source, hist=h)
+        card = res["card"]
+        if card.empty:
+            continue
+        scores = {r["game_id"]: (float(r["actual_home"]), float(r["actual_away"]),
+                                 r["home"], r["away"]) for _, r in g.iterrows()}
+        graded = grade_card(card, scores, mode, teaser_pts)
+        graded["season"], graded["week"] = int(S), int(w)
+        picks.append(graded)
+        st = graded[graded["result"] != "open"]
+        gp, tt = st[st["slot"] == "Game pick"], st[st["slot"] == "Total"]
+        weeks.append(dict(
+            season=int(S), week=int(w), games=int(len(g)), picks=int(len(st)),
+            points=float(st["points"].sum()),
+            expected=float(res["total_exp"]), market_expected=float(res["market_exp"]),
+            wins=int((st["result"] == "win").sum()), pushes=int((st["result"] == "push").sum()),
+            exp_wins=float(st["p"].sum()),
+            top5_wins=int((st.head(5)["result"] == "win").sum()),
+            game_pick_hit=float((gp["result"] == "win").mean()) if len(gp) else np.nan,
+            totals_hit=float((tt["result"] == "win").mean()) if len(tt) else np.nan,
+            combos_won=int(((st["kind"] == "PARLAY") & (st["result"] == "win")).sum()),
+        ))
+    wk = pd.DataFrame(weeks)
+    if not wk.empty:
+        wk["cum_points"] = wk["points"].cumsum()
+        wk["cum_expected"] = wk["expected"].cumsum()
+    return wk, (pd.concat(picks, ignore_index=True) if picks else pd.DataFrame())
