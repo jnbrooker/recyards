@@ -118,7 +118,7 @@ def game_projections(sim: dict, rules: dict, game_id: str = "",
 
 def week_projections(ctx: dict, games: pd.DataFrame, rules: dict,
                      n_sims: int = 10000, use_injuries: bool = True,
-                     seed: int = 11) -> tuple[pd.DataFrame, dict, list]:
+                     seed: int = 11, engine: str = "drive") -> tuple[pd.DataFrame, dict, list]:
     """Simulate every game in `games` (a schedule slice) and stack the tables.
 
     Returns (table, samples, game_summaries). Games whose teams have no rating
@@ -138,12 +138,9 @@ def week_projections(ctx: dict, games: pd.DataFrame, rules: dict,
         try:
             if home not in ratings["off"].index or away not in ratings["off"].index:
                 raise ValueError("no rating")
-            sim = G.simulate_game(ratings, ctx["wk"], roster(home), roster(away),
-                                  home, away, ctx["pass_vol"], ctx["rush_vol"],
-                                  ctx["rush_def"], ctx["lg_pass"], home="a",
-                                  n_sims=n_sims, seed=seed + i, avail=ctx.get("avail"),
-                                  wind=g.get("wind"), roof=g.get("roof"),
-                                  target_rate=ctx.get("target_rate"))
+            sim = G.run_game(ctx, roster(home), roster(away), home, away, n_sims=n_sims,
+                             seed=seed + i, home="a", avail=ctx.get("avail"),
+                             wind=g.get("wind"), roof=g.get("roof"), engine=engine)
         except ValueError as e:
             summaries.append(dict(game_id=g["game_id"], home=home, away=away,
                                   ok=False, error=str(e)))

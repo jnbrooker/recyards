@@ -21,9 +21,8 @@ def get_context(seasons, recency):
     return UI.cached_context(tuple(sorted(seasons)), recency)
 
 
-@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner=False)
 def get_schedule(season):
-    return D.load_schedule((int(season),))
+    return UI.cached_schedule(int(season))
 
 
 @st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner=False)
@@ -75,7 +74,7 @@ wind = st.sidebar.number_input("Wind (mph)", 0.0, 40.0, _wind0, 1.0,
                                     f"{-T.WIND_COEF:.1f} points off the projected total "
                                     "(fitted on 2024–25). nflverse only records wind after "
                                     "the game, so type the forecast for an upcoming one.")
-n_sims = st.sidebar.select_slider("Simulations", [4000, 10000, 20000, 50000], value=20000)
+n_sims = st.sidebar.select_slider("Simulations", [4000, 10000, 20000, 50000], value=UI.DEFAULTS["n_sims_game"])
 
 st.title("🏈 Game Simulation")
 if home == away:
@@ -91,11 +90,9 @@ try:
 except ValueError as e:
     st.error(str(e)); st.stop()
 
-sim = G.simulate_game(ratings, ctx["wk"], r_home, r_away, home, away,
-                      ctx["pass_vol"], ctx["rush_vol"], ctx["rush_def"],
-                      ctx["lg_pass"], home=None if neutral else "a",
-                      n_sims=n_sims, seed=11, avail=ctx.get("avail"),
-                      wind=wind, roof=_roof, target_rate=ctx.get("target_rate"))
+engine = UI.engine_picker("p7")
+sim = UI.cached_game(tuple(seasons), recency, home, away, int(n_sims), bool(neutral),
+                     bool(use_inj), float(wind), str(_roof), engine)
 s = G.summarize(sim)
 
 fav, dog = (home, away) if s["mean_margin"] >= 0 else (away, home)

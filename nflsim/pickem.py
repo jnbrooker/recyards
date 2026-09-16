@@ -82,7 +82,7 @@ def spread_to_moneyline(spread_home: float) -> tuple[float, float]:
 # ---------------------------------------------------------------------------
 
 def simulate_slate(ctx: dict, games: pd.DataFrame, n_sims: int = 10000,
-                   use_injuries: bool = True, seed: int = 23) -> dict:
+                   use_injuries: bool = True, seed: int = 23, engine: str = "drive") -> dict:
     """game_id -> dict(home, away, pts_home, pts_away, label) for every game."""
     ratings = ctx["ratings"]
     out, rosters = {}, {}
@@ -97,12 +97,9 @@ def simulate_slate(ctx: dict, games: pd.DataFrame, n_sims: int = 10000,
         if home not in ratings["off"].index or away not in ratings["off"].index:
             continue
         try:
-            sim = G.simulate_game(ratings, ctx["wk"], roster(home), roster(away),
-                                  home, away, ctx["pass_vol"], ctx["rush_vol"],
-                                  ctx["rush_def"], ctx["lg_pass"], home="a",
-                                  n_sims=n_sims, seed=seed + i, avail=ctx.get("avail"),
-                                  wind=g.get("wind"), roof=g.get("roof"),
-                                  target_rate=ctx.get("target_rate"))
+            sim = G.run_game(ctx, roster(home), roster(away), home, away, n_sims=n_sims,
+                             seed=seed + i, home="a", avail=ctx.get("avail"),
+                             wind=g.get("wind"), roof=g.get("roof"), engine=engine)
         except ValueError:
             continue
         out[g["game_id"]] = dict(

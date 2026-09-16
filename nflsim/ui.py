@@ -147,12 +147,16 @@ def recency_caption(wk: pd.DataFrame | None, recency, shares: dict | None = None
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner="Loading play-by-play, depth charts and injuries…")
+def _cached_context(seasons: tuple, recency) -> dict:
+    from . import game as G
+    return G.prepare(seasons, recency=recency)
+
+
 def cached_context(seasons: tuple[int, ...], recency) -> dict:
     """The full game-engine context (`game.prepare`), shared by every page
     that offers the game view — one download and one set of ratings per
     (seasons, recency) for the whole app."""
-    from . import game as G
-    return G.prepare(tuple(sorted(seasons)), recency=recency)
+    return _cached_context(_norm_seasons(seasons), recency)
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner="Building rosters…")
@@ -233,11 +237,199 @@ def script_caption(f: dict, game_row, what: str, typical: float, this_game: floa
             f"{what} {player_typical:.1f} → **{player_game:.1f}**.")
 
 
+@st.cache_data(ttl=6 * 3600, show_spinner="Loading depth charts and injury reports…")
+def _cached_live(seasons: tuple, recency) -> dict:
+    return RO.load_live(seasons, recency=recency)
+
+
 def cached_live(seasons: tuple[int, ...], recency=None) -> dict:
     from . import data as D
-    return RO.load_live(tuple(sorted(seasons)), recency=recency or D.RECENCY_DEFAULT)
+    return _cached_live(_norm_seasons(seasons), recency or D.RECENCY_DEFAULT)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Building every team's roster…")
+def _cached_rosters(seasons: tuple, use_injuries: bool, recency) -> pd.DataFrame:
+    return RO.league_rosters(_cached_live(seasons, recency), use_injuries)
 
 
 def cached_rosters(seasons: tuple[int, ...], use_injuries: bool,
                    recency=None) -> pd.DataFrame:
-    return RO.league_rosters(cached_live(seasons, recency), use_injuries)
+    from . import data as D
+    return _cached_rosters(_norm_seasons(seasons), bool(use_injuries), recency or D.RECENCY_DEFAULT)
+
+
+def _norm_seasons(seasons) -> tuple:
+    """Cache keys are built from the raw arguments, so every caller must hand
+    over the same thing: a sorted tuple of ints, whatever order the widget gave."""
+    return tuple(sorted(int(s) for s in seasons))
+
+
+def engine_picker(key: str = "engine") -> str:
+    """Drive engine (default) or the play-level engine, on the pages that
+    simulate whole games. The play engine builds its tables on first use
+    (~2-3 minutes once per app process) and runs ~10x slower per game."""
+    lbl = st.sidebar.radio(
+        "Game engine", ["Drive (default)", "Play-level (beta)"], horizontal=True, key=f"{key}_engine",
+        help="**Drive**: one draw per possession; the engine every page was built on.  \n"
+             "**Play-level**: every snap simulated from ten seasons of play-by-play — "
+             "volume comes from the clock and the score, so a quarterback's yards move "
+             "with the game total and a trailing team really does throw more. Same "
+             "expected margin and total (both are steered to the ratings layer); "
+             "different shape. Not yet shown to beat the drive engine on props — "
+             "see page 12 for the gates.")
+    return "play" if lbl.startswith("Play") else "drive"
+
+
+# ---------------------------------------------------------------------------
+# One cache for the whole app
+# ---------------------------------------------------------------------------
+# Streamlit's caches are per PROCESS but keyed per FUNCTION, so two pages that
+# wrap the same computation in their own @st.cache_data each pay for it. Every
+# page that simulates a game or a slate now goes through the functions below,
+# and Home.py can run them all once for the default settings ("warm-up") so
+# that the pages open instantly afterwards. Pages must call with the same
+# arguments the warm-up used — DEFAULTS is the single source of those.
+
+DEFAULTS = dict(
+    n_sims_game=20000,      # page 7, one fixture
+    n_sims_slate=10000,     # page 8 fantasy, page 9 pick'em
+    use_injuries=True,
+    scoring="PPR",
+)
+
+
+def default_priors() -> tuple:
+    """(seasons, recency) exactly as `priors_picker` returns them untouched."""
+    from . import data as D
+    _, defaults = D.season_choices()
+    # sorted, because every page passes tuple(sorted(seasons)) — the cache key must match
+    return tuple(sorted(int(s) for s in defaults)), D.RECENCY_PRESETS["Balanced"]
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def cached_schedule(season: int) -> pd.DataFrame:
+    from . import data as D
+    return D.load_schedule((int(season),))
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner="Loading 15 seasons of closing lines…")
+def cached_history() -> pd.DataFrame:
+    from . import market as MK
+    return MK.load_history()
+
+
+@st.cache_resource(show_spinner="Building the play-level engine (ten seasons of plays, once per session)…")
+def cached_play_engine(latest_season: int) -> dict:
+    """The play engine's tables, sensitivities and team tendencies, built once
+    per process and shared with `game.run_game` through the module registry."""
+    from . import playengine as PE
+    PE.attach({"depth_seasons": (int(latest_season),)})
+    return PE._ENGINE
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Simulating the game…")
+def _cached_game(seasons: tuple, recency, home: str, away: str, n_sims: int, neutral: bool,
+                use_injuries: bool, wind: float, roof: str, engine: str) -> dict:
+    from . import game as G
+    ctx = cached_context(seasons, recency)
+    if engine == "play":
+        cached_play_engine(int(ctx["depth_seasons"][-1]))
+    r_home = G.roster_for(ctx, home, use_injuries=use_injuries)
+    r_away = G.roster_for(ctx, away, use_injuries=use_injuries)
+    return G.run_game(ctx, r_home, r_away, home, away, n_sims=int(n_sims), seed=11,
+                      home=None if neutral else "a", avail=ctx.get("avail"),
+                      wind=wind, roof=roof, engine=engine)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Simulating every game this week…")
+def _cached_week(seasons: tuple, recency, week: int, rules_items: tuple, n_sims: int,
+                use_injuries: bool, engine: str):
+    from . import fantasy as F
+    ctx = cached_context(seasons, recency)
+    if engine == "play":
+        cached_play_engine(int(ctx["depth_seasons"][-1]))
+    sched = cached_schedule(int(ctx["depth_seasons"][-1]))
+    games = sched[sched["week"] == int(week)]
+    return F.week_projections(ctx, games, dict(rules_items), n_sims=int(n_sims),
+                              use_injuries=use_injuries, engine=engine)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Simulating every game this week…")
+def _cached_slate(seasons: tuple, recency, week: int, n_sims: int, use_injuries: bool, engine: str) -> dict:
+    from . import pickem as P
+    ctx = cached_context(seasons, recency)
+    if engine == "play":
+        cached_play_engine(int(ctx["depth_seasons"][-1]))
+    sched = cached_schedule(int(ctx["depth_seasons"][-1]))
+    games = sched[sched["week"] == int(week)]
+    return P.simulate_slate(ctx, games, n_sims=int(n_sims), use_injuries=use_injuries, engine=engine)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Refitting the model week by week for past games…")
+def _cached_team_backtest(seasons: tuple, recency) -> pd.DataFrame:
+    from . import backtest as B
+    return B.team_backtest(list(seasons), recency=recency, availability=True)
+
+
+def warm_up(progress=None, engines=("drive", "play")) -> list[str]:
+    """Compute everything the pages need for the default settings, so every
+    page opens from cache. Returns a log of what was built and how long it took."""
+    import time
+    from . import data as D, fantasy as F
+    log = []
+    seasons, recency = default_priors()
+
+    def step(label, fn):
+        t = time.time()
+        if progress:
+            progress(label)
+        fn()
+        log.append(f"{label} — {time.time() - t:.0f}s")
+
+    step("Priors, ratings, depth charts and injuries", lambda: cached_context(seasons, recency))
+    ctx = cached_context(seasons, recency)
+    season = int(ctx["depth_seasons"][-1])
+    step("Schedule", lambda: cached_schedule(season))
+    sched = cached_schedule(season)
+    week = D.current_week(sched)
+    step("Live rosters for every team", lambda: cached_rosters(seasons, DEFAULTS["use_injuries"], recency))
+    step("Fifteen seasons of closing lines", cached_history)
+    step(f"Week {week} slate, drive engine (pick'em)",
+         lambda: cached_slate(seasons, recency, week, DEFAULTS["n_sims_slate"], DEFAULTS["use_injuries"], "drive"))
+    rules = tuple(sorted(F.PRESETS[DEFAULTS["scoring"]].items()))
+    step(f"Week {week} fantasy projections, drive engine",
+         lambda: cached_week(seasons, recency, week, rules, DEFAULTS["n_sims_slate"], DEFAULTS["use_injuries"], "drive"))
+    step(f"Card history for {season} (pick'em replay)", lambda: cached_team_backtest((season,), recency))
+    wg = sched[(sched["week"] == week) & ~sched["played"]]
+    g = (wg if len(wg) else sched[sched["week"] == week]).iloc[0]
+    roof = str(g["roof"]) if pd.notna(g.get("roof")) else "outdoors"
+    wind = float(g["wind"]) if pd.notna(g.get("wind")) else 0.0
+    step(f"{g['away_team']} @ {g['home_team']}, drive engine (game page default)",
+         lambda: cached_game(seasons, recency, g["home_team"], g["away_team"], DEFAULTS["n_sims_game"],
+                             False, DEFAULTS["use_injuries"], wind, roof, "drive"))
+    if "play" in engines:
+        step("Play-level engine tables (ten seasons of plays)", lambda: cached_play_engine(season))
+        step(f"{g['away_team']} @ {g['home_team']}, play engine",
+             lambda: cached_game(seasons, recency, g["home_team"], g["away_team"], DEFAULTS["n_sims_game"],
+                                 False, DEFAULTS["use_injuries"], wind, roof, "play"))
+        step(f"Week {week} fantasy projections, play engine (the slow one)",
+             lambda: cached_week(seasons, recency, week, rules, DEFAULTS["n_sims_slate"], DEFAULTS["use_injuries"], "play"))
+    return log
+
+
+def cached_game(seasons: tuple, recency, home: str, away: str, n_sims: int, neutral: bool,
+                use_injuries: bool, wind: float, roof: str, engine: str):
+    return _cached_game(_norm_seasons(seasons), recency, str(home), str(away), int(n_sims), bool(neutral), bool(use_injuries), float(wind), str(roof), str(engine))
+
+
+def cached_week(seasons: tuple, recency, week: int, rules_items: tuple, n_sims: int,
+                use_injuries: bool, engine: str):
+    return _cached_week(_norm_seasons(seasons), recency, int(week), tuple(sorted((str(k), float(v)) for k, v in dict(rules_items).items())), int(n_sims), bool(use_injuries), str(engine))
+
+
+def cached_slate(seasons: tuple, recency, week: int, n_sims: int, use_injuries: bool, engine: str):
+    return _cached_slate(_norm_seasons(seasons), recency, int(week), int(n_sims), bool(use_injuries), str(engine))
+
+
+def cached_team_backtest(seasons: tuple, recency):
+    return _cached_team_backtest(_norm_seasons(seasons), recency)

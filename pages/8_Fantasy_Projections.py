@@ -20,18 +20,13 @@ def get_context(seasons, recency):
     return UI.cached_context(tuple(sorted(seasons)), recency)
 
 
-@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner=False)
 def get_schedule(season):
-    return D.load_schedule((int(season),))
+    return UI.cached_schedule(int(season))
 
 
-@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Simulating every game this week…")
-def get_week(seasons, recency, week, rules_items, n_sims, use_injuries):
-    ctx = get_context(seasons, recency)
-    sched = get_schedule(ctx["depth_seasons"][-1])
-    games = sched[sched["week"] == int(week)]
-    return F.week_projections(ctx, games, dict(rules_items), n_sims=n_sims,
-                              use_injuries=use_injuries)
+def get_week(seasons, recency, week, rules_items, n_sims, use_injuries, engine="drive"):
+    return UI.cached_week(tuple(seasons), recency, int(week), tuple(rules_items), int(n_sims),
+                          bool(use_injuries), engine)
 
 
 # --- sidebar ----------------------------------------------------------------
@@ -56,7 +51,8 @@ with st.sidebar.expander("Edit scoring rules"):
                                      step=0.05 if "yd" in key else 0.5, format="%.2f",
                                      key=f"rule_{key}")
 use_inj = st.sidebar.toggle("Drop players ruled out", value=True)
-n_sims = st.sidebar.select_slider("Simulations per game", [4000, 10000, 20000], value=10000)
+n_sims = st.sidebar.select_slider("Simulations per game", [4000, 10000, 20000], value=UI.DEFAULTS["n_sims_slate"])
+engine = UI.engine_picker("p8")
 
 st.sidebar.divider()
 positions = st.sidebar.multiselect("Positions", ["QB", "RB", "WR", "TE", "FB"],
@@ -66,7 +62,7 @@ min_proj = st.sidebar.slider("Hide players projected under", 0.0, 10.0, 2.0, 0.5
 
 # --- run --------------------------------------------------------------------
 table, samples, summaries = get_week(tuple(seasons), recency, int(week),
-                                     tuple(sorted(rules.items())), int(n_sims), use_inj)
+                                     tuple(sorted(rules.items())), int(n_sims), use_inj, engine)
 
 st.title("🏈 Fantasy Projections")
 ok = [g for g in summaries if g["ok"]]

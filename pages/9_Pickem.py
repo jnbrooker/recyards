@@ -24,17 +24,12 @@ def get_context(seasons, recency):
     return UI.cached_context(tuple(sorted(seasons)), recency)
 
 
-@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner=False)
 def get_schedule(season):
-    return D.load_schedule((int(season),))
+    return UI.cached_schedule(int(season))
 
 
-@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Simulating every game this week…")
-def get_slate(seasons, recency, week, n_sims, use_injuries):
-    ctx = get_context(seasons, recency)
-    sched = get_schedule(ctx["depth_seasons"][-1])
-    games = sched[sched["week"] == int(week)]
-    return P.simulate_slate(ctx, games, n_sims=n_sims, use_injuries=use_injuries)
+def get_slate(seasons, recency, week, n_sims, use_injuries, engine="drive"):
+    return UI.cached_slate(tuple(seasons), recency, int(week), int(n_sims), bool(use_injuries), engine)
 
 
 def _api_key():
@@ -45,16 +40,12 @@ def _api_key():
     return k or os.environ.get("ODDS_API_KEY", "")
 
 
-@st.cache_data(ttl=24 * 3600, show_spinner="Loading 15 seasons of closing lines…")
 def get_history():
-    return MK.load_history()
+    return UI.cached_history()
 
 
-@st.cache_data(ttl=D.REFRESH_HOURS * 3600, show_spinner="Refitting the model week by week for past games…")
 def get_team_backtest(seasons, recency):
-    """Out-of-sample margin and total for every played game: ratings, home
-    field, availability and calibration refit on games BEFORE each week."""
-    return B.team_backtest(list(seasons), recency=recency, availability=True)
+    return UI.cached_team_backtest(tuple(seasons), recency)
 
 
 # --- sidebar ----------------------------------------------------------------
@@ -72,7 +63,7 @@ cur = D.current_week(sched)
 week = st.sidebar.selectbox("Week", weeks, index=weeks.index(cur) if cur in weeks else 0)
 exclude_played = st.sidebar.toggle("Skip games already played", value=True)
 use_inj = st.sidebar.toggle("Drop players ruled out", value=True)
-n_sims = st.sidebar.select_slider("Simulations per game", [4000, 10000, 20000], value=10000)
+n_sims = st.sidebar.select_slider("Simulations per game", [4000, 10000, 20000], value=UI.DEFAULTS["n_sims_slate"])
 
 st.sidebar.divider()
 st.sidebar.subheader("Pool rules")
@@ -101,14 +92,16 @@ source_lbl = st.sidebar.radio(
          "what the engine thinks.")
 source = "market" if source_lbl.startswith("Market") else "engine"
 market_w = 1.0
+game_engine = "drive"
 if source == "engine":
+    game_engine = UI.engine_picker("p9")
     market_w = st.sidebar.slider(
         "Lean on the market", 0.0, 1.0, 0.5, 0.05,
         help="0 = grade every pick on the pure model. 1 = centre each game where the "
              "line is and keep only the model's shape.")
 
 # --- run ----------------------------------------------------------------------
-sims = get_slate(tuple(seasons), recency, int(week), int(n_sims), use_inj)
+sims = get_slate(tuple(seasons), recency, int(week), int(n_sims), use_inj, game_engine)
 games = sched[sched["week"] == int(week)].copy()
 games = games[games["game_id"].isin(sims.keys())]
 if exclude_played:

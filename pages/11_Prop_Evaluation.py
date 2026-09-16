@@ -112,6 +112,8 @@ if led.empty:
 # settle anything now playable; re-project unplayed lines predicted by an older
 # model version (started / settled lines keep the prediction they were graded on)
 wk_all = D.load_weekly(tuple(sorted(set(int(s) for s in led["season"].dropna().unique()))), recency)
+if led["player_id"].isna().any():
+    led, _ = P.rematch(led, get_rosters(tuple(seasons), recency))
 led = P.fill_actuals(led, wk_all)
 bar = st.progress(0.0, text="Checking predictions against the current model…")
 led, n_stale = P.reproject_unplayed(led, ctx, only_stale=True,
@@ -149,7 +151,7 @@ else:
         line=("line", "median"), over_price=("over_price", "median"), under_price=("under_price", "median"),
         pred_mean=("pred_mean", "median"), pred_median=("pred_median", "median"), p_over=("p_over", "median"),
         actual=("actual", "first"), result=("result", "first"), commence=("commence", "first"),
-        bookmaker=("bookmaker", "nunique")).reset_index()
+        model_version=("model_version", "first"), bookmaker=("bookmaker", "nunique")).reset_index()
     d = agg
 g = P.grade(d, use=use, edge=edge)
 games_sel = st.sidebar.multiselect("Games", sorted((g["away"] + " @ " + g["home"]).unique().tolist()), default=[])
@@ -176,6 +178,32 @@ if s.get("settled", 0):
 else:
     st.caption("Nothing settled yet — actuals fill in automatically once the games are in the "
                "weekly feed (nflverse publishes within hours of the final whistle).")
+
+# where the model's centre sits against the book's number, by model version —
+# this is the thing to watch as new weeks come in
+yd = g[g["market"].isin(["player_rush_yds", "player_reception_yds"]) & g["pred_mean"].notna()]
+if not yd.empty:
+    with st.expander("Model centre vs the book's line, by model version"):
+        bias = (yd.assign(mean_line=yd["pred_mean"] - yd["line"],
+                          median_line=yd["pred_median"] - yd["line"],
+                          actual_line=yd["actual"] - yd["line"])
+                  .groupby(["model_version", "market"])
+                  .agg(lines=("line", "size"), settled=("actual", "count"),
+                       mean_minus_line=("mean_line", "mean"), median_minus_line=("median_line", "mean"),
+                       actual_minus_line=("actual_line", "mean"),
+                       model_over=("p_over", lambda x: float((x > 0.5).mean())))
+                  .reset_index())
+        bias["market"] = bias["market"].map(lambda m: P.MARKETS[m][0])
+        bias["current"] = np.where(bias["model_version"] == P.model_version(), "◀ current", "")
+        st.dataframe(bias.style.format({"mean_minus_line": "{:+.1f}", "median_minus_line": "{:+.1f}",
+                                        "actual_minus_line": "{:+.1f}", "model_over": "{:.0%}"}, na_rep="—"),
+                     hide_index=True, width="stretch")
+        st.caption("Yards. A calibrated model has *mean − line* near zero and *median − line* a "
+                   "little below it (yardage is right-skewed, and books tend to set the number "
+                   "near the mean). Week 1 (version 47d6…) had medians 8 yards under the line "
+                   "on receiving — the shape bug fixed on 14 Sep. `model_over` is the share of "
+                   "lines where the model favours the over; `actual − line` shows how the week "
+                   "itself ran.")
 
 # --- the table -----------------------------------------------------------------
 show = g.copy()

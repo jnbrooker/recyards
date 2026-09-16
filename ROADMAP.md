@@ -721,6 +721,142 @@ rating if the box-score yardage needs its own anchor.*
     0.81 vs 0.68) even though its coverage is fine out of sample; worth the
     same per-stage decomposition when there is time.
 
+    **Week 1 final, one row per player-market (225 lines, 16 Sep).** Side the
+    median sat on hit 52.0%; picks at ≥3% edge 50.0% (n=192); the book's own
+    favoured side 47.6%. Brier 0.270 vs the book's 0.250 — the book was better,
+    largely because the model's under-skew put it on the wrong side of a week
+    where outcomes ran +5 yards over the lines. Level was right (mean − line
+    +0.4 receiving, +1.5 rushing); shape was the whole story (median − line
+    −8.2 / −4.9). The 18 DEN@KC lines re-projected with the fixed shape sat
+    at median − line −4, mean − line +1: medians now a normal 0.85 of the mean,
+    still below the book's number. Whether the book's number is the mean or
+    the median of outcomes is the open question, and it decides whether the
+    model should pick on the median at all; it takes several weeks of settled
+    lines to answer. The props page now shows this table by model version.
+    The current version (17b6…) has no graded lines until week 2's are fetched.
+    Also fixed: book nicknames ("Joshua Palmer", "Hollywood Brown") now match
+    via an alias table and a loose first-name key; late matches on played
+    games are settled but never predicted after the fact.
+
+12. **Play-level game engine — built, gated, kept as a lab.** *(2026-09-16.)*
+    `nflsim/playengine.py` + page 12. Ten seasons of play-by-play (462,773
+    plays, cached locally in `cache/`) → empirical tables: play call by state
+    (down, distance, field position, exact score within a field goal, part of
+    game), actual outcomes by state, clock use by kind of play, kicks and tries.
+    A vectorised loop plays every simulation one snap at a time (4,000 games in
+    ~15 s). Team strength enters as per-side yards-per-play shifts solved so the
+    engine's mean margin and total land on the ratings layer's expected game;
+    fractional shifts are applied stochastically (rounding erased them — the
+    first sensitivity measured was 14.6 points per yard because +0.6 rounded to
+    a full yard on every play).
+
+    **League gate, no tuning, identical teams:** drives 11.0 vs 11.4, punts 3.9
+    vs 4.1, FG attempts 1.97 vs 1.97, INTs 0.78 vs 0.78, sacks 2.36 vs 2.38,
+    plays 63 vs 62, mass at 7 / 6 / 10 points right, home–away score correlation
+    right. Open: mass at exactly 3 is 10% vs 14% (needs timeouts as a resource
+    and the two-minute warning); ties 1.0% vs 0.4% (overtime is single-period
+    sudden death here).
+
+    **Shape gate, 2025, engine vs a normal curve on the same out-of-sample
+    means:** winner log-loss 0.6368 vs 0.6342, cover 0.7282 vs 0.7270, over
+    0.6958 vs 0.6943 — a hair worse everywhere, inside noise. A normal with the
+    right sd is already a good model of a margin, and the engine's missing mass
+    at 3 costs it what its mechanics gain. More telling: the cover calibration
+    is inverted for BOTH (predicted 66% → actual 49%), because the ratings'
+    disagreement with the closing line carries no signal; no shape fixes that.
+    **So the drive engine stays the default for scores and spreads.**
+
+    **Stage 4 — players on top (built 2026-09-16).** `playengine.allocate_players`
+    takes each simulation's team attempts, completions, gross passing yards,
+    carries, rushing yards, touchdowns, sacks and interceptions from the clock
+    and game state and allocates them to the depth chart with the drive
+    engine's own machinery (Dirichlet shares, the receiving and rushing
+    yardage mechanics, multinomial touchdown splits), then rescales so that in
+    EVERY simulation the receivers sum to the team's gross passing yards and
+    the rushers to its rushing yards. Every box-score identity holds on both
+    engines. The structural difference is the point: under the play engine a
+    quarterback's passing yards correlate **+0.35** with the game total (drive
+    engine 0.00; real +0.44) and rushing attempts **+0.61** with the margin
+    (drive +0.20; real +0.50) — because volume comes from the game, not from a
+    normal draw. Team tendencies were added so teams differ in call mix and
+    pace: pass rate over expectation as a logit shift on the play call (BAL
+    −0.34 to CIN +0.29) and tempo as a clock multiplier, from the last three
+    seasons of plays. `game.run_game(..., engine=)` dispatches; the output
+    shape is identical so fantasy, the pick'em slate and the game page take an
+    Engine toggle (`ui.engine_picker`, default Drive).
+
+    **Stage-4 gate (5,278 real team-games vs the engine):** pass attempts 32.4
+    vs 34.1, rush attempts 27.9 vs 25.9, gross pass yards 236 vs 243 — close
+    but leaning run; and the outcome dependence of volume is too strong: real
+    teams run 60 snaps when losing by 14+ and 63 when winning by 14+, the
+    engine 57 and 67 (slope 0.22 snaps per point vs a real 0.05). Traced to
+    the losing side's drives being too short (5.1 snaps vs 5.8). Two fixes
+    tried and kept because they are right, neither closed it: the clock now
+    keys on the size of the lead (trailing 9+ snaps every 28 s in the second
+    half against 37 s for a team up 9+); outcomes on downs 2-4 are sampled
+    relative to the sticks so conversion rates match the data exactly. **Open:**
+    the trailing team's volume, ~3-4 snaps at the extremes. Until it closes,
+    the play engine over-states a trailing team's receivers slightly less than
+    the drive engine's normal draw does, but is not yet validated as the
+    better props engine — no player-level historical replay is possible with
+    as-of-now depth charts, so the gate is the team-box distributions above.
+
+    Also live / any-state pricing (not started).
+
+13. **Learned mean (`nflsim/learn.py`) — tested, not adopted.** *(2026-09-15.)*
+    Gradient boosting on 2016–25 player-weeks with routes run and targets per
+    route (participation feed), snap share, the QB's EPA per dropback, opponent
+    man-coverage and pressure rates, and the player's own history at three
+    horizons; walk-forward by season. Receiving yards: MAE 23.28 vs a trailing
+    average's 23.77 (2024), 22.69 vs 23.15 (2025) — and **23.06 vs the current
+    model's 22.99 on matched rows, correlation 0.93 between the two.** No
+    advantage for rookies, role changes or stars; a 50/50 ensemble gains 0.1.
+    Targets alone: 3.7% better than the trailing average. Conclusion: the mean
+    of a receiver's yards is at the ceiling of box-score and participation data
+    (noise floor ~19–20, both models at 23); the gap to the book (~0.7 yards) is
+    information, not maths. Routes: far more stable week to week than target
+    share (0.70 vs 0.56) but targets per route is noisy (0.27), so route% × TPRR
+    does not beat the EW share (0.0510 vs 0.0506). Kept as the experiment
+    harness; the next real lever on props is injury-week redistribution, and
+    the model's structural edge is the joint distribution (SGP, fantasy).
+
+14. **Pick'em: probabilities from the market and history.** *(2026-09-15.)*
+    `nflsim/market.py`. The engine's disagreement with the closing spread
+    carried no information on 2025 (slope +0.01, r +0.004; ATS 46%). Page 9 now
+    prices each side as P(the pool's line is beaten | the market's line) from
+    4,191 games at the same closing spread (±0.5 kernel, anchored at 50/50 on
+    the market's own number), totals from the empirical residual, moneylines
+    vig-free. Out of sample 2023–25: pool a point worse than market → predicted
+    44.3%, actual 44.7%; Wong teaser legs predicted 74.1%, actual 76.7% (n=180,
+    breakeven 72.7%). Replay of 19 weeks, odds-weighted: 3,831 points realised
+    vs 4,041 expected (engine at 50% lean: 2,731 vs 5,100); teasers 8/19 vs
+    4/19. Pool lines are editable beside live market lines (Odds API); a
+    "Number vs market" column shows the half-point edge. The pool prices at
+    openers, so that edge is real but unmeasured until the weekly ledger
+    accumulates closing lines.
+
+    *Replay re-run 2026-09-16 with the current ratings layer.* 2025, 18 weeks,
+    odds-weighted: market card 3,596 realised vs 3,697 expected (126 of 360
+    wins, 118 expected; parlays/teasers 13 of 54; totals 20 of 34); engine card
+    3,295 vs 4,226 expected (3 of 54 combos) — the engine's expectation is the
+    over-confidence the market source removes. 2026 week 1 live: market card
+    144 vs 205 expected (4 of 20 — the odds-weighted card is 16 moneyline dogs,
+    and the dogs went 4-12), engine card 209 vs 226. One week is noise; the
+    market card's 2025 expectation was within 3% of realised, the engine's was
+    28% high.
+
+15. **Warm-up and one cache for the app.** *(2026-09-16.)* Every page that
+    simulates a game or a slate goes through the shared cached functions in
+    `ui.py` (`cached_context`, `cached_schedule`, `cached_rosters`,
+    `cached_game`, `cached_week`, `cached_slate`, `cached_team_backtest`,
+    `cached_history`, `cached_play_engine`), keyed on the same `DEFAULTS`, so
+    two pages never compute the same thing twice. `Home.py` runs `ui.warm_up`
+    once per app process on first open (drive engine 2-3 minutes; with the
+    play engine 10-20 minutes) — priors, rosters, this week's slate on both
+    engines, the pick'em replay and the game page's first fixture — after
+    which every page opens from cache at its default settings. A toggle skips
+    the play engine; a button re-runs it. Caches live six hours.
+
 ## 9. Maintenance
 
 Several constants are fitted on out-of-sample residuals and rest on two

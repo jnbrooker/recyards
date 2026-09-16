@@ -172,10 +172,31 @@ def save_ledger(d: pd.DataFrame) -> None:
 _KEY = ["season", "week", "game_id", "bookmaker", "market", "player"]
 
 
+# Book names that are not the nflverse display name (looked up after normalising).
+_NICKNAMES = {
+    "joshua palmer": "josh palmer", "hollywood brown": "marquise brown",
+    "gabe davis": "gabriel davis", "chig okonkwo": "chigoziem okonkwo",
+}
+
+_FIRST_NAMES = {"joshua": "josh", "michael": "mike", "matthew": "matt", "nicholas": "nick",
+                "christopher": "chris", "cameron": "cam", "zachary": "zach", "jonathan": "jon",
+                "kenneth": "ken", "alexander": "alex", "daniel": "dan", "robert": "rob",
+                "william": "will", "benjamin": "ben", "anthony": "tony", "samuel": "sam"}
+
+
 def _norm(name: str) -> str:
     s = re.sub(r"[.\'’]", "", str(name).lower())
     s = re.sub(r"\b(jr|sr|ii|iii|iv)\b", "", s)
-    return re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\s+", " ", s).strip()
+    return _NICKNAMES.get(s, s)
+
+
+def _loose(name: str) -> str:
+    """Second-chance key: hyphens dropped, long first names shortened."""
+    parts = _norm(name).replace("-", " ").split(" ")
+    if parts:
+        parts[0] = _FIRST_NAMES.get(parts[0], parts[0])
+    return " ".join(parts)
 
 
 def match_players(lines: pd.DataFrame, rosters: pd.DataFrame, home: str, away: str) -> pd.DataFrame:
@@ -184,9 +205,10 @@ def match_players(lines: pd.DataFrame, rosters: pd.DataFrame, home: str, away: s
     both = rosters[rosters["team"].isin([home, away])]
     lookup = {_norm(n): (p, t) for n, p, t in zip(both["name"], both["player_id"], both["team"])}
     league = {_norm(n): (p, t) for n, p, t in zip(rosters["name"], rosters["player_id"], rosters["team"])}
+    loose = {_loose(n): (p, t) for n, p, t in zip(both["name"], both["player_id"], both["team"])}
     ids, teams = [], []
     for nm in lines["player"]:
-        hit = lookup.get(_norm(nm)) or league.get(_norm(nm))
+        hit = lookup.get(_norm(nm)) or league.get(_norm(nm)) or loose.get(_loose(nm))
         ids.append(hit[0] if hit else None); teams.append(hit[1] if hit else None)
     lines["player_id"] = ids
     lines["team"] = teams
@@ -314,13 +336,35 @@ def _samples(ctx: dict, market: str, row: pd.Series, n_sims: int = 20000,
     return None
 
 
+def rematch(led: pd.DataFrame, rosters: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Second pass over rows the fetch could not attach to a player (book
+    nicknames, hyphens): returns (ledger, rows newly matched). Only rows with
+    no player_id are touched, so settled rows never move."""
+    led = led.copy()
+    miss = led["player_id"].isna()
+    if not miss.any() or rosters is None or rosters.empty:
+        return led, 0
+    n = 0
+    for (home, away), g in led[miss].groupby(["home", "away"]):
+        m = match_players(g, rosters, home, away)
+        got = m["player_id"].notna()
+        led.loc[m.index[got], "player_id"] = m.loc[got, "player_id"]
+        led.loc[m.index[got], "team"] = m.loc[got, "team"]
+        n += int(got.sum())
+    return led, n
+
+
 def predict_missing(led: pd.DataFrame, ctx: dict, progress=None) -> pd.DataFrame:
     """Freeze Game-view predictions for ledger rows that have none."""
     led = led.copy()
     led["predicted_at"] = led["predicted_at"].astype(object)
     led["model_version"] = led["model_version"].astype(object)
     version = model_version()
-    todo = led.index[led["pred_mean"].isna() & led["player_id"].notna()]
+    # never freeze a prediction for a game that has started: a late match (see
+    # `rematch`) on a played game stays unpredicted rather than graded in hindsight
+    commence = pd.to_datetime(led["commence"], utc=True, errors="coerce")
+    open_ = led["result"].isna() & (commence.isna() | (commence > pd.Timestamp.now(tz="UTC")))
+    todo = led.index[led["pred_mean"].isna() & led["player_id"].notna() & open_]
     cache, memo = {}, {}
     for i, idx in enumerate(todo):
         row = led.loc[idx]
@@ -417,7 +461,7 @@ def grade(led: pd.DataFrame, use: str = "median", edge: float = 0.03) -> pd.Data
     centre = d["pred_median"] if use == "median" else d["pred_mean"]
     d["pick"] = np.where(d["edge"] > edge, "over", np.where(d["edge"] < -edge, "under", "none"))
     d["centre_pick"] = np.where(centre > d["line"], "over", np.where(centre < d["line"], "under", "none"))
-    settled = d["result"].isin(["over", "under"])
+    settled = d["result"].isin(["over", "under"]) & d["p_over"].notna()
     d["hit"] = np.where(settled & (d["pick"] != "none"), d["pick"] == d["result"], np.nan)
     d["centre_hit"] = np.where(settled & (d["centre_pick"] != "none"), d["centre_pick"] == d["result"], np.nan)
     d["book_hit"] = np.where(settled, np.where(d["book_p_over"] > 0.5, "over", "under") == d["result"], np.nan)
@@ -426,7 +470,7 @@ def grade(led: pd.DataFrame, use: str = "median", edge: float = 0.03) -> pd.Data
 
 def summary(g: pd.DataFrame) -> dict:
     """Headline numbers over settled rows."""
-    s = g[g["result"].isin(["over", "under"])]
+    s = g[g["result"].isin(["over", "under"]) & g["p_over"].notna()]
     if s.empty:
         return dict(settled=0)
     y = (s["result"] == "over").astype(float)

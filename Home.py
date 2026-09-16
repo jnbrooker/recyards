@@ -10,6 +10,8 @@ math layer in `nflsim/`, and they all feed the forthcoming Game Simulation page.
 
 import streamlit as st
 
+from nflsim import ui as UI
+
 st.set_page_config(page_title="NFL Model Suite", page_icon="🏈", layout="wide")
 
 st.title("🏈 NFL Monte Carlo Model Suite")
@@ -33,6 +35,42 @@ st.markdown(
     "- **Pick'em Card** — a 20-slot confidence card for the week (ATS / underdog ML per game, three 3-team combos, the pool's totals), graded against editable lines and ranked by expected return.\n"
     "- **Backtest** — every model scored out of sample, week by week, against the closing line and a trailing average. The only honest way to tune anything here.\n"
 )
+
+# --- warm-up: compute this week for the default settings, once per process ------
+st.subheader("Getting this week ready")
+c1, c2 = st.columns([1, 3])
+with c1:
+    both = st.toggle("Include the play-level engine", value=True,
+                     help="Adds the ten-season play tables and a full slate on the play "
+                          "engine — the slow part (10-20 minutes). Off = drive engine only "
+                          "(2-3 minutes).")
+    run = st.button("Pre-compute this week", type="primary",
+                    help="Runs every page's default computation once so the pages open "
+                         "instantly. Results live in the app's cache for six hours (or until "
+                         "the app restarts).")
+with c2:
+    st.caption("Runs automatically the first time the app opens, and on demand after that. "
+               "Every page simulates and caches; this does all of it up front for the default settings — priors, rosters, this week's slate on "
+               "both engines, the pick'em replay and the game page's first fixture — so you can "
+               "move between pages without waiting. Change a setting on a page and only that "
+               "computation reruns. Leave this tab open while it works.")
+@st.cache_resource
+def _warm_state():
+    return {"done": False}
+
+
+auto = _warm_state()
+if run or not auto["done"]:
+    auto["done"] = True                      # once per app process; the button re-runs it
+    status = st.status("Warming up…", expanded=True)
+    log = UI.warm_up(progress=lambda label: status.write(f"• {label}"),
+                     engines=("drive", "play") if both else ("drive",))
+    status.update(label="Ready — every page now opens from cache.", state="complete")
+    st.session_state["warmed"] = True
+    with st.expander("What was built"):
+        st.write("\n".join(f"- {l}" for l in log))
+elif st.session_state.get("warmed"):
+    st.success("This week is pre-computed. Pages open from cache.")
 
 st.subheader("How it works")
 st.write(

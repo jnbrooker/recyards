@@ -248,6 +248,28 @@ LEAD_BETA = 0.03
 MAX_DRIVES = 16
 
 
+def run_game(ctx: dict, roster_a: pd.DataFrame, roster_b: pd.DataFrame, team_a: str, team_b: str,
+             n_sims: int = 20000, seed: int | None = None, home: str | None = "a",
+             avail=None, wind=None, roof=None, engine: str = "drive") -> dict:
+    """Simulate one game with either engine; identical output shape.
+
+    'drive' — this module's drive engine (default everywhere).
+    'play'  — `playengine.simulate_game_players`: the play-level engine with
+              the same depth charts on top. Builds its tables on first use.
+    """
+    if engine == "play":
+        from . import playengine as PE
+        if "play_engine" not in ctx:
+            PE.attach(ctx)
+        tables, sens = ctx["play_engine"]
+        return PE.simulate_game_players(tables, sens, ctx, roster_a, roster_b, team_a, team_b,
+                                        n=n_sims, seed=seed, avail=avail, wind=wind, roof=roof, home=home)
+    return simulate_game(ctx["ratings"], ctx["wk"], roster_a, roster_b, team_a, team_b,
+                         ctx["pass_vol"], ctx["rush_vol"], ctx["rush_def"], ctx["lg_pass"],
+                         home=home, n_sims=n_sims, seed=seed, avail=avail, wind=wind, roof=roof,
+                         target_rate=ctx.get("target_rate"))
+
+
 def _score_sides(rng, drives_a: np.ndarray, drives_b: np.ndarray, mix_a: dict, mix_b: dict,
                  r: dict, team_a: str, team_b: str, pace_mean: float) -> tuple[dict, dict]:
     """Resolve both teams' drives into touchdowns, field goals and points,
