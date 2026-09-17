@@ -21,7 +21,10 @@ st.set_page_config(page_title="Prop Evaluation", page_icon="🏈", layout="wide"
 def _api_key():
     try:
         k = st.secrets.get("ODDS_API_KEY", "")
-    except Exception:
+    except Exception as e:
+        # a secrets file that exists but will not parse (a stray BOM, a bad
+        # quote) would otherwise silently disable the fetch buttons
+        st.sidebar.error(f"`.streamlit/secrets.toml` could not be read: {e}")
         k = ""
     return k or os.environ.get("ODDS_API_KEY", "")
 

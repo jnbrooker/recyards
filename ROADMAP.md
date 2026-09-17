@@ -801,6 +801,31 @@ rating if the box-score yardage needs its own anchor.*
     better props engine — no player-level historical replay is possible with
     as-of-now depth charts, so the gate is the team-box distributions above.
 
+    **Player-level replay, done after all (`nflsim/enginetest.py`, 2026-09-17).**
+    The 2025 depth charts are daily snapshots, so rosters *can* be rebuilt as
+    of each kickoff. Both engines on the same 136 games (8 a week, weeks 2–18),
+    same as-of ratings, rosters, priors and injuries, 2,000 sims, scored on
+    every player who played (1,946 receiving lines, 847 rushing, 1,762
+    receptions; ~35 min for the pair):
+
+    | | drive | play |
+    |---|---|---|
+    | receiving MAE / CRPS | 19.02 / 13.21 | 19.04 / 13.15 |
+    | receiving median beaten | 0.525 | 0.505 |
+    | receiving 40–60 tier: bias / median beaten | −4.8 / 0.580 | −2.7 / 0.509 |
+    | receiving 80% cover / above p90 | 0.810 / 0.112 | 0.795 / 0.112 |
+    | rushing MAE / CRPS | 19.18 / 13.14 | 19.26 / 13.22 |
+    | receptions MAE / CRPS | 1.50 / 1.05 | 1.52 / 1.06 |
+
+    A dead heat: the CRPS gap on receiving is −0.06 (se 0.04), on rushing
+    +0.08 (se 0.11). The one real difference is the drive engine's medians for
+    40–60-yard receivers (the WR1/WR2 tier that carries most prop lines)
+    running low — beaten 58% of the time — which the play engine fixes
+    (50.9%). Nothing else separates them, tails included. Verdict: the play
+    engine is *as good* on players, not better; it earns its place on
+    correlated markets (its QB-yards↔total correlation is real), not on
+    single-player lines. Not adopted as default.
+
     Also live / any-state pricing (not started).
 
 13. **Learned mean (`nflsim/learn.py`) — tested, not adopted.** *(2026-09-15.)*

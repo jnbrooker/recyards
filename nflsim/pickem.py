@@ -142,6 +142,67 @@ def default_lines(games: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+POOL_FILE = "pickem/lines.csv"
+_POOL_COLS = ["season", "week", "game_id", "home", "away", "spread_home", "total",
+              "ml_home", "ml_away", "mkt_spread_home", "mkt_total", "mkt_ml_home",
+              "mkt_ml_away", "ou_in_pool", "saved_at"]
+
+
+def load_pool_lines() -> pd.DataFrame:
+    """The pool's posted lines, one row per game, as saved from the page (or
+    entered by hand). Also the opener log: the market columns are the market
+    at the moment the pool's lines were saved."""
+    import os
+    if not os.path.exists(POOL_FILE):
+        return pd.DataFrame(columns=_POOL_COLS)
+    d = pd.read_csv(POOL_FILE)
+    for c in _POOL_COLS:
+        if c not in d.columns:
+            d[c] = np.nan
+    return d
+
+
+def save_pool_lines(lines: pd.DataFrame, season: int, week: int,
+                    ou_games: list | None = None) -> pd.DataFrame:
+    """Replace this week's rows with `lines` (the page's lines frame: pool and
+    mkt_* columns). Returns the full file."""
+    import os
+    d = load_pool_lines()
+    d = d[~((d["season"] == int(season)) & (d["week"] == int(week)))]
+    ou = set(ou_games or [])
+    rows = lines.assign(season=int(season), week=int(week),
+                        ou_in_pool=lines["game_id"].isin(ou),
+                        saved_at=pd.Timestamp.now(tz="UTC").isoformat())[_POOL_COLS]
+    d = pd.concat([d, rows], ignore_index=True).sort_values(["season", "week", "game_id"])
+    os.makedirs(os.path.dirname(POOL_FILE), exist_ok=True)
+    d.to_csv(POOL_FILE, index=False)
+    return d
+
+
+def apply_pool(lines: pd.DataFrame, saved: pd.DataFrame, season: int, week: int) -> pd.DataFrame:
+    """Overwrite the POOL columns of the page's lines frame from the saved
+    file for this week; games not in the file keep the seed. Market columns
+    are left alone (they track the live market, not the file)."""
+    if saved is None or saved.empty:
+        return lines
+    s = saved[(saved["season"] == int(season)) & (saved["week"] == int(week))]
+    if s.empty:
+        return lines
+    out = lines.copy()
+    key = s.set_index("game_id")
+    for i, r in out.iterrows():
+        if r["game_id"] not in key.index:
+            continue
+        m = key.loc[r["game_id"]]
+        for c in ("spread_home", "total"):
+            if pd.notna(m.get(c)):
+                out.loc[i, c] = float(m[c])
+        for c in ("ml_home", "ml_away"):
+            if pd.notna(m.get(c)):
+                out.loc[i, c] = int(m[c])
+    return out
+
+
 def apply_market(lines: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
     """Overwrite the mkt_* columns from a consensus-lines frame (home, away,
     spread_home, total, ml_home, ml_away). Pool columns are left alone."""

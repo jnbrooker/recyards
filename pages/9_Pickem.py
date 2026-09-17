@@ -35,7 +35,10 @@ def get_slate(seasons, recency, week, n_sims, use_injuries, engine="drive"):
 def _api_key():
     try:
         k = st.secrets.get("ODDS_API_KEY", "")
-    except Exception:
+    except Exception as e:
+        # a secrets file that exists but will not parse (a stray BOM, a bad
+        # quote) would otherwise silently disable the fetch buttons
+        st.sidebar.error(f"`.streamlit/secrets.toml` could not be read: {e}")
         k = ""
     return k or os.environ.get("ODDS_API_KEY", "")
 
@@ -147,6 +150,13 @@ with c_info:
                    f"{q.get('remaining', '?')}")
 if mkey in st.session_state:
     seed_lines = P.apply_market(seed_lines, st.session_state[mkey])
+saved_pool = P.load_pool_lines()
+season_of_week = int(games["season"].iloc[0]) if len(games) else int(ctx["depth_seasons"][-1])
+seed_lines = P.apply_pool(seed_lines, saved_pool, season_of_week, int(week))
+n_saved = int(((saved_pool["season"] == season_of_week) & (saved_pool["week"] == int(week))).sum())
+if n_saved:
+    st.caption(f"Pool lines for {n_saved} games loaded from `{P.POOL_FILE}`; the market columns "
+               "are live. Edit and save to replace them.")
 
 key = f"lines_{week}_{exclude_played}"
 edited = st.data_editor(
@@ -187,12 +197,19 @@ prelim = P.build_card(sims, lines, mode=mode_key, juice=int(juice), teaser_pts=f
                       source=source, hist=hist)
 auto_ou = prelim["card"].loc[prelim["card"]["slot"] == "Total", "game_id"].tolist()
 game_opts = dict(zip(lines["Game"], lines["game_id"]))
+saved_ou = set(saved_pool.loc[(saved_pool["season"] == season_of_week) & (saved_pool["week"] == int(week))
+                              & (saved_pool["ou_in_pool"] == True), "game_id"]) if n_saved else set()
 ou_pick = st.multiselect(
     "Games whose over/unders are in the pool", list(game_opts.keys()),
-    default=[g for g, gid in game_opts.items() if gid in auto_ou],
+    default=[g for g, gid in game_opts.items() if gid in (saved_ou or auto_ou)],
     help="The pool names these; the model then picks over or under on each. "
-         "Pre-filled with the games where the model sees the most value.")
+         "Pre-filled from the saved pool lines, else with the games where the model sees the most value.")
 ou_games = [game_opts[g] for g in ou_pick]
+if st.button("Save pool lines", help=f"Writes the pool columns, the totals games and the market "
+                                     f"as it stands now to `{P.POOL_FILE}` — so they survive a "
+                                     "restart and the opener-vs-closer log accumulates."):
+    P.save_pool_lines(lines, season_of_week, int(week), ou_games)
+    st.success(f"Saved {len(lines)} games for week {week}.")
 
 res = P.build_card(sims, lines, mode=mode_key, juice=int(juice), teaser_pts=float(teaser_pts),
                    teaser_odds=int(teaser_odds),
