@@ -11,6 +11,9 @@ Honest evaluation needs two things this module enforces:
   * **Predictions are frozen at fetch time.** The Game-view projection (mean,
     median, P(over) at the line) is computed when the line is recorded and
     never recomputed, so later injury news cannot leak into a "prediction".
+    The play-level engine's projection of the same line (`play_*`, one
+    simulated game per fixture, every player read off the box score) is
+    frozen beside it, so the two engines are judged on identical lines.
   * **The book is the benchmark.** Each line comes with its over/under prices;
     the implied (vig-free) probability is what the model's P(over) is scored
     against, and a side is only "the model's pick" when it disagrees with the
@@ -72,8 +75,19 @@ LEDGER_COLS = [
     "bookmaker", "market", "player", "player_id", "team", "line",
     "over_price", "under_price", "fetched_at",
     "pred_mean", "pred_median", "p_over", "predicted_at", "model_version",
+    "play_mean", "play_median", "play_p_over",
     "actual", "result",
 ]
+
+# engine -> its frozen (mean, median, P(over)) columns
+ENGINES = {
+    "game": ("pred_mean", "pred_median", "p_over"),
+    "play": ("play_mean", "play_median", "play_p_over"),
+}
+ENGINE_LABELS = {"game": "Game view", "play": "Play engine"}
+# the play engine runs ~700 sims a second; 10,000 a game is ~15 s (a 16-game
+# week in ~4 minutes) and puts the Monte-Carlo error on P(over) at 0.5%
+PLAY_SIMS = 10000
 
 
 def model_version() -> str:
@@ -170,6 +184,8 @@ def save_ledger(d: pd.DataFrame) -> None:
 
 
 _KEY = ["season", "week", "game_id", "bookmaker", "market", "player"]
+_PRED_COLS = ("pred_mean", "pred_median", "p_over", "predicted_at",
+              "play_mean", "play_median", "play_p_over")
 
 
 # Book names that are not the nflverse display name (looked up after normalising).
@@ -262,10 +278,10 @@ def fetch_week(api_key: str, ctx: dict, sched: pd.DataFrame, rosters: pd.DataFra
     # a refetch replaces the same key (closing line wins); keep frozen predictions
     # from earlier rows only if the line is unchanged
     if not led.empty:
-        merged = new.merge(led[_KEY + ["line", "pred_mean", "pred_median", "p_over", "predicted_at"]],
+        merged = new.merge(led[_KEY + ["line"] + list(_PRED_COLS)],
                            on=_KEY, how="left", suffixes=("", "_old"))
         same = merged["line"] == merged["line_old"]
-        for c in ("pred_mean", "pred_median", "p_over", "predicted_at"):
+        for c in _PRED_COLS:
             merged[c] = np.where(same, merged[c + "_old"], np.nan)
         new = merged[LEDGER_COLS]
         led = led.merge(new[_KEY], on=_KEY, how="left", indicator=True)
@@ -336,6 +352,53 @@ def _samples(ctx: dict, market: str, row: pd.Series, n_sims: int = 20000,
     return None
 
 
+def _play_box(ctx: dict, row: pd.Series, memo: dict) -> dict | None:
+    """The play engine's box arrays for one fixture, simulated once per
+    prediction pass (memoised on game_id): {team: box} for both sides."""
+    from . import game as G, roster as RO
+    key = ("play_box", row["game_id"])
+    if key not in memo:
+        home, away = row["home"], row["away"]
+        for team in (home, away):
+            if ("roster", team) not in memo:
+                memo[("roster", team)] = RO.roster_for(ctx, team, True)
+        # the engine takes the active roster only, in the same order it will
+        # index the box arrays
+        ra = memo[("roster", home)]; ra = ra[ra["active"]].reset_index(drop=True)
+        rb = memo[("roster", away)]; rb = rb[rb["active"]].reset_index(drop=True)
+        sim = G.run_game(ctx, ra, rb, home, away, n_sims=PLAY_SIMS, seed=7, home="a",
+                         avail=ctx.get("avail"), engine="play")
+        memo[key] = {home: sim["box_a"], away: sim["box_b"]}
+    return memo[key]
+
+
+def _play_samples(ctx: dict, market: str, row: pd.Series, memo: dict):
+    """Simulated samples for one ledger row from the play-level engine: the
+    player's column of his team's box score across every simulated game.
+    Weather is left out, as it is for the Game-view samples, so the two
+    engines see identical inputs."""
+    box = _play_box(ctx, row, memo).get(row["team"])
+    if box is None:
+        return None                     # matched to a roster outside this game
+    r = box["roster"].reset_index(drop=True)
+    j = np.flatnonzero(r["player_id"].astype(str).values == str(row["player_id"]))
+    if not len(j):
+        return None                     # ruled out: not on the active roster
+    j = int(j[0])
+    if market == "player_rush_yds":
+        return box["rush_yards"][:, j]
+    if market == "player_reception_yds":
+        return box["rec_yards"][:, j]
+    if market == "player_receptions":
+        return box["receptions"][:, j]
+    if market == "player_anytime_td":
+        return box["rec_tds"][:, j] + box["rush_tds"][:, j]
+    return None
+
+
+_SAMPLERS = {"game": _samples, "play": _play_samples}
+
+
 def rematch(led: pd.DataFrame, rosters: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     """Second pass over rows the fetch could not attach to a player (book
     nicknames, hyphens): returns (ledger, rows newly matched). Only rows with
@@ -354,8 +417,10 @@ def rematch(led: pd.DataFrame, rosters: pd.DataFrame) -> tuple[pd.DataFrame, int
     return led, n
 
 
-def predict_missing(led: pd.DataFrame, ctx: dict, progress=None) -> pd.DataFrame:
-    """Freeze Game-view predictions for ledger rows that have none."""
+def predict_missing(led: pd.DataFrame, ctx: dict, progress=None,
+                    engines: tuple = ("game", "play")) -> pd.DataFrame:
+    """Freeze predictions for ledger rows that have none — the Game view and,
+    in the same pass, the play engine (one simulated game per fixture)."""
     led = led.copy()
     led["predicted_at"] = led["predicted_at"].astype(object)
     led["model_version"] = led["model_version"].astype(object)
@@ -364,28 +429,35 @@ def predict_missing(led: pd.DataFrame, ctx: dict, progress=None) -> pd.DataFrame
     # `rematch`) on a played game stays unpredicted rather than graded in hindsight
     commence = pd.to_datetime(led["commence"], utc=True, errors="coerce")
     open_ = led["result"].isna() & (commence.isna() | (commence > pd.Timestamp.now(tz="UTC")))
-    todo = led.index[led["pred_mean"].isna() & led["player_id"].notna() & open_]
+    missing = np.zeros(len(led), bool)
+    for eng in engines:
+        missing |= led[ENGINES[eng][0]].isna().values
+    todo = led.index[missing & led["player_id"].notna() & open_]
     cache, memo = {}, {}
     for i, idx in enumerate(todo):
         row = led.loc[idx]
         if progress:
             progress(i / max(len(todo), 1), f"{row['player']} {MARKETS[row['market']][0]}")
-        key = (row["game_id"], row["market"], str(row["player_id"]))
-        if key not in cache:
-            try:
-                cache[key] = _samples(ctx, row["market"], row, memo=memo)
-            except Exception:
-                cache[key] = None
-        x = cache[key]
-        if x is None:
-            continue
-        x = np.asarray(x, float)
-        line = float(row["line"])
-        led.loc[idx, "pred_mean"] = float(x.mean())
-        led.loc[idx, "pred_median"] = float(np.median(x))
-        led.loc[idx, "p_over"] = float((x >= 1).mean()) if row["market"] == "player_anytime_td" else float((x > line).mean())
-        led.loc[idx, "predicted_at"] = pd.Timestamp.now(tz="UTC")
-        led.loc[idx, "model_version"] = version
+        for eng in engines:
+            c_mean, c_median, c_p = ENGINES[eng]
+            if pd.notna(row[c_mean]):
+                continue
+            key = (eng, row["game_id"], row["market"], str(row["player_id"]))
+            if key not in cache:
+                try:
+                    cache[key] = _SAMPLERS[eng](ctx, row["market"], row, memo=memo)
+                except Exception:
+                    cache[key] = None
+            x = cache[key]
+            if x is None:
+                continue
+            x = np.asarray(x, float)
+            line = float(row["line"])
+            led.loc[idx, c_mean] = float(x.mean())
+            led.loc[idx, c_median] = float(np.median(x))
+            led.loc[idx, c_p] = float((x >= 1).mean()) if row["market"] == "player_anytime_td" else float((x > line).mean())
+            led.loc[idx, "predicted_at"] = pd.Timestamp.now(tz="UTC")
+            led.loc[idx, "model_version"] = version
     return led
 
 
@@ -403,7 +475,7 @@ def reproject_unplayed(led: pd.DataFrame, ctx: dict, progress=None,
         open_ &= led["model_version"].astype(str) != model_version()
     if not open_.any():
         return led, 0
-    for c in ("pred_mean", "pred_median", "p_over", "predicted_at"):
+    for c in _PRED_COLS:
         led.loc[open_, c] = np.nan
     led = predict_missing(led, ctx, progress)
     return led, int(open_.sum())
@@ -450,18 +522,23 @@ def implied_prob(american) -> float:
     return 100 / (a + 100) if a > 0 else -a / (-a + 100)
 
 
-def grade(led: pd.DataFrame, use: str = "median", edge: float = 0.03) -> pd.DataFrame:
+def grade(led: pd.DataFrame, use: str = "median", edge: float = 0.03,
+          engine: str = "game") -> pd.DataFrame:
     """Per-row grading columns: the book's vig-free P(over), the model's edge,
-    the model's pick (over / under / none) and whether it hit."""
+    the model's pick (over / under / none) and whether it hit. `engine` picks
+    which frozen projection is graded; its numbers are copied to `eng_mean`,
+    `eng_median` and `eng_p` so the rest of the page needs no branching."""
     d = led.copy()
+    c_mean, c_median, c_p = ENGINES[engine]
+    d["eng_mean"], d["eng_median"], d["eng_p"] = d[c_mean], d[c_median], d[c_p]
     po, pu = d["over_price"].map(implied_prob), d["under_price"].map(implied_prob)
     tot = po + pu
     d["book_p_over"] = np.where(tot > 0, po / tot, np.nan)
-    d["edge"] = d["p_over"] - d["book_p_over"]
-    centre = d["pred_median"] if use == "median" else d["pred_mean"]
+    d["edge"] = d["eng_p"] - d["book_p_over"]
+    centre = d["eng_median"] if use == "median" else d["eng_mean"]
     d["pick"] = np.where(d["edge"] > edge, "over", np.where(d["edge"] < -edge, "under", "none"))
     d["centre_pick"] = np.where(centre > d["line"], "over", np.where(centre < d["line"], "under", "none"))
-    settled = d["result"].isin(["over", "under"]) & d["p_over"].notna()
+    settled = d["result"].isin(["over", "under"]) & d["eng_p"].notna()
     d["hit"] = np.where(settled & (d["pick"] != "none"), d["pick"] == d["result"], np.nan)
     d["centre_hit"] = np.where(settled & (d["centre_pick"] != "none"), d["centre_pick"] == d["result"], np.nan)
     d["book_hit"] = np.where(settled, np.where(d["book_p_over"] > 0.5, "over", "under") == d["result"], np.nan)
@@ -469,23 +546,48 @@ def grade(led: pd.DataFrame, use: str = "median", edge: float = 0.03) -> pd.Data
 
 
 def summary(g: pd.DataFrame) -> dict:
-    """Headline numbers over settled rows."""
-    s = g[g["result"].isin(["over", "under"]) & g["p_over"].notna()]
+    """Headline numbers over settled rows of a graded frame."""
+    s = g[g["result"].isin(["over", "under"]) & g["eng_p"].notna()]
     if s.empty:
         return dict(settled=0)
     y = (s["result"] == "over").astype(float)
     out = dict(settled=int(len(s)), lines=int(len(g)),
-               model_brier=float(((s["p_over"] - y) ** 2).mean()),
+               model_brier=float(((s["eng_p"] - y) ** 2).mean()),
                book_brier=float(((s["book_p_over"] - y) ** 2).mean()),
                centre_hit=float(s["centre_hit"].dropna().astype(float).mean()) if s["centre_hit"].notna().any() else np.nan,
                centre_n=int(s["centre_hit"].notna().sum()),
                pick_hit=float(s["hit"].dropna().astype(float).mean()) if s["hit"].notna().any() else np.nan,
                pick_n=int(s["hit"].notna().sum()),
                book_hit=float(s["book_hit"].dropna().astype(float).mean()),
-               over_rate=float(y.mean()), model_over=float((s["p_over"] > 0.5).mean()))
+               over_rate=float(y.mean()), model_over=float((s["eng_p"] > 0.5).mean()))
     yards = s[s["market"].isin(["player_rush_yds", "player_reception_yds"])]
     if not yards.empty:
-        out["mae_mean"] = float((yards["pred_mean"] - yards["actual"]).abs().mean())
-        out["mae_median"] = float((yards["pred_median"] - yards["actual"]).abs().mean())
+        out["mae_mean"] = float((yards["eng_mean"] - yards["actual"]).abs().mean())
+        out["mae_median"] = float((yards["eng_median"] - yards["actual"]).abs().mean())
         out["mae_line"] = float((yards["line"] - yards["actual"]).abs().mean())
     return out
+
+
+def compare_engines(d: pd.DataFrame, use: str = "median", edge: float = 0.03) -> pd.DataFrame:
+    """Both engines' headline numbers on the SAME settled lines — only rows
+    where both projections were frozen count, so neither engine gets the
+    easier subset. One row per engine, plus the book as the benchmark."""
+    both = d
+    for eng in ENGINES:
+        both = both[both[ENGINES[eng][2]].notna()]
+    rows = []
+    for eng in ENGINES:
+        s = summary(grade(both, use=use, edge=edge, engine=eng))
+        if not s.get("settled"):
+            continue
+        rows.append(dict(engine=ENGINE_LABELS[eng], settled=s["settled"],
+                         centre_hit=s["centre_hit"], centre_n=s["centre_n"],
+                         pick_hit=s["pick_hit"], pick_n=s["pick_n"],
+                         brier=s["model_brier"], mae_mean=s.get("mae_mean", np.nan),
+                         mae_median=s.get("mae_median", np.nan), model_over=s["model_over"]))
+    if rows:
+        s = summary(grade(both, use=use, edge=edge, engine="game"))
+        rows.append(dict(engine="Book", settled=s["settled"], centre_hit=s["book_hit"], centre_n=s["settled"],
+                         pick_hit=np.nan, pick_n=0, brier=s["book_brier"], mae_mean=s.get("mae_line", np.nan),
+                         mae_median=s.get("mae_line", np.nan), model_over=np.nan))
+    return pd.DataFrame(rows)

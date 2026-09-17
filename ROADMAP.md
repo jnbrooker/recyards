@@ -882,6 +882,28 @@ rating if the box-score yardage needs its own anchor.*
     which every page opens from cache at its default settings. A toggle skips
     the play engine; a button re-runs it. Caches live six hours.
 
+16. **Play engine in the props ledger.** *(2026-09-17.)* The 2025 replay
+    (§12) could only say the engines were level on players; the ledger can say
+    it on the lines that matter. Every ledger row now freezes a second
+    projection beside the Game view — `play_mean`, `play_median`,
+    `play_p_over` — from one play-engine simulation of the fixture (10,000
+    games, ~15 s; `props.PLAY_SIMS`) with the player read off the box score,
+    same active roster, same rule that nothing is projected after kickoff.
+    Rows recorded before this have blank play columns (the week-1 lines);
+    week 2's were frozen on 17 Sep before the Thursday game (at 5,000 sims,
+    the first setting). The page grades
+    either engine (a *Projection graded* radio drives Edge, Pick and the
+    charts), shows both engines' medians and P(over) per line, and once lines
+    settle compares them head to head on the SAME lines
+    (`props.compare_engines`: only rows with both projections count). The
+    week-2 freeze already shows the shape difference the replay found — the
+    play engine's median sits 0.78 of its mean against the Game view's 0.72,
+    it favours the over on 24% of receiving lines (Game view 16%) and 38% of
+    rushing (28%) — and the two take opposite sides of the line on 18% of
+    lines, mostly running backs' receiving yards (the play engine allocates
+    them more of the team's targets). One week is noise; the comparison table
+    is the thing to read when it has a few hundred settled lines.
+
 ## 9. Maintenance
 
 Several constants are fitted on out-of-sample residuals and rest on two
