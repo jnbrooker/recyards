@@ -284,11 +284,12 @@ if any_played:
                   help=f"From the {len(settled)} settled slots; the locked card expected {exp_settled:.1f} from them.")
         m2.metric("Expected from settled slots", f"{exp_settled:.1f}")
         m3.metric("Picks hit", f"{wins} of {len(settled) - pushes}" + (f" ({pushes} push)" if pushes else ""))
-        m4.metric("Card total expected", f"{exp_all:.1f}", help=f"All {len(graded)} slots, as locked at "
-                  f"{pd.to_datetime(locked_card['locked_at'].iloc[0]).strftime('%d %b %H:%M')} UTC.")
+        locked_when = pd.to_datetime(locked_card["locked_at"].iloc[0], errors="coerce", utc=True)
+        locked_txt = locked_when.strftime("%d %b %H:%M") if pd.notna(locked_when) else "—"
+        m4.metric("Card total expected", f"{exp_all:.1f}", help=f"All {len(graded)} slots, as locked at {locked_txt} UTC.")
         n_lock = len(locked_games) if locked_games is not None else 0
         if n_lock < len(week_games):
-            st.caption(f"Locked at {pd.to_datetime(locked_card['locked_at'].iloc[0]).strftime('%d %b %H:%M')} UTC "
+            st.caption(f"Locked at {locked_txt} UTC "
                        f"with {len(week_games) - n_lock} game{'s' if len(week_games) - n_lock != 1 else ''} already "
                        "played and left out; the card and the comparison cover the rest of the week.")
         show = pd.DataFrame({"Conf": graded["confidence"], "Slot": graded["slot"], "Pick": graded["text"],
