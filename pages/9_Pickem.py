@@ -275,7 +275,7 @@ if any_played:
     if locked_card is None or locked_card.empty:
         st.info("Nothing locked for this week: every game had been played when it was first viewed.")
     else:
-        graded = P.grade_card(locked_card, P.week_scores(week_games), locked_card["mode"].iloc[0])
+        graded = P.grade_card(locked_card, P.week_scores(week_games), mode_key)   # the pool's scoring, as set above
         settled = graded[graded["result"] != "open"]
         wins = int((settled["result"] == "win").sum()); pushes = int((settled["result"] == "push").sum())
         exp_settled = float(settled["exp_points"].sum()); exp_all = float(graded["exp_points"].sum())
@@ -319,7 +319,7 @@ if any_played:
         rows = []
         for w_, cw in allc.groupby("week"):
             cw = cw.copy(); cw["legs"] = [__import__("json").loads(l) if isinstance(l, str) and l.startswith("[") else None for l in cw["legs"]]
-            g_ = P.grade_card(cw, P.week_scores(sched[sched["week"] == int(w_)]), cw["mode"].iloc[0])
+            g_ = P.grade_card(cw, P.week_scores(sched[sched["week"] == int(w_)]), mode_key)
             rows.append(dict(Week=int(w_), Slots=len(g_), Hit=int((g_["result"] == "win").sum()),
                              Expected=float(g_["exp_points"].sum()), Realised=float(g_["points"].sum())))
         st.markdown("**Earlier weeks, locked cards**")
