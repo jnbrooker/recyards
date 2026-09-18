@@ -207,9 +207,11 @@ ou_pick = st.multiselect(
     help="The pool names these; the model then picks over or under on each. "
          "Pre-filled from the saved pool lines, else with the games where the model sees the most value.")
 ou_games = [game_opts[g] for g in ou_pick]
-if st.button("Save pool lines", help=f"Writes the pool columns, the totals games and the market "
-                                     f"as it stands now to `{P.POOL_FILE}` — so they survive a "
-                                     "restart and the opener-vs-closer log accumulates."):
+save_clicked = st.button("Save pool lines", help=f"Writes the pool columns, the totals games and the market "
+                                                  f"as it stands now to `{P.POOL_FILE}` — so they survive a "
+                                                  "restart and the opener-vs-closer log accumulates — and "
+                                                  "locks the card as it stands (if no game has kicked off).")
+if save_clicked:
     P.save_pool_lines(lines, season_of_week, int(week), ou_games)
     st.success(f"Saved {len(lines)} games for week {week}.")
 
@@ -222,6 +224,24 @@ res = P.build_card(sims, lines, mode=mode_key, juice=int(juice), teaser_pts=floa
 card = res["card"]
 for n in res["notes"]:
     st.warning(n)
+
+# --- lock the card before kickoff, so results can be read against it -----------
+week_games = sched[sched["week"] == int(week)]
+any_played = bool(week_games["played"].any())
+locked_card, locked_games = P.load_locked(season_of_week, int(week))
+played_ids = set(week_games.loc[week_games["played"], "game_id"])
+relock = st.button("Lock the card as it stands", help="Writes this card (and the model's margin and total "
+                   "for every game) to `pickem/cards.csv` so this week's results are graded against it. Games "
+                   "already played are left out. The first view of a week locks automatically; use this to "
+                   "re-lock after changing the settings, before kickoff.")
+if locked_card is None or relock or (save_clicked and not any_played):
+    # the first view of a week (or a save before kickoff, or the button): lock
+    # the card as it stands; games already played are left out, so a mid-week
+    # lock covers only what is still to come
+    P.lock_card(card, res["candidates"], season_of_week, int(week), mode_key, source, played=played_ids)
+    locked_card, locked_games = P.load_locked(season_of_week, int(week))
+    if relock:
+        st.success(f"Locked {len(locked_card)} slots for the {len(locked_games)} games still to play.")
 
 # --- the card -----------------------------------------------------------------
 st.subheader("The card")
@@ -248,6 +268,62 @@ if mode_key == "odds":
     st.caption("Odds-weighted scoring puts long shots and parlays at the top because their "
                "payout is large — that is the highest **expected** return, but it is also "
                "the highest variance. The Model P column is the chance each slot pays at all.")
+
+# --- this week's results against the locked card -----------------------------------
+if any_played:
+    st.subheader(f"Week {week} so far: results against the locked card")
+    if locked_card is None or locked_card.empty:
+        st.info("Nothing locked for this week: every game had been played when it was first viewed.")
+    else:
+        graded = P.grade_card(locked_card, P.week_scores(week_games), locked_card["mode"].iloc[0])
+        settled = graded[graded["result"] != "open"]
+        wins = int((settled["result"] == "win").sum()); pushes = int((settled["result"] == "push").sum())
+        exp_settled = float(settled["exp_points"].sum()); exp_all = float(graded["exp_points"].sum())
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Points so far", f"{graded['points'].sum():.1f}",
+                  help=f"From the {len(settled)} settled slots; the locked card expected {exp_settled:.1f} from them.")
+        m2.metric("Expected from settled slots", f"{exp_settled:.1f}")
+        m3.metric("Picks hit", f"{wins} of {len(settled) - pushes}" + (f" ({pushes} push)" if pushes else ""))
+        m4.metric("Card total expected", f"{exp_all:.1f}", help=f"All {len(graded)} slots, as locked at "
+                  f"{pd.to_datetime(locked_card['locked_at'].iloc[0]).strftime('%d %b %H:%M')} UTC.")
+        n_lock = len(locked_games) if locked_games is not None else 0
+        if n_lock < len(week_games):
+            st.caption(f"Locked at {pd.to_datetime(locked_card['locked_at'].iloc[0]).strftime('%d %b %H:%M')} UTC "
+                       f"with {len(week_games) - n_lock} game{'s' if len(week_games) - n_lock != 1 else ''} already "
+                       "played and left out; the card and the comparison cover the rest of the week.")
+        show = pd.DataFrame({"Conf": graded["confidence"], "Slot": graded["slot"], "Pick": graded["text"],
+                             "P(win)": graded["p"], "Exp. pts": graded["exp_points"],
+                             "Result": graded["result"].map({"win": "✅ win", "loss": "❌ loss", "push": "push", "open": "—"}),
+                             "Points": np.where(graded["result"] == "open", np.nan, graded["points"])})
+        st.dataframe(show.style.format({"P(win)": "{:.1%}", "Exp. pts": "{:.1f}", "Points": "{:.1f}"}, na_rep="—"),
+                     hide_index=True, width="stretch", height=min(600, 38 * len(show) + 40))
+        gr = P.game_results(locked_games, week_games) if locked_games is not None else pd.DataFrame()
+        if not gr.empty:
+            st.markdown("**The model against the scores, game by game**")
+            gt = pd.DataFrame({"Game": gr["away"] + " @ " + gr["home"], "Score": gr["score"],
+                               "Model margin": gr["model_margin"], "Line": gr["line_margin"], "Actual margin": gr["actual_margin"],
+                               "Model total": gr["model_total"], "Line total": gr["line_total"], "Actual total": gr["actual_total"],
+                               "Model on the right side": np.where(gr["model_side_right"], "✅", "❌")})
+            st.dataframe(gt.style.format({"Model margin": "{:+.1f}", "Line": "{:+.1f}", "Actual margin": "{:+.0f}",
+                                          "Model total": "{:.1f}", "Line total": "{:.1f}", "Actual total": "{:.0f}"}),
+                         hide_index=True, width="stretch")
+            n = len(gr)
+            st.caption(f"{n} game{'s' if n != 1 else ''} played. Margin error — model {gr['model_margin_err'].abs().mean():.1f}, "
+                       f"line {gr['line_margin_err'].abs().mean():.1f}; total error — model {gr['model_total_err'].abs().mean():.1f}, "
+                       f"line {gr['line_total_err'].abs().mean():.1f}. The model sat on the right side of the line in "
+                       f"{int(gr['model_side_right'].sum())} of {n}. Margins are home minus away.")
+    # the season so far, from every locked week
+    allc = P.load_locked_all()
+    allc = allc[(allc["season"] == season_of_week) & (allc["week"] < int(week))] if len(allc) else allc
+    if len(allc):
+        rows = []
+        for w_, cw in allc.groupby("week"):
+            cw = cw.copy(); cw["legs"] = [__import__("json").loads(l) if isinstance(l, str) and l.startswith("[") else None for l in cw["legs"]]
+            g_ = P.grade_card(cw, P.week_scores(sched[sched["week"] == int(w_)]), cw["mode"].iloc[0])
+            rows.append(dict(Week=int(w_), Slots=len(g_), Hit=int((g_["result"] == "win").sum()),
+                             Expected=float(g_["exp_points"].sum()), Realised=float(g_["points"].sum())))
+        st.markdown("**Earlier weeks, locked cards**")
+        st.dataframe(pd.DataFrame(rows).style.format({"Expected": "{:.1f}", "Realised": "{:.1f}"}), hide_index=True, width="stretch")
 
 # --- the reasoning, game by game --------------------------------------------------
 with st.expander("Every game: model vs line, and every candidate's probability"):

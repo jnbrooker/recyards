@@ -1088,6 +1088,20 @@ rating if the box-score yardage needs its own anchor.*
     0.02 vs 0.05). Page 8 shows K and D/ST by default; both are in the
     head-to-head pool. Next for both: the same markets in the props ledger.
 
+19. **Pick'em results against a locked card.** *(2026-09-18.)* The page
+    rebuilt the card on every view, so a played week could only be graded
+    with hindsight. Now the card and the model's margin and total for every
+    game are **locked** to `pickem/cards.csv` / `pickem/model_games.csv` the
+    first time a week is viewed (and on "Save pool lines" before kickoff, or
+    the "Lock the card" button), games already played left out; once games
+    are in, the page grades the locked card — points so far against what
+    the locked card expected from the settled slots, picks hit — and shows
+    the model against the scores game by game (model margin, line, actual;
+    the same for totals; whether the model sat on the right side of the
+    line; week MAE for model and line), plus earlier locked weeks' expected
+    vs realised. Same rule as the props ledger: nothing is judged after the
+    fact.
+
 ## 9. Maintenance
 
 Several constants are fitted on out-of-sample residuals and rest on two

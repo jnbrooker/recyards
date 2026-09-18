@@ -152,6 +152,114 @@ _POOL_COLS = ["season", "week", "game_id", "home", "away", "spread_home", "total
               "mkt_ml_away", "ou_in_pool", "saved_at"]
 
 
+# ---------------------------------------------------------------------------
+# The locked card: the picks as they stood before kickoff, graded afterwards
+# ---------------------------------------------------------------------------
+# The page rebuilds the card on every view, so grading it after the games
+# would use post-game ratings and lines. The card (and the model's margin and
+# total for every game) is written here before the first kickoff — the same
+# rule as the props ledger — and results are read against that.
+
+CARD_FILE = "pickem/cards.csv"
+GAMES_FILE = "pickem/model_games.csv"
+_CARD_COLS = ["season", "week", "slot", "kind", "game_id", "team", "text", "line_margin", "line_total",
+              "p", "p_push", "dec", "market_p", "edge", "confidence", "payout", "exp_points", "market_exp",
+              "mode", "source", "legs", "locked_at"]
+_GAME_COLS = ["season", "week", "game_id", "home", "away", "model_margin", "line_margin", "model_total",
+              "line_total", "p_home_cover", "p_home_win", "p_over", "source", "locked_at"]
+
+
+def lock_card(card: pd.DataFrame, candidates: pd.DataFrame, season: int, week: int,
+              mode: str, source: str, played: set | None = None) -> None:
+    """Replace this week's locked card and game view with the ones given.
+    Slots and games already played are left out — a lock made mid-week
+    covers the games still to come, never a pick made in hindsight."""
+    import json
+    import os
+    now = pd.Timestamp.now(tz="UTC").isoformat()
+    played = set(played or [])
+    c = card.copy()
+    if played:
+        def touches_played(r):
+            if r["kind"] == "PARLAY":
+                return any(l["game_id"] in played for l in (r.get("legs") or []))
+            return r["game_id"] in played
+        c = c[[not touches_played(r) for _, r in c.iterrows()]]
+        candidates = candidates[~candidates["game_id"].isin(played)]
+    c["legs"] = [json.dumps(l) if isinstance(l, list) else "" for l in c.get("legs", [""] * len(c))]
+    if "payout" not in c.columns:
+        c["payout"] = c["dec"]
+    c = c.assign(season=int(season), week=int(week), mode=mode, source=source, locked_at=now)
+    for col in _CARD_COLS:
+        if col not in c.columns:
+            c[col] = np.nan
+    rows = []
+    for gid, g in candidates.groupby("game_id", sort=False):
+        f = g.iloc[0]
+        def P(kind, team=None):
+            q = g[g["kind"] == kind]
+            if team is not None:
+                q = q[q["team"] == team]
+            return float(q["p"].iloc[0]) if len(q) else np.nan
+        rows.append(dict(season=int(season), week=int(week), game_id=gid, home=f["home"], away=f["away"],
+                         model_margin=f["model_margin"], line_margin=f["line_margin"],
+                         model_total=f["model_total"], line_total=f["line_total"],
+                         p_home_cover=P("ATS", f["home"]), p_home_win=P("ML", f["home"]), p_over=P("OVER"),
+                         source=source, locked_at=now))
+    gv = pd.DataFrame(rows, columns=_GAME_COLS)
+    os.makedirs(os.path.dirname(CARD_FILE), exist_ok=True)
+    for path, new, cols in ((CARD_FILE, c[_CARD_COLS], _CARD_COLS), (GAMES_FILE, gv, _GAME_COLS)):
+        old = pd.read_csv(path) if os.path.exists(path) else pd.DataFrame(columns=cols)
+        old = old[~((old["season"] == int(season)) & (old["week"] == int(week)))]
+        pd.concat([old, new], ignore_index=True).sort_values(["season", "week"]).to_csv(path, index=False)
+
+
+def load_locked(season: int, week: int) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    """This week's locked card and game view, or (None, None)."""
+    import json
+    import os
+    if not os.path.exists(CARD_FILE):
+        return None, None
+    c = pd.read_csv(CARD_FILE); c = c[(c["season"] == int(season)) & (c["week"] == int(week))]
+    if c.empty:
+        return None, None
+    c = c.copy()
+    c["legs"] = [json.loads(l) if isinstance(l, str) and l.startswith("[") else None for l in c["legs"]]
+    g = pd.read_csv(GAMES_FILE) if os.path.exists(GAMES_FILE) else pd.DataFrame(columns=_GAME_COLS)
+    g = g[(g["season"] == int(season)) & (g["week"] == int(week))]
+    return c.reset_index(drop=True), g.reset_index(drop=True)
+
+
+def load_locked_all() -> pd.DataFrame:
+    import os
+    return pd.read_csv(CARD_FILE) if os.path.exists(CARD_FILE) else pd.DataFrame(columns=_CARD_COLS)
+
+
+def week_scores(sched_week: pd.DataFrame) -> dict:
+    """game_id -> (home_score, away_score, home, away) for the played games."""
+    q = sched_week[sched_week["played"] & sched_week["home_score"].notna()]
+    return {r["game_id"]: (float(r["home_score"]), float(r["away_score"]), r["home_team"], r["away_team"])
+            for _, r in q.iterrows()}
+
+
+def game_results(games: pd.DataFrame, sched_week: pd.DataFrame) -> pd.DataFrame:
+    """The locked game view beside the actual scores: model, line and actual
+    margin and total, with each one's error, for the played games."""
+    sc = week_scores(sched_week)
+    g = games[games["game_id"].isin(sc)].copy()
+    if g.empty:
+        return g
+    g["actual_margin"] = [sc[i][0] - sc[i][1] for i in g["game_id"]]
+    g["actual_total"] = [sc[i][0] + sc[i][1] for i in g["game_id"]]
+    g["score"] = [f"{sc[i][3]} {sc[i][1]:.0f} @ {sc[i][2]} {sc[i][0]:.0f}" for i in g["game_id"]]
+    g["model_margin_err"] = g["model_margin"] - g["actual_margin"]
+    g["line_margin_err"] = g["line_margin"] - g["actual_margin"]
+    g["model_total_err"] = g["model_total"] - g["actual_total"]
+    g["line_total_err"] = g["line_total"] - g["actual_total"]
+    g["model_side_right"] = np.sign(g["model_margin"] - g["line_margin"]) == np.sign(g["actual_margin"] - g["line_margin"])
+    return g
+
+
 def load_pool_lines() -> pd.DataFrame:
     """The pool's posted lines, one row per game, as saved from the page (or
     entered by hand). Also the opener log: the market columns are the market
