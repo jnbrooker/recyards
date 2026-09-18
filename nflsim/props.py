@@ -8,12 +8,14 @@ accumulates from the first fetch — the free tier has no historical props.
 
 Honest evaluation needs two things this module enforces:
 
-  * **Predictions are frozen at fetch time.** The Game-view projection (mean,
-    median, P(over) at the line) is computed when the line is recorded and
-    never recomputed, so later injury news cannot leak into a "prediction".
-    The play-level engine's projection of the same line (`play_*`, one
-    simulated game per fixture, every player read off the box score) is
-    frozen beside it, so the two engines are judged on identical lines.
+  * **Predictions are frozen at fetch time.** Three projections of every line
+    (mean, median, P(over)) are computed when the line is recorded and never
+    recomputed, so later injury news cannot leak into a "prediction": the
+    drive engine's (`drive_*`) and the play engine's (`play_*`), each one
+    simulated game per fixture with every player read off the box score —
+    the thing the pages ship — and the single-stat Game view (`pred_*`, the
+    player pages' own path). The engines are judged on identical lines;
+    `ui.DEFAULT_ENGINE` says which one the page grades by default.
   * **The book is the benchmark.** Each line comes with its over/under prices;
     the implied (vig-free) probability is what the model's P(over) is scored
     against, and a side is only "the model's pick" when it disagrees with the
@@ -75,19 +77,22 @@ LEDGER_COLS = [
     "bookmaker", "market", "player", "player_id", "team", "line",
     "over_price", "under_price", "fetched_at",
     "pred_mean", "pred_median", "p_over", "predicted_at", "model_version",
+    "drive_mean", "drive_median", "drive_p_over",
     "play_mean", "play_median", "play_p_over",
     "actual", "result",
 ]
 
 # engine -> its frozen (mean, median, P(over)) columns
 ENGINES = {
-    "game": ("pred_mean", "pred_median", "p_over"),
+    "drive": ("drive_mean", "drive_median", "drive_p_over"),
     "play": ("play_mean", "play_median", "play_p_over"),
+    "game": ("pred_mean", "pred_median", "p_over"),
 }
-ENGINE_LABELS = {"game": "Game view", "play": "Play engine"}
-# the play engine runs ~700 sims a second; 10,000 a game is ~15 s (a 16-game
-# week in ~4 minutes) and puts the Monte-Carlo error on P(over) at 0.5%
-PLAY_SIMS = 10000
+ENGINE_LABELS = {"drive": "Drive engine", "play": "Play engine", "game": "Game view"}
+# sims per fixture when freezing: the play engine runs ~700 games a second, so
+# 10,000 is ~15 s (a 16-game week in ~4 minutes) and puts the Monte-Carlo
+# error on P(over) at 0.5%; the drive engine is quick enough for 20,000
+ENGINE_SIMS = {"drive": 20000, "play": 10000}
 
 
 def model_version() -> str:
@@ -185,6 +190,7 @@ def save_ledger(d: pd.DataFrame) -> None:
 
 _KEY = ["season", "week", "game_id", "bookmaker", "market", "player"]
 _PRED_COLS = ("pred_mean", "pred_median", "p_over", "predicted_at",
+              "drive_mean", "drive_median", "drive_p_over",
               "play_mean", "play_median", "play_p_over")
 
 
@@ -352,32 +358,32 @@ def _samples(ctx: dict, market: str, row: pd.Series, n_sims: int = 20000,
     return None
 
 
-def _play_box(ctx: dict, row: pd.Series, memo: dict) -> dict | None:
-    """The play engine's box arrays for one fixture, simulated once per
-    prediction pass (memoised on game_id): {team: box} for both sides."""
+def _engine_box(ctx: dict, row: pd.Series, memo: dict, engine: str) -> dict:
+    """One engine's box arrays for one fixture, simulated once per prediction
+    pass (memoised on game_id): {team: box} for both sides."""
     from . import game as G, roster as RO
-    key = ("play_box", row["game_id"])
+    key = (engine, "box", row["game_id"])
     if key not in memo:
         home, away = row["home"], row["away"]
         for team in (home, away):
             if ("roster", team) not in memo:
                 memo[("roster", team)] = RO.roster_for(ctx, team, True)
-        # the engine takes the active roster only, in the same order it will
-        # index the box arrays
+        # the engines take the active roster only, in the order they index
+        # the box arrays
         ra = memo[("roster", home)]; ra = ra[ra["active"]].reset_index(drop=True)
         rb = memo[("roster", away)]; rb = rb[rb["active"]].reset_index(drop=True)
-        sim = G.run_game(ctx, ra, rb, home, away, n_sims=PLAY_SIMS, seed=7, home="a",
-                         avail=ctx.get("avail"), engine="play")
+        sim = G.run_game(ctx, ra, rb, home, away, n_sims=ENGINE_SIMS[engine], seed=7, home="a",
+                         avail=ctx.get("avail"), engine=engine)
         memo[key] = {home: sim["box_a"], away: sim["box_b"]}
     return memo[key]
 
 
-def _play_samples(ctx: dict, market: str, row: pd.Series, memo: dict):
-    """Simulated samples for one ledger row from the play-level engine: the
-    player's column of his team's box score across every simulated game.
-    Weather is left out, as it is for the Game-view samples, so the two
-    engines see identical inputs."""
-    box = _play_box(ctx, row, memo).get(row["team"])
+def _box_samples(ctx: dict, market: str, row: pd.Series, memo: dict, engine: str):
+    """Simulated samples for one ledger row from a game engine: the player's
+    column of his team's box score across every simulated game. Weather is
+    left out, as it is for the Game-view samples, so every projection sees
+    identical inputs."""
+    box = _engine_box(ctx, row, memo, engine).get(row["team"])
     if box is None:
         return None                     # matched to a roster outside this game
     r = box["roster"].reset_index(drop=True)
@@ -396,7 +402,11 @@ def _play_samples(ctx: dict, market: str, row: pd.Series, memo: dict):
     return None
 
 
-_SAMPLERS = {"game": _samples, "play": _play_samples}
+_SAMPLERS = {
+    "game": _samples,
+    "drive": lambda ctx, market, row, memo: _box_samples(ctx, market, row, memo, "drive"),
+    "play": lambda ctx, market, row, memo: _box_samples(ctx, market, row, memo, "play"),
+}
 
 
 def rematch(led: pd.DataFrame, rosters: pd.DataFrame) -> tuple[pd.DataFrame, int]:
@@ -418,9 +428,9 @@ def rematch(led: pd.DataFrame, rosters: pd.DataFrame) -> tuple[pd.DataFrame, int
 
 
 def predict_missing(led: pd.DataFrame, ctx: dict, progress=None,
-                    engines: tuple = ("game", "play")) -> pd.DataFrame:
-    """Freeze predictions for ledger rows that have none — the Game view and,
-    in the same pass, the play engine (one simulated game per fixture)."""
+                    engines: tuple = tuple(ENGINES)) -> pd.DataFrame:
+    """Freeze predictions for ledger rows that have none — both game engines
+    (one simulated game per fixture each) and the Game view, in one pass."""
     led = led.copy()
     led["predicted_at"] = led["predicted_at"].astype(object)
     led["model_version"] = led["model_version"].astype(object)
@@ -523,7 +533,7 @@ def implied_prob(american) -> float:
 
 
 def grade(led: pd.DataFrame, use: str = "median", edge: float = 0.03,
-          engine: str = "game") -> pd.DataFrame:
+          engine: str = "drive") -> pd.DataFrame:
     """Per-row grading columns: the book's vig-free P(over), the model's edge,
     the model's pick (over / under / none) and whether it hit. `engine` picks
     which frozen projection is graded; its numbers are copied to `eng_mean`,
@@ -568,15 +578,16 @@ def summary(g: pd.DataFrame) -> dict:
     return out
 
 
-def compare_engines(d: pd.DataFrame, use: str = "median", edge: float = 0.03) -> pd.DataFrame:
-    """Both engines' headline numbers on the SAME settled lines — only rows
-    where both projections were frozen count, so neither engine gets the
-    easier subset. One row per engine, plus the book as the benchmark."""
+def compare_engines(d: pd.DataFrame, use: str = "median", edge: float = 0.03,
+                    engines: tuple = ("drive", "play")) -> pd.DataFrame:
+    """The engines' headline numbers on the SAME settled lines — only rows
+    where every compared projection was frozen count, so none gets the easier
+    subset. One row per engine, plus the book as the benchmark."""
     both = d
-    for eng in ENGINES:
+    for eng in engines:
         both = both[both[ENGINES[eng][2]].notna()]
     rows = []
-    for eng in ENGINES:
+    for eng in engines:
         s = summary(grade(both, use=use, edge=edge, engine=eng))
         if not s.get("settled"):
             continue
@@ -586,8 +597,56 @@ def compare_engines(d: pd.DataFrame, use: str = "median", edge: float = 0.03) ->
                          brier=s["model_brier"], mae_mean=s.get("mae_mean", np.nan),
                          mae_median=s.get("mae_median", np.nan), model_over=s["model_over"]))
     if rows:
-        s = summary(grade(both, use=use, edge=edge, engine="game"))
+        s = summary(grade(both, use=use, edge=edge, engine="drive"))
         rows.append(dict(engine="Book", settled=s["settled"], centre_hit=s["book_hit"], centre_n=s["settled"],
                          pick_hit=np.nan, pick_n=0, brier=s["book_brier"], mae_mean=s.get("mae_line", np.nan),
                          mae_median=s.get("mae_line", np.nan), model_over=np.nan))
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Promotion: when does the play engine become the default?
+# ---------------------------------------------------------------------------
+
+PROMOTION_MIN_LINES = 600          # settled lines with both engines frozen (three to four weeks)
+PROMOTION_CAL_BAND = (0.47, 0.53)  # share of actuals above the median, each yardage market
+PROMOTION_TIER_SLACK = 0.02        # play may trail drive by this much in any line tier
+
+
+def promotion_gate(d: pd.DataFrame, use: str = "median", edge: float = 0.03) -> pd.DataFrame:
+    """The rule written down before the weeks came in (ROADMAP §16): the play
+    engine replaces the drive engine as the default when, on the same settled
+    lines, it is at least as good on Brier and MAE, its median is calibrated
+    on both yardage markets, and it is not worse in any line tier. One row per
+    criterion with the numbers and whether it is met."""
+    both = d[d["drive_p_over"].notna() & d["play_p_over"].notna() & d["result"].isin(["over", "under"])]
+    rows = []
+    n = len(both)
+    rows.append(dict(criterion=f"settled lines with both engines frozen (≥ {PROMOTION_MIN_LINES})",
+                     drive=np.nan, play=float(n), met=n >= PROMOTION_MIN_LINES))
+    if n == 0:
+        return pd.DataFrame(rows)
+    gd, gp = grade(both, use, edge, "drive"), grade(both, use, edge, "play")
+    sd, sp = summary(gd), summary(gp)
+    rows.append(dict(criterion="Brier of P(over) (play ≤ drive)", drive=sd["model_brier"], play=sp["model_brier"],
+                     met=sp["model_brier"] <= sd["model_brier"]))
+    if "mae_median" in sd and "mae_median" in sp:
+        rows.append(dict(criterion="MAE of the median, yards (play ≤ drive)", drive=sd["mae_median"], play=sp["mae_median"],
+                         met=sp["mae_median"] <= sd["mae_median"]))
+    lo, hi = PROMOTION_CAL_BAND
+    for m, lab in (("player_reception_yds", "receiving"), ("player_rush_yds", "rushing")):
+        q = both[both["market"] == m]
+        if len(q) >= 50:
+            cd = float((q["actual"] > q["drive_median"]).mean()); cp = float((q["actual"] > q["play_median"]).mean())
+            rows.append(dict(criterion=f"actual above the median, {lab} ({lo:.2f}–{hi:.2f})", drive=cd, play=cp, met=lo <= cp <= hi))
+    y = both[both["market"].isin(["player_reception_yds", "player_rush_yds"])].copy()
+    if len(y) >= 100:
+        y["tier"] = pd.cut(y["line"], [0, 30, 60, 500], labels=["under 30", "30–60", "60+"])
+        for t, q in y.groupby("tier", observed=True):
+            if len(q) < 30:
+                continue
+            hd = float(gd.loc[q.index, "centre_hit"].dropna().astype(float).mean())
+            hp = float(gp.loc[q.index, "centre_hit"].dropna().astype(float).mean())
+            rows.append(dict(criterion=f"{use} vs line hit rate, lines {t} (play ≥ drive − {PROMOTION_TIER_SLACK:.0%})",
+                             drive=hd, play=hp, met=hp >= hd - PROMOTION_TIER_SLACK))
     return pd.DataFrame(rows)

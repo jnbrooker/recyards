@@ -26,7 +26,7 @@ numbers below are what the harness says, not what the fit said.
 | Fantasy Projections | the whole slate scored per simulation (PPR / half / standard), floor and ceiling |
 | Pick'em | a 20-slot confidence card graded from the simulated margins and totals |
 | Backtest | every model scored week by week out of sample, vs the closing line and a trailing average |
-| Prop Evaluation | this week's player-prop lines (The Odds API, on request) beside the model's frozen projections from both engines, settled automatically, graded against the book and against each other |
+| Prop Evaluation | this week's player-prop lines (The Odds API, on request) beside three frozen projections (drive engine, play engine, Game view), settled automatically, graded against the book and against each other, with the play engine's promotion gate |
 
 Pages 1–5 pick players from the **live depth chart** with injury tags; a
 player's usage share blends his own history with his slot's prior (depth-chart

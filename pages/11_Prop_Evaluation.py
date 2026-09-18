@@ -1,6 +1,7 @@
-"""Prop Evaluation — this week's player-prop lines beside the model's frozen
-Game-view projection and the play engine's projection of the same line,
-settled automatically once the games are played, and graded against the book.
+"""Prop Evaluation — this week's player-prop lines beside three frozen
+projections of each (the drive engine, the play engine, the single-stat Game
+view), settled automatically once the games are played, graded against the
+book — and the engines against each other on the same lines.
 
 Lines come from The Odds API only when you press Fetch (never on page load):
 games kicking off within the next 7 days, two markets by default, skipping
@@ -126,7 +127,7 @@ led = P.fill_actuals(led, wk_all)
 _open = led["result"].isna() & led["player_id"].notna() & \
         (pd.to_datetime(led["commence"], utc=True, errors="coerce") > pd.Timestamp.now(tz="UTC"))
 _todo = _open & ((led["model_version"].astype(str) != P.model_version()) |
-                 led["pred_mean"].isna() | led["play_mean"].isna())
+                 led["pred_mean"].isna() | led["drive_mean"].isna() | led["play_mean"].isna())
 if _todo.any():
     UI.cached_play_engine(season)       # builds the tables once per process, with its own spinner
     bar = st.progress(0.0, text="Checking predictions against the current model…")
@@ -135,23 +136,23 @@ if _todo.any():
     if n_stale:
         st.info(f"The model changed since {n_stale} unplayed lines were projected — they have been "
                 f"re-projected with version `{P.model_version()}`. Started and settled lines are untouched.")
-    if (_open & led["play_mean"].isna()).any():
-        bar.progress(0.0, text="Play-engine projections for lines that have none (one simulated game per fixture)…")
+    if (_open & (led["play_mean"].isna() | led["drive_mean"].isna() | led["pred_mean"].isna())).any():
+        bar.progress(0.0, text="Projections for lines that have none (one simulated game per fixture and engine)…")
         led = P.predict_missing(led, ctx, progress=lambda f, t: bar.progress(min(f, 1.0), text=t))
-    elif (_open & led["pred_mean"].isna()).any():
-        led = P.predict_missing(led, ctx)
     bar.empty()
 P.save_ledger(led)
 
 st.sidebar.divider()
 st.sidebar.subheader("Evaluate")
-engine = st.sidebar.radio("Projection graded", list(P.ENGINES), horizontal=True,
-                          format_func=lambda e: P.ENGINE_LABELS[e],
-                          help="**Game view**: the single-stat models with this game's script "
-                               "factors — what the player pages show.  \n**Play engine**: every "
-                               "snap simulated and the player read off the box score, so his "
-                               "volume comes from the clock and the score. Both are frozen when a "
-                               "line is recorded; the comparison below scores them on the same lines.")
+engine = st.sidebar.radio("Projection graded", list(P.ENGINES), index=list(P.ENGINES).index(UI.DEFAULT_ENGINE),
+                          horizontal=True, format_func=lambda e: P.ENGINE_LABELS[e],
+                          help="**Drive engine**: the game simulated one possession at a time, the "
+                               "player read off the box score — the app's default.  \n**Play engine**: "
+                               "every snap simulated, so his volume comes from the clock and the "
+                               "score.  \n**Game view**: the single-stat models with this game's "
+                               "script factors — what the player pages show. All three are frozen "
+                               "when a line is recorded; the comparison below scores the engines on "
+                               "the same lines.")
 use = st.sidebar.radio("Compare the line with the model's", ["median", "mean"], horizontal=True,
                        help="Median is the fair over/under point of a right-skewed yardage "
                             "distribution; the mean is what a book's line usually tracks.")
@@ -174,6 +175,7 @@ else:
     agg = d.groupby(keys, dropna=False).agg(
         line=("line", "median"), over_price=("over_price", "median"), under_price=("under_price", "median"),
         pred_mean=("pred_mean", "median"), pred_median=("pred_median", "median"), p_over=("p_over", "median"),
+        drive_mean=("drive_mean", "median"), drive_median=("drive_median", "median"), drive_p_over=("drive_p_over", "median"),
         play_mean=("play_mean", "median"), play_median=("play_median", "median"), play_p_over=("play_p_over", "median"),
         actual=("actual", "first"), result=("result", "first"), commence=("commence", "first"),
         model_version=("model_version", "first"), bookmaker=("bookmaker", "nunique")).reset_index()
@@ -204,10 +206,12 @@ else:
     st.caption("Nothing settled yet — actuals fill in automatically once the games are in the "
                "weekly feed (nflverse publishes within hours of the final whistle).")
 
-# the two engines head to head, on lines where both projections were frozen
-cmp_ = P.compare_engines(d, use=use, edge=edge)
+# the engines head to head, on lines where every projection was frozen
+cmp_ = P.compare_engines(d, use=use, edge=edge, engines=tuple(P.ENGINES))
+if cmp_.empty:
+    cmp_ = P.compare_engines(d, use=use, edge=edge, engines=("drive", "play"))
 if not cmp_.empty:
-    with st.expander("Game view vs play engine, on the same settled lines", expanded=True):
+    with st.expander("Drive engine vs play engine (vs Game view), on the same settled lines", expanded=True):
         st.dataframe(cmp_.rename(columns={"engine": "Projection", "settled": "Settled",
                                           "centre_hit": f"{use.title()} vs line hit", "centre_n": "n",
                                           "pick_hit": f"Picks ≥{edge:.0%} hit", "pick_n": "n picks",
@@ -217,14 +221,22 @@ if not cmp_.empty:
                                     "Brier": "{:.3f}", "MAE mean": "{:.1f}", "MAE median": "{:.1f}",
                                     "Favours over": "{:.0%}"}, na_rep="—"),
                      hide_index=True, width="stretch")
-        st.caption("Only lines with both projections frozen before kickoff count, so neither engine "
-                   "gets an easier subset. The book row uses the line itself (MAE) and its favoured "
-                   "side (hit rate). The play engine joined the ledger in week 2; on the 2025 replay "
-                   "(roadmap §12) the two were a dead heat on yards, the play engine fixing the drive "
-                   "engine's low medians for 40–60-yard receivers.")
+        st.caption("Only lines with every compared projection frozen before kickoff count, so no "
+                   "engine gets an easier subset. The book row uses the line itself (MAE) and its "
+                   "favoured side (hit rate). Both engines' box-score projections are on every line from "
+                   "week 2 on (bar the Thursday game); before that the app's shipped projection "
+                   "is the Game view).")
+        gate = P.promotion_gate(d, use=use, edge=edge)
+        st.markdown(f"**Promotion gate** — the play engine becomes the default (`ui.DEFAULT_ENGINE`, "
+                    f"now *{P.ENGINE_LABELS[UI.DEFAULT_ENGINE]}*) when every line below is met:")
+        st.dataframe(gate.assign(met=np.where(gate["met"], "✅", "—"))
+                         .rename(columns={"criterion": "Criterion", "drive": "Drive", "play": "Play", "met": "Met"})
+                         .style.format({"Drive": "{:.3f}", "Play": "{:.3f}"}, na_rep="—"),
+                     hide_index=True, width="stretch")
 else:
-    st.caption("The play engine's projections are frozen beside the Game view from week 2 on; once "
-               "those lines settle, the two engines are compared here on the same lines.")
+    st.caption("Both engines' projections are frozen beside the Game view from week 3 on; once "
+               "those lines settle, the engines are compared here on the same lines and the "
+               "promotion gate is scored.")
 
 # where the model's centre sits against the book's number, by model version —
 # this is the thing to watch as new weeks come in
@@ -257,28 +269,29 @@ show = g.copy()
 show["Game"] = show["away"] + " @ " + show["home"]
 show["Market"] = show["market"].map(lambda m: P.MARKETS[m][0])
 show["Edge"] = show["edge"]
-cols = ["week", "Game", "player", "team", "Market", "line", "pred_median", "pred_mean", "p_over",
-        "play_median", "play_mean", "play_p_over",
+cols = ["week", "Game", "player", "team", "Market", "line", "drive_median", "drive_p_over",
+        "play_median", "play_p_over", "pred_median", "p_over",
         "book_p_over", "Edge", "pick", "actual", "result", "hit"]
 if book != "all (median line)":
     cols.insert(6, "over_price"); cols.insert(7, "under_price")
 else:
     show["books"] = show["bookmaker"]; cols.append("books")
 view = show[cols].rename(columns={"week": "Wk", "player": "Player", "team": "Team", "line": "Line",
-                                  "pred_median": "Game median", "pred_mean": "Game mean", "p_over": "Game P(over)",
-                                  "play_median": "Play median", "play_mean": "Play mean", "play_p_over": "Play P(over)",
+                                  "drive_median": "Drive median", "drive_p_over": "Drive P(over)",
+                                  "play_median": "Play median", "play_p_over": "Play P(over)",
+                                  "pred_median": "Game median", "p_over": "Game P(over)",
                                   "book_p_over": "Book P(over)", "pick": "Pick",
                                   "actual": "Actual", "result": "Result", "hit": "Hit",
                                   "over_price": "Over", "under_price": "Under", "books": "Books"})
 view = view.sort_values(["Wk", "Game", "Market", "Edge"], ascending=[True, True, True, False])
-fmt = {"Line": "{:.1f}", "Game median": "{:.1f}", "Game mean": "{:.1f}", "Game P(over)": "{:.0%}",
-       "Play median": "{:.1f}", "Play mean": "{:.1f}", "Play P(over)": "{:.0%}",
+fmt = {"Line": "{:.1f}", "Drive median": "{:.1f}", "Drive P(over)": "{:.0%}",
+       "Play median": "{:.1f}", "Play P(over)": "{:.0%}", "Game median": "{:.1f}", "Game P(over)": "{:.0%}",
        "Book P(over)": "{:.0%}", "Edge": "{:+.0%}", "Actual": "{:.0f}"}
 st.dataframe(view.style.format(fmt, na_rep="—"), width="stretch", hide_index=True, height=560)
 st.caption("The model columns were frozen when the line was recorded (see `predicted_at` in the "
-           "ledger) — nothing is re-projected after the fact. *Game* is the Game-view projection, "
-           "*Play* the play engine's (week 2 on; blank where the line was recorded before the play "
-           f"engine joined the ledger). *Edge* and *Pick* are the {P.ENGINE_LABELS[engine]}'s: the side "
+           "ledger) — nothing is re-projected after the fact. *Drive* and *Play* are the two game "
+           "engines' box-score projections, *Game* the single-stat Game view (blank where the line "
+           f"was recorded before that projection joined the ledger). *Edge* and *Pick* are the {P.ENGINE_LABELS[engine]}'s: the side "
            "it backs when its P(over) beats the book's vig-free probability by the edge; *Hit* "
            "whether it came in. Void = the player did not play.")
 

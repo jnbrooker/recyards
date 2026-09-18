@@ -91,8 +91,9 @@ except ValueError as e:
     st.error(str(e)); st.stop()
 
 engine = UI.engine_picker("p7")
-sim = UI.cached_game(tuple(seasons), recency, home, away, int(n_sims), bool(neutral),
-                     bool(use_inj), float(wind), str(_roof), engine)
+sim = UI.run_with_progress(f"Simulating {away} @ {home} {n_sims:,} times on the {'play' if engine == 'play' else 'drive'} engine",
+                           UI.cached_game, tuple(seasons), recency, home, away, int(n_sims), bool(neutral),
+                           bool(use_inj), float(wind), str(_roof), engine)
 s = G.summarize(sim)
 
 fav, dog = (home, away) if s["mean_margin"] >= 0 else (away, home)

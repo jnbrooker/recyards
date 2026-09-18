@@ -557,6 +557,21 @@ def _stint_appearance_rate(h: pd.DataFrame, totals: pd.DataFrame) -> float:
 # Team- and league-level convenience
 # ---------------------------------------------------------------------------
 
+def sim_shares(roster: pd.DataFrame, col: str) -> np.ndarray:
+    """The share to SIMULATE a game with: the conditional ("if he plays")
+    share for every active player, since a simulated game is always one he is
+    in — the unconditional share counts games he missed as zero and is the
+    right quantity for filling the roster's slots, not for his box score.
+    Falls back to the unconditional share where the conditional is missing."""
+    base = roster[col].values.astype(float)
+    ccol = f"{col}_cond"
+    if ccol not in roster.columns:
+        return base
+    cond = roster[ccol].values.astype(float)
+    act = roster["active"].values if "active" in roster.columns else np.ones(len(roster), bool)
+    return np.where(act & np.isfinite(cond) & (cond > 0), cond, base)
+
+
 def roster_for(live: dict, team: str, use_injuries: bool = True,
                week: int | None = None) -> pd.DataFrame:
     """One team's roster from its most recent depth chart.

@@ -82,7 +82,7 @@ def spread_to_moneyline(spread_home: float) -> tuple[float, float]:
 # ---------------------------------------------------------------------------
 
 def simulate_slate(ctx: dict, games: pd.DataFrame, n_sims: int = 10000,
-                   use_injuries: bool = True, seed: int = 23, engine: str = "drive") -> dict:
+                   use_injuries: bool = True, seed: int = 23, engine: str = "drive", progress=None) -> dict:
     """game_id -> dict(home, away, pts_home, pts_away, label) for every game."""
     ratings = ctx["ratings"]
     out, rosters = {}, {}
@@ -92,14 +92,18 @@ def simulate_slate(ctx: dict, games: pd.DataFrame, n_sims: int = 10000,
             rosters[team] = G.roster_for(ctx, team, use_injuries=use_injuries)
         return rosters[team]
 
+    n_games = max(len(games), 1)
     for i, g in games.reset_index(drop=True).iterrows():
         home, away = g["home_team"], g["away_team"]
         if home not in ratings["off"].index or away not in ratings["off"].index:
             continue
+        sub = (lambda f, t, i=i: progress((i + f) / n_games, f"{away} @ {home}")) if progress else None
+        if progress:
+            progress(i / n_games, f"{away} @ {home}")
         try:
             sim = G.run_game(ctx, roster(home), roster(away), home, away, n_sims=n_sims,
                              seed=seed + i, home="a", avail=ctx.get("avail"),
-                             wind=g.get("wind"), roof=g.get("roof"), engine=engine)
+                             wind=g.get("wind"), roof=g.get("roof"), engine=engine, progress=sub)
         except ValueError:
             continue
         out[g["game_id"]] = dict(

@@ -22,14 +22,21 @@ are honest (a 10-drive game and a 13-drive game consume the same clock), which
 is what player volume should hang off. And any state can be priced, which is
 what live and alternate markets need.
 
-Stage 1 (this file, first cut): the empirical tables, with a report that checks
-them against league facts. Stage 2: the simulation loop. Stage 3: team
-adjustment and the harness. Stage 4: players on top.
+Stage 1: the empirical tables, with a report that checks them against league
+facts. Stage 2: the simulation loop. Stage 3: team adjustment and the harness.
+Stage 4: players on top. Decisions are a dense physical table (down, distance,
+field position) plus additive clock-and-score logit shifts (`ShiftTable`),
+recency-weighted and shrunk toward their parents; outcomes are empirical rows
+keyed on the play, hurry-up mode, down, distance and field position, shifted
+by the matchup, the team's day and the within-team effect of the score.
 
-Simplifications, stated: timeouts are not tracked as a resource (their effect
-is inside the empirical clock use in the last two minutes); penalties are
-sampled as outcomes of the play they replaced; overtime is a single period,
-first score wins, ties allowed.
+Simplifications, stated: penalties are sampled as outcomes of the play they
+replaced (no separate pass-interference event); overtime is one ten-minute
+period under the current rule (both teams possess, then sudden death; ties
+allowed). Timeouts ARE tracked (three a half, two in overtime), called at the
+data's rate by situation, and the victory formation is a rule.
+
+Gate: `python -m nflsim.playengine --gate` after touching this file.
 """
 
 from __future__ import annotations
@@ -47,7 +54,18 @@ CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
 
 TABLE_SEASONS = tuple(range(2016, 2026))     # decisions, outcomes, clock
 KICKOFF_SEASONS = (2025,)                    # the current kickoff rules only
-MIN_CELL = 40                                # plays a cell needs before we trust it
+MIN_CELL = 40                                # plays a cell needs before we trust it (outcome pools)
+SHRINK_K = 25                                # decision cells: weight n / (n + K) on the cell, rest on its parent
+DECISION_DECAY = 0.80                        # per season, on play-calling tables (decisions drift; physics does not)
+STATE_SHIFT_K = 200                          # plays behind a full-weight state shift on outcomes
+CLOCK_DECAY = 0.70                           # per season, thinning the clock pools (pace drifts: 63.5 snaps a team-game in 2016, 61.5 in 2023-25)
+# game-level variance: play-level noise alone under-disperses games. Each side
+# gets a yards-per-play shift for the day (a team factor, independent per
+# side) plus a factor common to both (tempo, weather, officiating — it moves
+# the total, not the margin). Both sds are solved in `sensitivity` so the
+# neutral engine's margin and total sds land on the harness's residuals.
+TARGET_MARGIN_SD = 12.8                      # backtest.MARGIN_SD: residual around the ratings' expected margin
+TARGET_TOTAL_SD = 13.4                       # the normal the shape gate uses for totals
 CALL_CODE = {"pass": 0, "run": 1, "kneel": 2, "spike": 3}   # integer keys for the samplers
 
 COLS = ["game_id", "play_id", "season", "week", "season_type", "posteam", "defteam",
@@ -59,7 +77,7 @@ COLS = ["game_id", "play_id", "season", "week", "season_type", "posteam", "defte
         "kick_distance", "penalty", "penalty_yards", "penalty_team", "first_down",
         "out_of_bounds", "timeout", "two_point_attempt", "two_point_conv_result",
         "extra_point_result", "touchback", "qb_kneel", "qb_spike", "aborted_play",
-        "punt_blocked", "epa", "pass", "rush"]
+        "punt_blocked", "epa", "pass", "rush", "timeout_team", "defteam_timeouts_remaining"]
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +90,9 @@ def _season_file(year: int) -> pd.DataFrame:
     f = CACHE_DIR / f"pbp_engine_{year}.parquet"
     current = int(year) >= _dt.date.today().year - (1 if _dt.date.today().month < 3 else 0)
     if f.exists() and not current:
-        return pd.read_parquet(f)
+        cached = pd.read_parquet(f)
+        if set(COLS) <= set(cached.columns):
+            return cached                 # a file from before a column was added is refetched
     d = pd.read_parquet(BASE.format(year=year), columns=COLS)
     d = d[d["season_type"] == "REG"].reset_index(drop=True)
     if not current:                       # a finished season is written once
@@ -111,6 +131,28 @@ def load_plays(seasons: tuple[int, ...] = TABLE_SEASONS) -> pd.DataFrame:
     d.loc[real, "next_half"] = nxt["game_half"]
     d.loc[real, "next_yl"] = nxt["yardline_100"]
     d.loc[real, "next_pos"] = nxt["posteam"]
+    # a timeout is its own row, not reliably in play order; charge it to the
+    # real play of the same half whose clock window contains it (the latest
+    # play snapped with more time on the clock), by which side called it
+    d["to_after_off"] = 0; d["to_after_def"] = 0
+    is_to = (d["timeout"] == 1) & d["timeout_team"].notna() & ~real & d["half_seconds_remaining"].notna()
+    rp = d[real][["game_id", "game_half", "half_seconds_remaining", "posteam"]].dropna()
+    rp = rp.reset_index().rename(columns={"index": "row"})
+    to = d[is_to][["game_id", "game_half", "half_seconds_remaining", "timeout_team"]].reset_index(drop=True)
+    by_half = {k: v.sort_values("half_seconds_remaining") for k, v in rp.groupby(["game_id", "game_half"])}
+    for (g, h), q in to.groupby(["game_id", "game_half"]):
+        cand = by_half.get((g, h))
+        if cand is None:
+            continue
+        secs = cand["half_seconds_remaining"].to_numpy()
+        pos_ = np.searchsorted(secs, q["half_seconds_remaining"].to_numpy(), side="right")   # first play with more time
+        ok = pos_ < len(secs)
+        rows = cand["row"].to_numpy()[pos_[ok]]
+        off = q["timeout_team"].to_numpy()[ok] == cand["posteam"].to_numpy()[pos_[ok]]
+        d.loc[rows[off], "to_after_off"] = 1
+        d.loc[rows[~off], "to_after_def"] = 1
+    d["defteam_timeouts_remaining"] = pd.to_numeric(d["defteam_timeouts_remaining"], errors="coerce")
+    d["posteam_timeouts_remaining"] = pd.to_numeric(d["posteam_timeouts_remaining"], errors="coerce")
     return d
 
 
@@ -124,7 +166,12 @@ def ytg_bin(y):
 
 
 def yl_bin(yl):
-    return np.clip((np.asarray(yl, float) - 1) // 10, 0, 9).astype(int)        # 0 = inside the 10
+    """Field position in 10-yard bins from the opponent's goal line (0 = inside
+    the 10), with the own 1-5 split off (10): a loss from the own 8 is a
+    routine play, the same loss from the own 2 is a safety, and teams snap
+    differently there."""
+    yl = np.asarray(yl, float)
+    return np.where(yl >= 96, 10, np.clip((yl - 1) // 10, 0, 9)).astype(int)
 
 
 def sd_bin(sd):
@@ -137,6 +184,24 @@ def sd_bin(sd):
                      [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], 12)
 
 
+def need_bin(sd):
+    """What the offence needs, for fourth-down decisions: 0 down 1-3 (a kick
+    ties or wins) · 1 tied · 2 down 4-8 (one touchdown) · 3 down 9-16 (two
+    scores) · 4 down 17+ · 5 up 1-3 · 6 up 4-8 · 7 up 9+. Coarser than the
+    exact score bins so the late cells have data."""
+    sd = np.asarray(sd, float)
+    return np.select([sd <= -17, sd <= -9, sd <= -4, sd < 0, sd == 0, sd <= 3, sd <= 8], [4, 3, 2, 0, 1, 5, 6], 7)
+
+
+def zone_bin(yl):
+    """Coarse field position for the fourth-down state shifts: 0 inside the
+    opponent's 40 (kick range), 1 the opponent's 41-60 (long kick or go),
+    2 own territory. Late and trailing, the choice is 'kick if in range,
+    otherwise go', an interaction a uniform shift cannot express."""
+    yl = np.asarray(yl, float)
+    return np.where(yl <= 40, 0, np.where(yl <= 60, 1, 2))
+
+
 def lead_class(sd):
     """-1 trailing by 9+, 0 within 8, +1 leading by 9+. Pace only changes once
     a game is out of one-score range: a trailing team snaps every ~28 s in the
@@ -146,12 +211,16 @@ def lead_class(sd):
 
 
 def time_bin(half, secs):
-    """0 H1 normal · 1 H1 last 2:00 · 2 H2 >10:00 · 3 H2 5-10 · 4 H2 2-5 · 5 H2 last 2:00 · 6 OT"""
+    """0 H1 normal · 1 H1 last 2:00 · 2 H2 >10:00 · 3 H2 5-10 · 4 H2 2-5 · 5 H2 0:30-2:00 ·
+    6 H2 last 0:30 (the kick-or-play decision as time expires) · 7 OT.
+    The last two minutes of overtime are the last two minutes of a tied game
+    — drive for the winning kick, hurry-up, timeouts — so they share bins 5-6."""
     half = np.asarray(half); secs = np.asarray(secs, float)
     h2 = (half == "Half2") | (half == 2)
     ot = (half == "Overtime") | (half == 3)
-    return np.select([ot, ~h2 & (secs > 120), ~h2, h2 & (secs > 600), h2 & (secs > 300), h2 & (secs > 120)],
-                     [6, 0, 1, 2, 3, 4], 5)
+    late = (h2 | ot) & (secs <= 120)
+    return np.select([late & (secs > 30), late, ot, ~h2 & (secs > 120), ~h2, h2 & (secs > 600), h2 & (secs > 300)],
+                     [5, 6, 7, 0, 1, 2, 3], 4)
 
 
 # ---------------------------------------------------------------------------
@@ -159,31 +228,38 @@ def time_bin(half, secs):
 # ---------------------------------------------------------------------------
 
 class Table:
-    """A conditional distribution over categories keyed by a state tuple,
-    with hierarchical fallback: if a cell is thin, drop the last key."""
+    """A conditional distribution over categories keyed by a state tuple, fitted
+    hierarchically: each cell is shrunk toward its parent (the same key with
+    the last element dropped) with weight n / (n + SHRINK_K), so a thin cell
+    keeps as much of its own evidence as it has instead of being discarded at
+    a threshold. Fitted with per-row weights (season recency)."""
 
-    def __init__(self, keys: list[str], cats: list[str]):
-        self.keys, self.cats = keys, cats
+    def __init__(self, keys: list[str], cats: list[str], k: float = SHRINK_K):
+        self.keys, self.cats, self.k = keys, cats, float(k)
         self.cells: dict[tuple, np.ndarray] = {}
 
-    def fit(self, df: pd.DataFrame, cat_col: str):
+    def fit(self, df: pd.DataFrame, cat_col: str, w=None):
         df = df[df[cat_col].isin(self.cats)]
-        c = pd.Categorical(df[cat_col], categories=self.cats)
-        codes = c.codes
-        for depth in range(len(self.keys), 0, -1):
+        codes = pd.Categorical(df[cat_col], categories=self.cats).codes
+        ok = codes >= 0
+        w = np.ones(len(df)) if w is None else np.asarray(w, float)
+        w, codes = w[ok], codes[ok]
+        base = pd.DataFrame({k: df[k].to_numpy()[ok] for k in self.keys})
+        n_cat = len(self.cats)
+        # the unconditional distribution is the root
+        self.cells[()] = np.bincount(codes, weights=w, minlength=n_cat) / max(w.sum(), 1e-9)
+        for depth in range(1, len(self.keys) + 1):
             ks = self.keys[:depth]
-            g = pd.DataFrame({k: df[k].to_numpy() for k in ks}).assign(_c=codes)
-            g = g[g["_c"] >= 0]
-            cnt = g.groupby(ks + ["_c"]).size().unstack("_c", fill_value=0)
-            cnt = cnt.reindex(columns=range(len(self.cats)), fill_value=0)
-            for key, row in cnt.iterrows():
+            g = base[ks].assign(_c=codes, _w=w)
+            cnt = g.groupby(ks + ["_c"])["_w"].agg(["sum", "size"]).unstack("_c", fill_value=0)
+            wsum = cnt["sum"].reindex(columns=range(n_cat), fill_value=0.0)
+            nraw = cnt["size"].reindex(columns=range(n_cat), fill_value=0).sum(axis=1)
+            for key, row in wsum.iterrows():
                 key = key if isinstance(key, tuple) else (key,)
-                n = row.sum()
-                if n >= MIN_CELL and key not in self.cells:
-                    self.cells[key] = (row.to_numpy(float) / n)
-        # the unconditional distribution is the last resort
-        n = (codes >= 0).sum()
-        self.cells[()] = np.bincount(codes[codes >= 0], minlength=len(self.cats)) / max(n, 1)
+                n = int(nraw.loc[key if len(key) > 1 else key[0]])
+                own = row.to_numpy(float) / max(row.sum(), 1e-9)
+                lam = n / (n + self.k)
+                self.cells[key] = lam * own + (1 - lam) * self.probs(key[:-1])
         return self
 
     def probs(self, key: tuple) -> np.ndarray:
@@ -192,6 +268,76 @@ class Table:
             if k in self.cells:
                 return self.cells[k]
         return self.cells[()]
+
+
+class ShiftTable:
+    """Additive logit effects of a SITUATION (clock, score) on a binary
+    decision whose base rate comes from a dense physical table (down, distance,
+    field position). Fitted as logit(observed) - logit(expected) per situation
+    cell from every play in that situation, shrunk n / (n + k) toward zero,
+    with the hierarchical fallback of `Table`. This is what keeps a trailing
+    team going for it on fourth down late: the (down, distance, field, clock,
+    score) cross-cells are thin, the clock-and-score effect is not."""
+
+    def __init__(self, keys: list[str], k: float = SHRINK_K):
+        self.keys, self.k = keys, float(k)
+        self.cells: dict[tuple, float] = {(): 0.0}
+
+    def fit(self, df: pd.DataFrame, y, expected, w=None):
+        y = np.asarray(y, float); e = np.clip(np.asarray(expected, float), 1e-4, 1 - 1e-4)
+        w = np.ones(len(y)) if w is None else np.asarray(w, float)
+        base = pd.DataFrame({k: df[k].to_numpy() for k in self.keys}).assign(_y=y * w, _e=e * w, _w=w, _n=1)
+        for depth in range(1, len(self.keys) + 1):
+            ks = self.keys[:depth]
+            g = base.groupby(ks)[["_y", "_e", "_w", "_n"]].sum()
+            for key, row in g.iterrows():
+                key = key if isinstance(key, tuple) else (key,)
+                if row["_n"] < 5:
+                    continue
+                obs = np.clip(row["_y"] / row["_w"], 1e-4, 1 - 1e-4); exp = np.clip(row["_e"] / row["_w"], 1e-4, 1 - 1e-4)
+                d = np.log(obs / (1 - obs)) - np.log(exp / (1 - exp))
+                lam = row["_n"] / (row["_n"] + self.k)
+                self.cells[key] = float(lam * d + (1 - lam) * self.shift(key[:-1]))
+        return self
+
+    def shift(self, key: tuple) -> float:
+        for depth in range(len(key), -1, -1):
+            k = tuple(key[:depth])
+            if k in self.cells:
+                return self.cells[k]
+        return 0.0
+
+    def shifts(self, keys: np.ndarray) -> np.ndarray:
+        if len(keys) == 0:
+            return np.zeros(0)
+        uniq, inv = np.unique(keys, axis=0, return_inverse=True)
+        return np.array([self.shift(tuple(int(x) for x in k)) for k in uniq])[inv.ravel()]
+
+
+class MeanShiftTable:
+    """A shrunk mean residual by situation — the WITHIN-TEAM effect of the
+    score and clock on a play's yards (a trailing team's runs gain more, its
+    late passes less), measured after removing each team-season's own mean so
+    the engine's strength shifts are not double-counted."""
+
+    def __init__(self, keys: list[str], k: float = STATE_SHIFT_K):
+        self.keys, self.k = keys, float(k)
+        self.cells: dict[tuple, float] = {(): 0.0}
+
+    def fit(self, df: pd.DataFrame, values):
+        v = np.asarray(values, float)
+        base = pd.DataFrame({k: df[k].to_numpy() for k in self.keys}).assign(_v=v, _n=1)
+        for depth in range(1, len(self.keys) + 1):
+            ks = self.keys[:depth]
+            g = base.groupby(ks)[["_v", "_n"]].sum()
+            for key, row in g.iterrows():
+                key = key if isinstance(key, tuple) else (key,)
+                lam = row["_n"] / (row["_n"] + self.k)
+                self.cells[key] = float(lam * row["_v"] / row["_n"] + (1 - lam) * self.shift(key[:-1]))
+        return self
+
+    shift = ShiftTable.shift
+    shifts = ShiftTable.shifts
 
 
 class Sampler:
@@ -245,16 +391,33 @@ def build_tables(plays: pd.DataFrame) -> dict:
                 "qb_kneel": "kneel", "qb_spike": "spike"}.get(pt)
     scrim["call"] = [call(r) for _, r in scrim[["play_type", "pass", "rush"]].iterrows()]
     scrim = scrim[scrim["call"].notna()]
-    early = scrim[scrim["down_i"] <= 3]
-    fourth = scrim[scrim["down_i"] == 4]
-    tables = dict(
-        # field goals (and the rare quick punt) happen on early downs when the
-        # clock is about to run out; the cells make them vanish otherwise
-        call_early=Table(["down_i", "ytg_b", "yl_b", "t_b", "sd_b"],
-                         ["pass", "run", "kneel", "spike", "punt", "fg"]).fit(early, "call"),
-        call_fourth=Table(["ytg_b", "yl_b", "t_b", "sd_b"],
-                          ["pass", "run", "punt", "fg"]).fit(fourth[fourth["call"] != "kneel"], "call"),
-    )
+    # decisions drift (pass rate 0.60 -> 0.57, fourth-down go rate 0.13 -> 0.23
+    # over 2016-25), so the play-calling tables weight recent seasons
+    latest = int(scrim["season"].max())
+    scrim["w_dec"] = DECISION_DECAY ** (latest - scrim["season"].astype(int))
+    early = scrim[scrim["down_i"] <= 3].copy()
+    fourth = scrim[(scrim["down_i"] == 4) & (scrim["call"] != "kneel")].copy()
+    tables = {}
+    # downs 1-3: the rare calls (kneel, spike, a kick with the clock running
+    # out) are driven by the clock and the score, so those keys come first
+    early["sp"] = np.where(early["call"].isin(["pass", "run"]), "none", early["call"])
+    tables["special_early"] = Table(["t_b", "sd_b", "down_i", "yl_b"],
+                                    ["none", "kneel", "spike", "punt", "fg"]).fit(early, "sp", early["w_dec"])
+    # pass vs run: a dense physical table plus additive clock-and-score shifts
+    pr = early[early["sp"] == "none"]
+    tables["pass_base"] = Table(["down_i", "ytg_b", "yl_b"], ["pass", "run"]).fit(pr, "call", pr["w_dec"])
+    exp_pass = _table_rows(tables["pass_base"], pr[["down_i", "ytg_b", "yl_b"]].to_numpy(int))[:, 0]
+    tables["pass_shift"] = ShiftTable(["t_b", "sd_b", "down_i"]).fit(pr, pr["call"] == "pass", exp_pass, pr["w_dec"])
+    # fourth down: go / punt / kick from distance and field position, with the
+    # clock-and-score effect on going for it (and on kicking rather than punting)
+    fourth["zone"] = zone_bin(fourth["yardline_100"].fillna(50))
+    fourth["need"] = need_bin(fourth["score_differential"].fillna(0))
+    tables["fourth_base"] = Table(["ytg_b", "yl_b"], ["pass", "run", "punt", "fg"]).fit(fourth, "call", fourth["w_dec"])
+    P4 = _table_rows(tables["fourth_base"], fourth[["ytg_b", "yl_b"]].to_numpy(int))
+    go = fourth["call"].isin(["pass", "run"])
+    tables["go_shift"] = ShiftTable(["t_b", "need", "zone"]).fit(fourth, go, P4[:, 0] + P4[:, 1], fourth["w_dec"])
+    ng = fourth[~go]; Pn = P4[~go.to_numpy()]
+    tables["fg_shift"] = ShiftTable(["t_b", "need", "zone"]).fit(ng, ng["call"] == "fg", Pn[:, 3] / np.maximum(Pn[:, 2] + Pn[:, 3], 1e-9), ng["w_dec"])
 
     # --- outcomes of pass and run plays (incl. penalties on them) -----------
     out = scrim[scrim["call"].isin(["pass", "run"])].copy()
@@ -271,17 +434,34 @@ def build_tables(plays: pd.DataFrame) -> dict:
     out["to_int"] = out["interception"]
     out["to_fum"] = out["fumble_lost"]
     out["ret_td"] = ((out["touchdown"] == 1) & (out["td_team"] == out["defteam"])).astype(int)
+    # the clock key must mean the same thing here as in the clock table below
+    # (incomplete, out of bounds, a penalty no-play): a turnover's seconds are
+    # in the running-clock pool with its own short dt, not the stopped one
     out["clock_stop"] = ((out["incomplete_pass"] == 1) | (out["out_of_bounds"] == 1)
-                         | (out["to_int"] == 1) | (out["to_fum"] == 1) | (out["is_pen"] == 1)).astype(int)
+                         | (out["is_pen"] == 1)).astype(int)
     out["auto_fd"] = ((out["is_pen"] == 1) & (out["first_down"] == 1)).astype(int)
     # field position after a turnover (the return is inside it); NaN if none
     out["to_yl"] = np.where((out["to_int"] == 1) | (out["to_fum"] == 1), out["next_yl"], np.nan)
     out["call"] = out["call"].map(CALL_CODE)
+    # the last two minutes of a half are a different game — deep shots and
+    # sideline throws (fewer completions, more clock stops, more chunk gains)
+    # — so outcomes carry a hurry-up flag, ahead of field position in the
+    # fallback order
+    out["hurry"] = out["t_b"].isin([1, 5, 6]).astype(int)
     out = out.reset_index(drop=True)
-    tables["outcomes"] = out[["call", "down_i", "ytg_b", "yl_b", "gain", "rel", "is_pen", "to_int", "to_fum",
+    # the score's within-team effect on a play's yards in normal time: residual
+    # from the team-season mean (by call), by call x lead class x part of game
+    # (overtime plays gain +0.4 a pass within the same teams). Late plays take
+    # their shape from the hurry-up pool instead.
+    real_play = (out["is_pen"] == 0) & (out["sack"] == 0) & (out["hurry"] == 0)
+    q = out[real_play].copy()
+    q["lead"] = lead_class(q["score_differential"].fillna(0))
+    q["res"] = q["gain"] - q.groupby([q["posteam"], q["season"], q["call"]])["gain"].transform("mean")
+    tables["state_shift"] = MeanShiftTable(["call", "lead", "t_b"]).fit(q, q["res"])
+    tables["outcomes"] = out[["call", "hurry", "down_i", "ytg_b", "yl_b", "gain", "rel", "is_pen", "to_int", "to_fum",
                               "ret_td", "clock_stop", "auto_fd", "safety", "sack", "complete_pass",
                               "to_yl", "epa"]].copy()
-    tables["outcome_sampler"] = Sampler(["call", "down_i", "ytg_b", "yl_b"]).fit(tables["outcomes"])
+    tables["outcome_sampler"] = Sampler(["call", "hurry", "down_i", "ytg_b", "yl_b"]).fit(tables["outcomes"])
 
     # --- clock: seconds to the next play, by kind of play and part of game --
     ck = scrim[scrim["call"].isin(["pass", "run", "kneel", "spike"])].copy()
@@ -291,9 +471,21 @@ def build_tables(plays: pd.DataFrame) -> dict:
                   | (ck["play_type"] == "no_play") | (ck["qb_spike"] == 1)).astype(int)
     ck["lead"] = lead_class(ck["score_differential"].fillna(0))
     ck["call"] = ck["call"].map(CALL_CODE)
+    ck["to_after"] = ((ck["to_after_off"] == 1) | (ck["to_after_def"] == 1)).astype(int)
+    # who calls a timeout after a play, by situation, among teams that have one
+    to_rows = ck[ck["call"].isin([0, 1, 2])]
+    has_off = to_rows[to_rows["posteam_timeouts_remaining"].fillna(0) > 0].assign(y=lambda q: np.where(q["to_after_off"] == 1, "yes", "no"))
+    has_def = to_rows[to_rows["defteam_timeouts_remaining"].fillna(0) > 0].assign(y=lambda q: np.where(q["to_after_def"] == 1, "yes", "no"))
+    tables["timeout_off"] = Table(["t_b", "lead", "stop"], ["no", "yes"]).fit(has_off, "y")
+    tables["timeout_def"] = Table(["t_b", "lead", "stop"], ["no", "yes"]).fit(has_def, "y")
+    # pace drifts (61.5 snaps a team-game in 2023-25 against 63.5 in 2016), so
+    # the pools are thinned toward recent seasons: a row survives with
+    # probability CLOCK_DECAY ** (seasons ago), a stochastic recency weight
+    keep_p = CLOCK_DECAY ** (latest - ck["season"].astype(int))
+    ck = ck[np.random.default_rng(0).random(len(ck)) < keep_p]
     ck = ck.reset_index(drop=True)
-    tables["clock"] = ck[["call", "stop", "t_b", "lead", "dt"]].copy()
-    tables["clock_sampler"] = Sampler(["call", "stop", "t_b", "lead"]).fit(tables["clock"])
+    tables["clock"] = ck[["call", "stop", "to_after", "t_b", "lead", "dt"]].copy()
+    tables["clock_sampler"] = Sampler(["call", "stop", "to_after", "t_b", "lead"]).fit(tables["clock"])
 
     # --- kicking ----------------------------------------------------------
     fg = d[(d["play_type"] == "field_goal") & d["field_goal_result"].notna()].copy()
@@ -362,9 +554,62 @@ PH_KICK, PH_PLAY, PH_TRY, PH_OVER = 0, 1, 2, 3
 
 STAT_COLS = ["plays", "pass_att", "comp", "pass_yds", "rush_att", "rush_yds", "sacks", "sack_yds",
              "ints", "fum_lost", "pass_td", "rush_td", "fg_made", "fg_att", "punts", "drives",
-             "first_downs", "def_td", "penalties"]
+             "first_downs", "def_td", "penalties",
+             # state-conditioned counters for the box gate: snaps, pass calls and
+             # drive starts while trailing 9+ / within 8 / leading 9+, snaps by down
+             "snaps_trail", "snaps_even", "snaps_lead", "pass_trail", "pass_even", "pass_lead",
+             "drives_trail", "drives_even", "drives_lead", "down1", "down2", "down3", "down4", "downs_to",
+             # the last two minutes of the second half (the end-game gate)
+             "late_snaps", "late_pass", "late_fga", "late_punts", "late_to", "late_yds", "late_secs",
+             "late_kneels", "late_spikes", "late_pen", "late_pass_yds", "late_sacks", "late_comp", "timeouts_used", "ot_snaps", "ot_punts", "ot_fga", "ot_secs", "ot_yds", "ot_fd",
+             "xp_att", "xp_made", "two_att", "two_made", "safeties"] + [f"snaps_tb{k}" for k in range(8)] + ["secs_tb0", "stops_tb0", "pen_tb0", "kick_secs"]
+LEAD_NAMES = {-1: "trail", 0: "even", 1: "lead"}
 # pass_att excludes sacks (a sack is a dropback, not an attempt); pass_yds is
 # GROSS (sack yardage in sack_yds), so it equals the sum of the receivers' yards
+
+
+def _table_rows(table: Table, keys: np.ndarray) -> np.ndarray:
+    """Category probabilities for every row of `keys` (n, n_cats)."""
+    if len(keys) == 0:
+        return np.zeros((0, len(table.cats)))
+    uniq, inv = np.unique(keys, axis=0, return_inverse=True)
+    return np.array([table.probs(tuple(int(x) for x in k)) for k in uniq])[inv.ravel()]
+
+
+def _sigmoid(z):
+    return 1 / (1 + np.exp(-z))
+
+
+def _logit(p):
+    p = np.clip(p, 1e-4, 1 - 1e-4)
+    return np.log(p / (1 - p))
+
+
+def expected_pass_rate(tables: dict, down, ytg_b, yl_b, t_b, sd_b, proe=0.0) -> np.ndarray:
+    """P(pass | a pass or run is called) on downs 1-3 for each row of state."""
+    down, ytg_b, yl_b, t_b, sd_b = (np.asarray(x, int) for x in (down, ytg_b, yl_b, t_b, sd_b))
+    base = _table_rows(tables["pass_base"], np.c_[down, ytg_b, yl_b])[:, 0]
+    return _sigmoid(_logit(base) + tables["pass_shift"].shifts(np.c_[t_b, sd_b, down]) + proe)
+
+
+def fourth_down_probs(tables: dict, ytg_b, yl_b, t_b, sd, yl, proe=0.0) -> np.ndarray:
+    """(n, 4) probabilities of pass / run / punt / field goal on fourth down,
+    from the distance, field position, clock and the raw score differential."""
+    ytg_b, yl_b, t_b = (np.asarray(x, int) for x in (ytg_b, yl_b, t_b))
+    P = _table_rows(tables["fourth_base"], np.c_[ytg_b, yl_b])
+    st = np.c_[t_b, need_bin(sd), zone_bin(yl)]
+    go = _sigmoid(_logit(P[:, 0] + P[:, 1]) + tables["go_shift"].shifts(st))
+    p_fg = _sigmoid(_logit(P[:, 3] / np.maximum(P[:, 2] + P[:, 3], 1e-9)) + tables["fg_shift"].shifts(st))
+    p_pass = _sigmoid(_logit(P[:, 0] / np.maximum(P[:, 0] + P[:, 1], 1e-9)) + proe)
+    return np.c_[go * p_pass, go * (1 - p_pass), (1 - go) * (1 - p_fg), (1 - go) * p_fg]
+
+
+def _draw_probs(rng, probs: np.ndarray) -> np.ndarray:
+    """One category per row from a (n, k) probability array."""
+    if len(probs) == 0:
+        return np.zeros(0, int)
+    cum = np.cumsum(probs, axis=1)
+    return np.minimum((cum < rng.random(len(probs))[:, None]).sum(axis=1), probs.shape[1] - 1)
 
 
 def _draw_table(rng, table: Table, keys: np.ndarray) -> np.ndarray:
@@ -440,15 +685,22 @@ class _Arrays:
 
 def simulate(tables: dict, n: int = 10000, seed: int | None = None,
              shift: dict | None = None, home_receives_first: float = 0.5,
-             tendency: dict | None = None) -> dict:
+             tendency: dict | None = None, game_shift: tuple | None = None,
+             progress=None) -> dict:
     """Play `n` games. `shift` (stage 3) is a per-team yards-per-play shift:
     {'pass': (home, away), 'run': (home, away)} applied to non-penalty gains,
-    with the defence's allowance folded in by the caller. Returns team scores
-    and per-team box-score counts, one entry per simulation."""
+    with the defence's allowance folded in by the caller. `game_shift` is
+    (sd_team, sd_common): each simulated game draws its own per-side shift on
+    top (see TARGET_MARGIN_SD); None takes the sds the tables were calibrated
+    with. `progress(fraction, text)` is called as games finish. Returns team
+    scores and per-team box-score counts, one entry per simulation."""
     rng = np.random.default_rng(seed)
     A = _Arrays(tables)
     shift = shift or {"pass": (0.0, 0.0), "run": (0.0, 0.0)}
     sh = {c: np.array(v, float) for c, v in shift.items()}
+    if game_shift is None:
+        game_shift = tables.get("game_shift", (0.0, 0.0))
+    gs = rng.normal(0, game_shift[0], (n, 2)) + rng.normal(0, game_shift[1], (n, 1))
     # team tendencies: a logit shift on the pass call (pass rate over expectation)
     # and a multiplier on the clock a play consumes (tempo), per side
     tendency = tendency or {}
@@ -465,12 +717,21 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
     kick_team = 1 - first_receiver
     stats = {c: np.zeros((n, 2), int) for c in STAT_COLS}
     drive_open = np.zeros(n, bool)
+    # overtime (regular season, current rules): ten minutes, both teams get a
+    # possession, then sudden death; a defensive score ends it at once
+    ot_poss = np.zeros((n, 2), int)
+    timeouts = np.full((n, 2), 3, int)             # per half; two each in overtime
+    margin_2min = np.full(n, np.nan)               # home margin at the two-minute warning of H2 (gate)
+    margin_half = np.full(n, np.nan); margin_5min = np.full(n, np.nan)
 
     def opp(t):
         return 1 - t
 
     def start_drive(m):
-        stats["drives"][m, pos[m]] += 1
+        # a drive is counted at its first pass or run (a kneel-out or a
+        # kickoff with the clock expiring is not a drive), which is what the
+        # gate's reference counts from the play feed
+        drive_open[m] = True
 
     def half_over(m):
         """The clock has run out for games `m`. Masks are taken BEFORE any
@@ -480,12 +741,12 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
         ot = m & (half == 3)
         tied = h2 & (score[:, 0] == score[:, 1])
         # first half -> second half, kicked off by the team that received first
-        half[h1] = 2; secs[h1] = HALF_SECS
+        half[h1] = 2; secs[h1] = HALF_SECS; timeouts[h1] = 3
         kick_team[h1] = first_receiver[h1]
         phase[h1] = PH_KICK
         # regulation over: decided, or into a single overtime period
         phase[h2 & ~tied] = PH_OVER
-        half[tied] = 3; secs[tied] = OT_SECS
+        half[tied] = 3; secs[tied] = OT_SECS; timeouts[tied] = 2
         kick_team[tied] = (rng.random(n) < 0.5).astype(int)[tied]
         phase[tied] = PH_KICK
         # overtime clock out: a tie
@@ -498,6 +759,8 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
         live = phase != PH_OVER
         if not live.any():
             break
+        if progress and _ % 20 == 0:
+            progress(float(1 - live.mean()), f"{int((~live).sum()):,} of {n:,} games finished")
 
         # ---- kickoff ---------------------------------------------------
         k = live & (phase == PH_KICK)
@@ -526,7 +789,6 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
         t = live & (phase == PH_TRY)
         if t.any():
             idx = np.where(t)[0]
-            ot_end = half[idx] == 3                   # a touchdown ends overtime
             sd = score[idx, pos[idx]] - score[idx, opp(pos[idx])]
             keys = np.c_[sd_bin(sd), time_bin(half[idx], secs[idx])]
             two = _draw_table(rng, tables["try_call"], keys) == 1
@@ -534,7 +796,12 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
             made2 = two & (rng.random(len(idx)) < tables["two_pt_rate"])
             score[idx[made1], pos[idx[made1]]] += 1
             score[idx[made2], pos[idx[made2]]] += 2
+            stats["xp_att"][idx[~two], pos[idx[~two]]] += 1; stats["xp_made"][idx[made1], pos[idx[made1]]] += 1
+            stats["two_att"][idx[two], pos[idx[two]]] += 1; stats["two_made"][idx[made2], pos[idx[made2]]] += 1
             kick_team[idx] = pos[idx]                 # the scoring team kicks off
+            # overtime: over once both have possessed and the scores differ
+            both = (ot_poss[idx, 0] > 0) & (ot_poss[idx, 1] > 0)
+            ot_end = (half[idx] == 3) & both & (score[idx, 0] != score[idx, 1])
             phase[idx] = np.where(ot_end, PH_OVER, PH_KICK)
             # the half can end on a touchdown with no time left
             ended = t & (secs <= 0) & (phase == PH_KICK)
@@ -549,19 +816,37 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
         me, them = pos[idx], opp(pos[idx])
         sd = score[idx, me] - score[idx, them]
         tb = time_bin(half[idx], secs[idx])
+
         yb, gb, sb = yl_bin(yl[idx]), ytg_bin(ytg[idx]), sd_bin(sd)
 
         call = np.zeros(len(idx), int)                 # 0 pass 1 run 2 kneel 3 spike 4 punt 5 fg
         early = down[idx] <= 3
         if early.any():
-            keys = np.c_[down[idx][early], gb[early], yb[early], tb[early], sb[early]]
-            ce = _draw_table_shift(rng, tables["call_early"], keys, proe[me[early]])
+            de, ge, ye, te, se = down[idx][early], gb[early], yb[early], tb[early], sb[early]
+            sp = _draw_table(rng, tables["special_early"], np.c_[te, se, de, ye])   # 0 none 1 kneel 2 spike 3 punt 4 fg
+            # second half and overtime: the victory formation is a rule, not a
+            # draw — a leading team kneels out when the clock it can burn (a
+            # full play clock per kneel, three seconds when the opponent has a
+            # timeout left) covers the time remaining; otherwise it must play
+            ie = idx[early]; h2 = half[ie] >= 2
+            kneels_left = np.maximum(5 - de, 1)
+            saved = np.minimum(timeouts[ie, opp(pos[ie])], kneels_left)
+            burnable = 40 * (kneels_left - saved) + 3 * saved
+            can_kneel = h2 & (sd[early] > 0) & (secs[ie] <= burnable + 5)
+            sp = np.where(h2 & (sp == 1) & ~can_kneel, 0, sp)
+            sp = np.where(can_kneel & (sp == 0), 1, sp)
+            ce = np.where(sp == 0, 0, sp + 1)
+            none = sp == 0
+            if none.any():
+                p_pass = expected_pass_rate(tables, de[none], ge[none], ye[none], te[none], se[none],
+                                            proe[me[early][none]])
+                ce[none] = (rng.random(int(none.sum())) >= p_pass).astype(int)       # 0 pass 1 run
             ce = np.where((ce == 5) & (yl[idx][early] + 17 > 66), 0, ce)
             call[early] = ce
         fourth = ~early
         if fourth.any():
-            keys = np.c_[gb[fourth], yb[fourth], tb[fourth], sb[fourth]]
-            c4 = _draw_table_shift(rng, tables["call_fourth"], keys, proe[me[fourth]])   # 0 pass 1 run 2 punt 3 fg
+            c4 = _draw_probs(rng, fourth_down_probs(tables, gb[fourth], yb[fourth], tb[fourth], sd[fourth],
+                                                     yl[idx][fourth], proe[me[fourth]]))   # 0 pass 1 run 2 punt 3 fg
             c4 = np.where(c4 == 2, 4, np.where(c4 == 3, 5, c4))
             # no field goals from beyond 65 yards
             c4 = np.where((c4 == 5) & (yl[idx][fourth] + 17 > 66), 4, c4)
@@ -572,14 +857,15 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
         flip = np.zeros(len(idx), bool); flip_yl = np.zeros(len(idx))
         td = np.zeros(len(idx), bool); dtd = np.zeros(len(idx), bool); saf = np.zeros(len(idx), bool)
         fg_made = np.zeros(len(idx), bool); stop = np.zeros(len(idx), int)
-        dt = np.zeros(len(idx))
+        dt = np.zeros(len(idx)); late_mask = np.zeros(len(idx), bool)
 
         # pass / run --------------------------------------------------
         pr = call <= 1
         if pr.any():
             j = np.where(pr)[0]
             cname = call[j]                                  # 0 pass, 1 run (CALL_CODE)
-            keys = np.c_[cname, np.minimum(down[idx][j], 4), gb[j], yb[j]].astype(int)
+            hurry = np.isin(tb[j], (1, 5, 6)).astype(int)
+            keys = np.c_[cname, hurry, np.minimum(down[idx][j], 4), gb[j], yb[j]].astype(int)
             rows = _draw_rows(rng, tables["outcome_sampler"], keys)
             gain = A.gain[rows].copy()
             pen = A.is_pen[rows] == 1
@@ -590,15 +876,52 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
             # matchup shift on real plays only. Gains are whole yards, so a
             # fractional shift is applied as its floor plus one extra yard with
             # probability equal to the fraction (rounding it would erase it).
+            lead_j = lead_class(sd[j])
             for cn, code in (("pass", 0), ("run", 1)):
-                mm = (call[j] == code) & ~pen
-                sv = sh[cn][me[j][mm]]
+                mm = (call[j] == code) & ~pen & (A.sack[rows] == 0)
+                # matchup shift, the team's day, and (in normal time) the
+                # score's within-team effect on this kind of play
+                sv = (sh[cn][me[j][mm]] + gs[idx[j][mm], me[j][mm]]
+                      + np.where(hurry[mm] == 1, 0.0,
+                                 tables["state_shift"].shifts(np.c_[np.full(int(mm.sum()), code), lead_j[mm], tb[j][mm]])))
                 base_s = np.floor(sv)
                 gain[mm] += base_s + (rng.random(int(mm.sum())) < (sv - base_s))
             gain = np.round(gain)
             is_pass = call[j] == 0
             is_sack = (A.sack[rows] == 1) & ~pen
             att = is_pass & ~pen & ~is_sack
+            # state counters, real snaps only (a penalty no-play is not a snap
+            # in the box score; the feed's pass/run plays are the reference)
+            lead_now = lead_class(sd[j])
+            nd = drive_open[idx[j]] & ~pen
+            if nd.any():
+                stats["drives"][idx[j][nd], me[j][nd]] += 1
+                for lc, name in LEAD_NAMES.items():
+                    mm = nd & (lead_now == lc)
+                    stats[f"drives_{name}"][idx[j][mm], me[j][mm]] += 1
+                drive_open[idx[j][nd]] = False
+            for lc, name in LEAD_NAMES.items():
+                mm = (lead_now == lc) & ~pen
+                stats[f"snaps_{name}"][idx[j][mm], me[j][mm]] += 1
+                stats[f"pass_{name}"][idx[j][mm & is_pass], me[j][mm & is_pass]] += 1
+            for dn in (1, 2, 3, 4):
+                mm = (down[idx][j] == dn) & ~pen
+                stats[f"down{dn}"][idx[j][mm], me[j][mm]] += 1
+            late = (tb[j] >= 5) & (tb[j] <= 6) & ~pen
+            oth = (half[idx][j] == 3) & ~pen
+            for k in range(8):
+                mk = (tb[j] == k) & ~pen
+                stats[f"snaps_tb{k}"][idx[j][mk], me[j][mk]] += 1
+            lpen = (tb[j] >= 5) & (tb[j] <= 6) & pen
+            stats["late_pen"][idx[j][lpen], me[j][lpen]] += 1
+            stats["pen_tb0"][idx[j][(tb[j] == 0) & pen], me[j][(tb[j] == 0) & pen]] += 1
+            stats["late_snaps"][idx[j][late], me[j][late]] += 1
+            stats["late_pass"][idx[j][late & is_pass], me[j][late & is_pass]] += 1
+            stats["late_yds"][idx[j][late], me[j][late]] += gain[late].astype(int)
+            la = late & att
+            stats["late_pass_yds"][idx[j][la], me[j][la]] += gain[la].astype(int)
+            stats["late_sacks"][idx[j][late & is_sack], me[j][late & is_sack]] += 1
+            stats["late_comp"][idx[j][la], me[j][la]] += (A.comp[rows][la] == 1)
             stats["pass_att"][idx[j][att], me[j][att]] += 1
             stats["rush_att"][idx[j][~is_pass & ~pen], me[j][~is_pass & ~pen]] += 1
             stats["comp"][idx[j], me[j]] += (A.comp[rows] == 1) & ~pen
@@ -610,6 +933,7 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
             stop[j] = A.stop[rows]
             to = ((A.to_int[rows] == 1) | (A.to_fum[rows] == 1)) & ~pen
             stats["ints"][idx[j], me[j]] += (A.to_int[rows] == 1) & ~pen
+            stats["late_to"][idx[j][late & to], me[j][late & to]] += 1
             stats["fum_lost"][idx[j], me[j]] += (A.to_fum[rows] == 1) & ~pen
             rtd = to & (A.ret_td[rows] == 1)
             sfy = (A.safety[rows] == 1) & ~pen & ~to
@@ -643,6 +967,7 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
             new_yl[j[adv]] = ny[adv]
             first = adv & (gain >= ytg[idx][j])
             stats["first_downs"][idx[j][first], me[j][first]] += 1
+            stats["ot_fd"][idx[j][first & oth], me[j][first & oth]] += 1
             new_down[j[first]] = 1; new_ytg[j[first]] = np.minimum(10, ny[first])
             nofirst = adv & ~first
             new_down[j[nofirst]] = down[idx][j][nofirst] + 1
@@ -650,22 +975,53 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
             # turnover on downs
             tod = nofirst & (new_down[j] > 4)
             flip[j[tod]] = True; flip_yl[j[tod]] = np.clip(100 - ny[tod], 1, 99)
-            # clock
-            lead = lead_class(sd[j])
-            ck = np.c_[cname, stop[j], tb[j], lead].astype(int)
-            dt[j] = A.dt[_draw_rows(rng, tables["clock_sampler"], ck)] * tempo[me[j]]
+            stats["downs_to"][idx[j][tod], me[j][tod]] += 1
+            late_mask[j[late]] = True
+            stats["ot_snaps"][idx[j][oth], me[j][oth]] += 1
+            stats["ot_yds"][idx[j][oth], me[j][oth]] += gain[oth].astype(int)
 
         # kneel / spike ------------------------------------------------
         for code, cname, gain_v, stopv in ((2, 2, -1.0, 0), (3, 3, 0.0, 1)):
             kk = call == code
             if kk.any():
                 j = np.where(kk)[0]
+                lk = (tb[j] >= 5) & (tb[j] <= 6)
+                stats["late_kneels" if code == 2 else "late_spikes"][idx[j][lk], me[j][lk]] += 1
                 new_yl[j] = np.clip(yl[idx][j] - gain_v, 1, 99)
                 new_down[j] = down[idx][j] + 1; new_ytg[j] = ytg[idx][j] - gain_v
                 tod = new_down[j] > 4
                 flip[j[tod]] = True; flip_yl[j[tod]] = np.clip(100 - new_yl[j[tod]], 1, 99)
-                ck = np.c_[np.full(len(j), cname), np.full(len(j), stopv), tb[j], lead_class(sd[j])].astype(int)
-                dt[j] = A.dt[_draw_rows(rng, tables["clock_sampler"], ck)]
+                stop[j] = stopv
+
+        # clock for pass / run / kneel / spike, with timeouts: a team with one
+        # left calls it at the data's rate for the situation, and the seconds
+        # to the next snap are drawn from the pool of plays a timeout followed
+        tk = call <= 3
+        if tk.any():
+            j = np.where(tk)[0]
+            lead = lead_class(sd[j])
+            key = np.c_[tb[j], lead, stop[j]].astype(int)
+            p_off = _table_rows(tables["timeout_off"], key)[:, 1]
+            p_def = _table_rows(tables["timeout_def"], key)[:, 1]
+            off_to = (rng.random(len(j)) < p_off) & (timeouts[idx[j], me[j]] > 0)
+            def_to = ~off_to & (rng.random(len(j)) < p_def) & (timeouts[idx[j], them[j]] > 0)
+            timeouts[idx[j][off_to], me[j][off_to]] -= 1
+            timeouts[idx[j][def_to], them[j][def_to]] -= 1
+            stats["timeouts_used"][idx[j][off_to], me[j][off_to]] += 1
+            stats["timeouts_used"][idx[j][def_to], them[j][def_to]] += 1
+            ck = np.c_[call[j], stop[j], (off_to | def_to).astype(int), tb[j], lead].astype(int)
+            dt[j] = A.dt[_draw_rows(rng, tables["clock_sampler"], ck)] * np.where(call[j] <= 1, tempo[me[j]], 1.0)
+            # the two-minute warning stops the clock at 2:00 in either half
+            reg = half[idx][j] <= 2
+            over = reg & (secs[idx][j] > 120) & (secs[idx][j] - dt[j] < 120)
+            dt[j[over]] = secs[idx][j][over] - 120
+            lm = late_mask[j]
+            stats["late_secs"][idx[j][lm], me[j][lm]] += np.round(dt[j][lm]).astype(int)
+            t0 = (tb[j] == 0) & (call[j] <= 1)
+            stats["secs_tb0"][idx[j][t0], me[j][t0]] += np.round(dt[j][t0]).astype(int)
+            stats["stops_tb0"][idx[j][t0 & (stop[j] == 1)], me[j][t0 & (stop[j] == 1)]] += 1
+            om = half[idx][j] == 3
+            stats["ot_secs"][idx[j][om], me[j][om]] += np.round(dt[j][om]).astype(int)
 
         # punt -----------------------------------------------------------
         pu = call == 4
@@ -674,6 +1030,10 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
             rows = _draw_rows(rng, tables["punt_sampler"], yb[j].reshape(-1, 1))
             flip[j] = True; flip_yl[j] = np.clip(A.punt_yl[rows], 1, 99)
             stats["punts"][idx[j], me[j]] += 1
+            lp = (tb[j] >= 5) & (tb[j] <= 6)
+            stats["late_punts"][idx[j][lp], me[j][lp]] += 1
+            op = half[idx][j] == 3
+            stats["ot_punts"][idx[j][op], me[j][op]] += 1
             dt[j] = 7.0
 
         # field goal -----------------------------------------------------
@@ -684,6 +1044,10 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
             made = rng.random(len(j)) < fg_make_prob(tables["fg_coef"], dist)
             stats["fg_att"][idx[j], me[j]] += 1
             stats["fg_made"][idx[j][made], me[j][made]] += 1
+            lf = (tb[j] >= 5) & (tb[j] <= 6)
+            stats["late_fga"][idx[j][lf], me[j][lf]] += 1
+            of = half[idx][j] == 3
+            stats["ot_fga"][idx[j][of], me[j][of]] += 1
             fg_made[j[made]] = True
             miss = j[~made]
             flip[miss] = True
@@ -692,6 +1056,12 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
             dt[j] = 5.0
 
         # ---- apply -----------------------------------------------------
+        cross = (half[idx] == 2) & (secs[idx] > 120) & (secs[idx] - dt <= 120)
+        margin_2min[idx[cross]] = score[idx[cross], 0] - score[idx[cross], 1]
+        c5 = (half[idx] == 2) & (secs[idx] > 300) & (secs[idx] - dt <= 300)
+        margin_5min[idx[c5]] = score[idx[c5], 0] - score[idx[c5], 1]
+        ch = (half[idx] == 1) & (secs[idx] - dt <= 0)
+        margin_half[idx[ch]] = score[idx[ch], 0] - score[idx[ch], 1]
         secs[idx] -= dt
         # scores
         i_td = idx[td]
@@ -703,6 +1073,7 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
         pos[i_dtd] = them[dtd]; phase[i_dtd] = PH_TRY
         i_saf = idx[saf]
         score[i_saf, them[saf]] += 2
+        stats["safeties"][i_saf, them[saf]] += 1
         kick_team[i_saf] = me[saf]                          # the team that conceded kicks
         phase[i_saf] = PH_KICK
         i_fg = idx[fg_made]
@@ -716,9 +1087,19 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
         cont = ~(td | dtd | saf | fg_made | flip)
         i_c = idx[cont]
         yl[i_c] = new_yl[cont]; down[i_c] = new_down[cont]; ytg[i_c] = np.maximum(new_ytg[cont], 1)
-        # overtime ends on any score
-        ot_scored = (half[idx] == 3) & (td | dtd | saf | fg_made)
-        phase[idx[ot_scored & ~(td | dtd)]] = PH_OVER          # FG / safety end it now; a TD ends after the try
+        # overtime: a possession ends on a score, a turnover, a punt or downs;
+        # once both teams have had one, the next score wins (and the game is
+        # over as soon as the scores differ); a defensive score ends it at once
+        in_ot = half[idx] == 3
+        ended_poss = in_ot & (td | fg_made | flip | saf)
+        ot_poss[idx[ended_poss], me[ended_poss]] += 1
+        both = (ot_poss[idx, 0] > 0) & (ot_poss[idx, 1] > 0)
+        differ = score[idx, 0] != score[idx, 1]
+        # once both have possessed, any possession-ending event with the
+        # scores apart ends it (a matching field goal does not); a defensive
+        # score ends it at once; a touchdown is settled after its try
+        ot_over = in_ot & ~td & differ & ((both & (fg_made | flip | saf)) | dtd | saf)
+        phase[idx[ot_over]] = PH_OVER
         # clock ran out during a play that did not score
         ended = p & (secs <= 0) & (phase == PH_PLAY)
         if ended.any():
@@ -726,7 +1107,8 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
 
     home, away = score[:, 0], score[:, 1]
     return dict(points_home=home, points_away=away, margin=home - away, total=home + away,
-                stats=stats, steps=_, finished=int((phase == PH_OVER).sum()))
+                stats=stats, steps=_, finished=int((phase == PH_OVER).sum()), margin_2min=margin_2min,
+                ot=(half == 3), ot_poss=ot_poss, secs_left=secs, margin_half=margin_half, margin_5min=margin_5min)
 
 
 def league_check(sim: dict, plays: pd.DataFrame) -> pd.DataFrame:
@@ -773,6 +1155,98 @@ def league_check(sim: dict, plays: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["metric", "engine", "real"])
 
 
+def real_state_table(plays: pd.DataFrame) -> pd.DataFrame:
+    """The real league's scrimmage plays with the lead class, down and a
+    drive-start flag attached — the box gate's reference."""
+    d = plays.sort_values(["game_id", "play_id"]).copy()
+    # possession changes are read over real rows only (quarter breaks and
+    # timeouts have no possession and would look like new drives)
+    d = d[d["play_type"].notna() & (d["play_type"] != "no_play")]
+    prev_pos = d.groupby("game_id")["posteam"].shift(1)
+    prev_type = d.groupby("game_id")["play_type"].shift(1)
+    d["drive_start"] = (d["posteam"] != prev_pos) | (prev_type == "kickoff")
+    sc = d[d["play_type"].isin(["pass", "run"])].copy()
+    sc["lead"] = lead_class(sc["score_differential"].fillna(0))
+    sc["is_pass"] = (sc["play_type"] == "pass").astype(int)
+    sc["down_i"] = sc["down"].fillna(1).astype(int)
+    return sc
+
+
+def league_sim(tables: dict, sens: dict, n_games: int = 20000, seed: int = 5,
+               margin_sd: float = 6.0, total_mu: float = 45.0, total_sd: float = 4.0,
+               per_matchup: int = 500) -> dict:
+    """A league with realistic dispersion: matchups steered to expected margins
+    drawn N(0, margin_sd) — the closing-spread spread — so time spent trailing
+    or leading big is comparable with the real league (identical teams would
+    under-visit those states). Returns one concatenated `simulate` result."""
+    rng = np.random.default_rng(seed)
+    parts = []
+    for k in range(max(n_games // per_matchup, 1)):
+        sh = shifts_for(sens, rng.normal(0, margin_sd), rng.normal(total_mu, total_sd))
+        parts.append(simulate(tables, per_matchup, seed=seed + k, shift=sh))
+    out = dict(points_home=np.concatenate([q["points_home"] for q in parts]),
+               points_away=np.concatenate([q["points_away"] for q in parts]),
+               margin_2min=np.concatenate([q["margin_2min"] for q in parts]),
+               margin_half=np.concatenate([q["margin_half"] for q in parts]), margin_5min=np.concatenate([q["margin_5min"] for q in parts]),
+               ot=np.concatenate([q["ot"] for q in parts]))
+    out["margin"] = out["points_home"] - out["points_away"]; out["total"] = out["points_home"] + out["points_away"]
+    out["stats"] = {c: np.concatenate([q["stats"][c] for q in parts]) for c in STAT_COLS}
+    return out
+
+
+GATE_SEASONS_BACK = 2      # the reference league is the last three seasons
+
+
+def box_gate(sim: dict, plays: pd.DataFrame, seasons_back: int = GATE_SEASONS_BACK) -> pd.DataFrame:
+    """Stage-4 gate, conditioned on the live score: does the engine give a
+    team the right number of snaps, the right pass rate and the right drive
+    length in each game state? `sim` should come from `league_sim` so the
+    occupancy rows (share of snaps in each state) are comparable. The
+    reference is the RECENT league (pace and play-calling drift)."""
+    plays = plays[plays["season"] >= plays["season"].max() - seasons_back]
+    st = sim["stats"]; sc = real_state_table(plays)
+    n_tg = 2 * len(sim["margin"])                              # team-games
+    r_tg = 2 * plays["game_id"].nunique()
+    scr = plays[plays["play_type"].isin(["pass", "run"])]
+    off_td = float(((scr["touchdown"] == 1) & (scr["td_team"] == scr["posteam"])).sum()) / r_tg
+    downs = scr[(scr["down"] == 4) & (scr["first_down"] == 0) & (scr["touchdown"] == 0)
+                & (scr["interception"] == 0) & (scr["fumble_lost"] == 0)]
+    tot = lambda c: float(st[c].sum())
+    snaps = tot("pass_att") + tot("sacks") + tot("rush_att")
+    rows = [("snaps / team-game", snaps / n_tg, len(sc) / r_tg),
+            ("pass attempts / team-game", tot("pass_att") / n_tg, float(((sc["is_pass"] == 1) & (sc["sack"] == 0)).sum()) / r_tg),
+            ("rush attempts / team-game", tot("rush_att") / n_tg, float((sc["is_pass"] == 0).sum()) / r_tg),
+            ("pass rate (dropbacks / snaps)", (tot("pass_att") + tot("sacks")) / snaps, float(sc["is_pass"].mean())),
+            ("gross pass yards / team-game", tot("pass_yds") / n_tg, float(sc.loc[(sc["is_pass"] == 1) & (sc["sack"] == 0), "yards_gained"].sum()) / r_tg),
+            ("rush yards / team-game", tot("rush_yds") / n_tg, float(sc.loc[sc["is_pass"] == 0, "yards_gained"].sum()) / r_tg),
+            ("drives / team-game", tot("drives") / n_tg, float(sc["drive_start"].sum()) / r_tg),
+            ("punts / team-game", tot("punts") / n_tg, float((plays["play_type"] == "punt").sum()) / r_tg),
+            ("FG attempts / team-game", tot("fg_att") / n_tg, float((plays["play_type"] == "field_goal").sum()) / r_tg),
+            ("offensive TDs / team-game", (tot("pass_td") + tot("rush_td")) / n_tg, off_td),
+            ("turnovers / team-game", (tot("ints") + tot("fum_lost")) / n_tg, float(scr["interception"].sum() + scr["fumble_lost"].sum()) / r_tg),
+            ("turnovers on downs / team-game", tot("downs_to") / n_tg, len(downs) / r_tg)]
+    for lc, name in LEAD_NAMES.items():
+        q = sc[sc["lead"] == lc]
+        rows += [(f"share of snaps while {name}", tot(f"snaps_{name}") / snaps, len(q) / len(sc)),
+                 (f"pass rate while {name}", tot(f"pass_{name}") / max(tot(f"snaps_{name}"), 1), float(q["is_pass"].mean())),
+                 (f"snaps per drive started while {name}", tot(f"snaps_{name}") / max(tot(f"drives_{name}"), 1),
+                  len(q) / max(float(q["drive_start"].sum()), 1))]
+    for dn in (1, 2, 3, 4):
+        rows.append((f"share of snaps on down {dn}", tot(f"down{dn}") / snaps, float((sc["down_i"] == dn).mean())))
+    m = sim["margin"].astype(float)
+    sched = D.load_schedule(tuple(sorted(int(x) for x in plays["season"].unique())))
+    if "game_type" in sched.columns:
+        sched = sched[sched["game_type"] == "REG"]
+    rm = (sched["home_score"] - sched["away_score"]).dropna().to_numpy(float)
+    rows += [("P(|margin| = 3)", float((np.abs(m) == 3).mean()), float((np.abs(rm) == 3).mean())),
+             ("P(|margin| = 7)", float((np.abs(m) == 7).mean()), float((np.abs(rm) == 7).mean())),
+             ("P(tie)", float((m == 0).mean()), float((rm == 0).mean())),
+             ("margin sd", float(m.std()), float(rm.std()))]
+    out = pd.DataFrame(rows, columns=["metric", "engine", "real"])
+    out["gap"] = out["engine"] - out["real"]
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Stage 3: team strength — steer the engine to the ratings' expected game
 # ---------------------------------------------------------------------------
@@ -790,13 +1264,20 @@ SENS_N = 6000
 
 
 def sensitivity(tables: dict, seed: int = 11) -> dict:
-    """d(margin)/d(home shift), d(total)/d(shift) and the neutral means."""
-    base = simulate(tables, SENS_N, seed=seed)
-    up = simulate(tables, SENS_N, seed=seed, shift={"pass": (SENS_SHIFT, 0.0), "run": (SENS_SHIFT, 0.0)})
+    """d(margin)/d(home shift), d(total)/d(shift), the neutral means, and the
+    game-level shift sds that bring the neutral sds up to the targets:
+    margin var adds 2·dm²·σt², total var adds dt²·(2σt² + 4σc²)."""
+    base = simulate(tables, SENS_N, seed=seed, game_shift=(0.0, 0.0))
+    up = simulate(tables, SENS_N, seed=seed, shift={"pass": (SENS_SHIFT, 0.0), "run": (SENS_SHIFT, 0.0)},
+                  game_shift=(0.0, 0.0))
     m0, t0 = float(base["margin"].mean()), float(base["total"].mean())
     dm = (float(up["margin"].mean()) - m0) / SENS_SHIFT          # margin per yard, one side
     dt = (float(up["total"].mean()) - t0) / SENS_SHIFT           # total per yard, one side
-    return dict(m0=m0, t0=t0, dm=dm, dt=dt)
+    sm, st_ = float(base["margin"].std()), float(base["total"].std())
+    var_t = max(TARGET_MARGIN_SD ** 2 - sm ** 2, 0.0) / (2 * dm ** 2)
+    var_c = max((TARGET_TOTAL_SD ** 2 - st_ ** 2) / dt ** 2 - 2 * var_t, 0.0) / 4
+    return dict(m0=m0, t0=t0, dm=dm, dt=dt, neutral_margin_sd=sm, neutral_total_sd=st_,
+                game_sd_team=float(np.sqrt(var_t)), game_sd_common=float(np.sqrt(var_c)))
 
 
 def shifts_for(sens: dict, margin: float, total: float) -> dict:
@@ -812,13 +1293,14 @@ def shifts_for(sens: dict, margin: float, total: float) -> dict:
 
 def simulate_matchup(tables: dict, sens: dict, ratings: dict, home: str, away: str,
                      n: int = 10000, seed: int | None = None, avail=None, wind=None,
-                     roof=None, neutral_site: bool = False, tendency: dict | None = None) -> dict:
+                     roof=None, neutral_site: bool = False, tendency: dict | None = None,
+                     progress=None) -> dict:
     """The engine steered to the ratings' expected margin and total for one game."""
     from . import teams as T
     e = T.expected_points(ratings, home, away, home=None if neutral_site else "a",
                           avail=avail, wind=wind, roof=roof)
     sh = shifts_for(sens, e["margin"], e["total"])
-    sim = simulate(tables, n, seed=seed, shift=sh, tendency=tendency)
+    sim = simulate(tables, n, seed=seed, shift=sh, tendency=tendency, progress=progress)
     sim.update(target_margin=float(e["margin"]), target_total=float(e["total"]),
                shift=sh, home=home, away=away,
                win_home=float((sim["margin"] > 0).mean() + 0.5 * (sim["margin"] == 0).mean()))
@@ -928,10 +1410,8 @@ def team_tendencies(tables: dict, plays: pd.DataFrame, latest: int | None = None
     d["t_b"] = time_bin(d["game_half"], d["half_seconds_remaining"].fillna(900))
     d["down_i"] = d["down"].fillna(0).astype(int)
     e = d[d["down_i"].between(1, 3) & d["play_type"].isin(["pass", "run"])].copy()
-    keys = e[["down_i", "ytg_b", "yl_b", "t_b", "sd_b"]].to_numpy(int)
-    uniq, inv = np.unique(keys, axis=0, return_inverse=True)
-    exp_pass = np.array([tables["call_early"].probs(tuple(int(x) for x in k))[0] for k in uniq])[inv.ravel()]
-    e["exp_pass"] = exp_pass; e["is_pass"] = (e["play_type"] == "pass").astype(float)
+    e["exp_pass"] = expected_pass_rate(tables, e["down_i"], e["ytg_b"], e["yl_b"], e["t_b"], e["sd_b"])
+    e["is_pass"] = (e["play_type"] == "pass").astype(float)
     g = e.groupby("posteam").apply(lambda q: pd.Series(dict(
         n=len(q), proe=float(np.average(q["is_pass"] - q["exp_pass"], weights=q["w"])),
         pass_rate=float(np.average(q["is_pass"], weights=q["w"])))))
@@ -960,7 +1440,7 @@ def allocate_players(rng, ctx: dict, roster: pd.DataFrame, team: str, opponent: 
                      st: dict, side: int) -> dict:
     """One team's player lines from the engine's per-simulation team totals.
     Returns the same dict shape as `game._side_box`."""
-    from . import game as G, rushing as R
+    from . import game as G, roster as RO, rushing as R
     n = len(st["pass_att"]); k = len(roster)
     attempts = st["pass_att"][:, side].astype(int)
     sacks = st["sacks"][:, side].astype(int)
@@ -972,9 +1452,9 @@ def allocate_players(rng, ctx: dict, roster: pd.DataFrame, team: str, opponent: 
     n_rush_td = st["rush_td"][:, side].astype(int)
     dropbacks = attempts + sacks
 
-    tgt_w = rng.dirichlet(np.clip(roster["target_share"].values, 1e-4, None)
+    tgt_w = rng.dirichlet(np.clip(RO.sim_shares(roster, "target_share"), 1e-4, None)
                           * G.TARGET_CONCENTRATION, size=n)
-    car_w = rng.dirichlet(np.clip(roster["carry_share"].values, 1e-4, None)
+    car_w = rng.dirichlet(np.clip(RO.sim_shares(roster, "carry_share"), 1e-4, None)
                           * G.CARRY_CONCENTRATION, size=n)
     target_rate = float(ctx.get("target_rate", G.TARGET_PER_ATTEMPT))
     targeted = rng.binomial(attempts, float(np.clip(target_rate, 0.8, 1.0)))
@@ -997,19 +1477,28 @@ def allocate_players(rng, ctx: dict, roster: pd.DataFrame, team: str, opponent: 
         elif c.max() > 0:
             rush_yards[:, j] = c * 4.2 * rng.lognormal(-0.08, 0.40, n)
 
-    # rescale to the game's totals: the receivers ARE the passing yards
-    def rescale(player, team_total):
+    # rescale to the game's totals: the receivers ARE the passing yards. A
+    # proportional scale is right when the players' draws are in the same
+    # range as the team's total; when they nearly cancel (rushing losses) the
+    # factor explodes, so outside a sane band the residual is spread by touches
+    def rescale(player, team_total, touches, nonneg):
         s_ = player.sum(axis=1)
         f = np.where(s_ > 0, team_total / np.where(s_ > 0, s_, 1.0), 0.0)
-        out = player * f[:, None]
-        # a team with yards but no receiver drew a catch: give them to the top share
-        orphan = (s_ <= 0) & (team_total > 0)
+        # non-negative draws (receiving) scale safely by any factor short of a
+        # blow-up; rushing draws can be losses, which a large factor amplifies
+        sane = (s_ > 0) & (f >= 0) & (f <= (10.0 if nonneg else 2.0))
+        out = np.where(sane[:, None], player * f[:, None], 0.0)
+        share = touches / np.maximum(touches.sum(axis=1, keepdims=True), 1)
+        out = np.where(sane[:, None], out, player + (team_total - s_)[:, None] * share)
+        # a team with yards but nobody touching the ball: give them to the top share
+        orphan = ~sane & (touches.sum(axis=1) == 0) & (team_total != 0)
         if orphan.any():
             top = np.argmax(tgt_w[orphan], axis=1) if player is rec_yards else np.argmax(car_w[orphan], axis=1)
+            out[orphan] = 0.0
             out[np.where(orphan)[0], top] = team_total[orphan]
         return np.round(out, 1)
-    rec_yards = rescale(rec_yards, pass_yds_team)
-    rush_yards = rescale(rush_yards, rush_yds_team)
+    rec_yards = rescale(rec_yards, pass_yds_team, receptions, nonneg=True)
+    rush_yards = rescale(rush_yards, rush_yds_team, player_car, nonneg=False)
 
     rec_tds = G._multinomial_alloc(rng, n_pass_td, np.tile(roster["rec_td_weight"].values, (n, 1)))
     rush_tds = G._multinomial_alloc(rng, n_rush_td, np.tile(roster["rush_td_weight"].values, (n, 1)))
@@ -1027,7 +1516,7 @@ def allocate_players(rng, ctx: dict, roster: pd.DataFrame, team: str, opponent: 
 def simulate_game_players(tables: dict, sens: dict, ctx: dict,
                           roster_a: pd.DataFrame, roster_b: pd.DataFrame,
                           team_a: str, team_b: str, n: int = 10000, seed: int | None = None,
-                          avail=None, wind=None, roof=None, home: str | None = "a") -> dict:
+                          avail=None, wind=None, roof=None, home: str | None = "a", progress=None) -> dict:
     """The play engine with both depth charts on top — the same output shape as
     `game.simulate_game`, so fantasy, props and the pick'em can consume either."""
     rng = np.random.default_rng(seed)
@@ -1035,7 +1524,7 @@ def simulate_game_players(tables: dict, sens: dict, ctx: dict,
     tendency = tendency_for(tend, team_a, team_b) if tend is not None else None
     sim = simulate_matchup(tables, sens, ctx["ratings"], team_a, team_b, n=n, seed=seed,
                            avail=avail, wind=wind, roof=roof, neutral_site=(home is None),
-                           tendency=tendency)
+                           tendency=tendency, progress=progress)
     box_a = allocate_players(rng, ctx, roster_a, team_a, team_b, sim["stats"], 0)
     box_b = allocate_players(rng, ctx, roster_b, team_b, team_a, sim["stats"], 1)
     return dict(
@@ -1050,22 +1539,97 @@ def simulate_game_players(tables: dict, sens: dict, ctx: dict,
 _ENGINE: dict = {}
 
 
-def attach(ctx: dict) -> dict:
-    """Build (once per process) and attach the play engine's tables to a context."""
-    if "tables" not in _ENGINE:
-        plays = load_plays()
-        _ENGINE["tables"] = build_tables(plays)
-        _ENGINE["sens"] = sensitivity(_ENGINE["tables"])
-        # tendencies use the most recent seasons INCLUDING the one being played
+def _engine_cache_file() -> Path:
+    """The tables and sensitivities depend only on the table seasons and this
+    module's code, so they are keyed on both — any edit here rebuilds them."""
+    import hashlib
+    h = hashlib.sha1(Path(__file__).read_bytes()).hexdigest()[:10]
+    CACHE_DIR.mkdir(exist_ok=True)
+    return CACHE_DIR / f"play_engine_{TABLE_SEASONS[0]}_{TABLE_SEASONS[-1]}_{h}.pkl"
+
+
+def build_engine(progress=None) -> dict:
+    """Tables, sensitivities and the calibrated game-level shift — from disk
+    when this code version has built them before, otherwise from the plays
+    (about a minute) and saved for next time."""
+    import pickle
+    f = _engine_cache_file()
+    if f.exists():
         try:
-            latest = int(ctx.get("depth_seasons", (plays["season"].max(),))[-1])
+            with open(f, "rb") as fh:
+                return pickle.load(fh)
+        except Exception:
+            pass                                   # a stale or partial file: rebuild
+    if progress:
+        progress(0.05, "loading ten seasons of plays")
+    plays = load_plays()
+    if progress:
+        progress(0.35, "building the tables")
+    tables = build_tables(plays)
+    if progress:
+        progress(0.7, "measuring the engine's sensitivities")
+    sens = sensitivity(tables)
+    tables["game_shift"] = (sens["game_sd_team"], sens["game_sd_common"])
+    eng = dict(tables=tables, sens=sens)
+    for old in CACHE_DIR.glob("play_engine_*.pkl"):     # one file per code version is enough
+        old.unlink(missing_ok=True)
+    with open(f, "wb") as fh:
+        pickle.dump(eng, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    return eng
+
+
+def attach(ctx: dict, progress=None) -> dict:
+    """Build (once per process, from disk when possible) and attach the play
+    engine's tables to a context."""
+    if "tables" not in _ENGINE:
+        eng = build_engine(progress)
+        _ENGINE["tables"], _ENGINE["sens"] = eng["tables"], eng["sens"]
+        # tendencies use the most recent seasons INCLUDING the one being played
+        if progress:
+            progress(0.9, "team tendencies from the last three seasons")
+        try:
+            latest = int(ctx.get("depth_seasons", (TABLE_SEASONS[-1],))[-1])
             recent = load_plays(tuple(range(latest - TENDENCY_SEASONS_BACK, latest + 1)))
         except Exception:
-            recent, latest = plays, None
+            recent, latest = load_plays(), None
         _ENGINE["tendencies"] = team_tendencies(_ENGINE["tables"], recent, latest)
     ctx["play_engine"] = (_ENGINE["tables"], _ENGINE["sens"])
     ctx["play_tendencies"] = _ENGINE["tendencies"]
     return ctx
+
+
+# ---------------------------------------------------------------------------
+# The regression gate: run after touching this file
+# ---------------------------------------------------------------------------
+# Tolerances on the box gate's gaps (engine − real, recent league). The two
+# marked "known" are open items (ROADMAP §16) and are reported, not failed.
+
+GATE_TOLERANCE = {
+    "snaps / team-game": 1.5, "pass attempts / team-game": 1.2, "rush attempts / team-game": 1.0,
+    "pass rate (dropbacks / snaps)": 0.01, "gross pass yards / team-game": 6.0, "rush yards / team-game": 4.0,
+    "drives / team-game": 0.7, "punts / team-game": 0.3, "FG attempts / team-game": 0.2,
+    "offensive TDs / team-game": 0.2, "turnovers / team-game": 0.15, "turnovers on downs / team-game": 0.15,
+    "share of snaps while trail": 0.02, "share of snaps while even": 0.02, "share of snaps while lead": 0.02,
+    "pass rate while trail": 0.015, "pass rate while even": 0.015, "pass rate while lead": 0.015,
+    "snaps per drive started while trail": 0.45, "snaps per drive started while even": 0.3,
+    "snaps per drive started while lead": 0.3,
+    "share of snaps on down 1": 0.01, "share of snaps on down 2": 0.01, "share of snaps on down 3": 0.01,
+    "share of snaps on down 4": 0.005,
+    "P(|margin| = 3)": None, "P(|margin| = 7)": 0.012, "P(tie)": 0.01, "margin sd": None,
+}
+
+
+def run_gate(n_games: int = 12000, seed: int = 5) -> tuple[pd.DataFrame, bool]:
+    """Build (or load) the engine, simulate a dispersed league and score the
+    box gate against its tolerances. Returns (table, passed)."""
+    eng = build_engine()
+    tables, sens = eng["tables"], eng["sens"]
+    sim = league_sim(tables, sens, n_games=n_games, seed=seed)
+    g = box_gate(sim, load_plays())
+    tol = g["metric"].map(GATE_TOLERANCE)
+    g["tolerance"] = tol
+    g["status"] = np.where(tol.isna(), "known", np.where(g["gap"].abs() <= tol.fillna(np.inf), "ok", "FAIL"))
+    return g, bool((g["status"] != "FAIL").all())
 
 
 # ---------------------------------------------------------------------------
@@ -1074,15 +1638,16 @@ def attach(ctx: dict) -> dict:
 
 def report(tables: dict, plays: pd.DataFrame) -> str:
     lines = []
-    ce = tables["call_early"]
     for down, ytg in ((1, 4), (2, 2), (2, 3), (3, 0), (3, 2), (3, 5)):
-        p = ce.probs((down, ytg, 5, 0, sd_bin([0])[0]))
-        lines.append(f"pass rate, down {down} ytg-bin {ytg} at midfield, tied, H1: {p[0]:.0%}")
-    cf = tables["call_fourth"]
+        p = expected_pass_rate(tables, [down], [ytg], [5], [0], [sd_bin([0])[0]])[0]
+        p_tr = expected_pass_rate(tables, [down], [ytg], [5], [4], [sd_bin([-10])[0]])[0]
+        lines.append(f"pass rate, down {down} ytg-bin {ytg} at midfield, tied H1: {p:.0%} | down 10, H2 2-5 min: {p_tr:.0%}")
     for ytg, yl, lab in ((0, 5, "4th & 1 at midfield"), (2, 3, "4th & 3-5 at opp 35"), (5, 6, "4th & 11+ at own 40"),
                          (0, 0, "4th & 1 inside the 10"), (2, 2, "4th & 3-5 at opp 25 (FG range)")):
-        p = cf.probs((ytg, yl, 2, sd_bin([0])[0]))
-        lines.append(f"4th down, {lab}, H2 early, tied: go {p[0]+p[1]:.0%} punt {p[2]:.0%} FG {p[3]:.0%}")
+        p = fourth_down_probs(tables, [ytg], [yl], [2], [0], [yl * 10 + 5])[0]
+        q = fourth_down_probs(tables, [ytg], [yl], [4], [-10], [yl * 10 + 5])[0]
+        lines.append(f"4th down, {lab}: tied H2 early go {p[0]+p[1]:.0%} punt {p[2]:.0%} FG {p[3]:.0%} | "
+                     f"down 10 with 2-5 min: go {q[0]+q[1]:.0%} punt {q[2]:.0%} FG {q[3]:.0%}")
     o = tables["outcomes"]
     for call in ("pass", "run"):
         q = o[o["call"] == CALL_CODE[call]]
@@ -1104,24 +1669,33 @@ def report(tables: dict, plays: pd.DataFrame) -> str:
 
 
 if __name__ == "__main__":
+    import sys
     import time
+    pd.set_option("display.width", 160)
+    if "--gate" in sys.argv:
+        t = time.time()
+        g, ok = run_gate()
+        print(g.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+        print(f"\n{'PASS' if ok else 'FAIL'} — {int((g['status'] == 'FAIL').sum())} outside tolerance, "
+              f"{int((g['status'] == 'known').sum())} known gaps, {time.time() - t:.0f}s")
+        sys.exit(0 if ok else 1)
     t = time.time()
     p = load_plays()
     print(f"{len(p):,} plays, {p['game_id'].nunique():,} games, loaded in {time.time()-t:.0f}s")
     t = time.time()
     tb = build_tables(p)
     print(f"tables built in {time.time()-t:.0f}s | outcome cells {len(tb['outcome_sampler'].cells):,} "
-          f"| decision cells {len(tb['call_early'].cells):,} + {len(tb['call_fourth'].cells):,}")
+          f"| decision cells {len(tb['pass_base'].cells) + len(tb['special_early'].cells) + len(tb['fourth_base'].cells):,}")
     print(report(tb, p))
     t = time.time()
     sim = simulate(tb, n=4000, seed=1)
     print(f"\nsimulated 4,000 games in {time.time()-t:.0f}s ({sim['steps']} steps, {sim['finished']} finished)")
-    pd.set_option("display.width", 160)
     print(league_check(sim, p).to_string(index=False, float_format=lambda x: f"{x:.3f}"))
     t = time.time()
     sens = sensitivity(tb)
     print(f"\nsensitivity ({time.time()-t:.0f}s): neutral margin {sens['m0']:+.2f} total {sens['t0']:.2f} | "
-          f"margin {sens['dm']:.2f} pts and total {sens['dt']:.2f} pts per yard-per-play of one side")
+          f"margin {sens['dm']:.2f} pts and total {sens['dt']:.2f} pts per yard-per-play of one side | "
+          f"game-level shift sds team {sens['game_sd_team']:.2f} common {sens['game_sd_common']:.2f}")
     sh = shifts_for(sens, 7.0, 47.0)
     chk = simulate(tb, 6000, seed=5, shift=sh)
     print(f"steer to margin +7 / total 47: engine margin {chk['margin'].mean():+.2f} total {chk['total'].mean():.2f} "

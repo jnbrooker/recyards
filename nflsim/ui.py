@@ -11,11 +11,75 @@ CURRENT team, which is what the team-volume lookups should use.
 
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 from . import roster as RO
+
+
+# ---------------------------------------------------------------------------
+# Progress with a time estimate
+# ---------------------------------------------------------------------------
+# A cached function must not draw Streamlit elements (they would be recorded
+# and replayed on every cache hit), so the long computations report a fraction
+# into a per-thread slot and the page thread draws ONE bar from it. The cached
+# function runs in a worker thread; a cache hit returns before any bar is drawn.
+
+_PROGRESS: dict[int, dict] = {}
+
+
+def report(frac: float, text: str = "") -> None:
+    """Called from inside the long computations: how far along, and what is
+    being worked on. A no-op unless the call is under `run_with_progress`."""
+    state = _PROGRESS.get(threading.get_ident())
+    if state is not None:
+        state["frac"], state["text"] = float(frac), str(text)
+
+
+def _fmt_secs(x: float) -> str:
+    x = max(int(round(x)), 0)
+    return f"{x // 60}:{x % 60:02d}" if x >= 60 else f"{x} s"
+
+
+def run_with_progress(label: str, fn, *args, **kwargs):
+    """Run `fn(*args)` (normally one of the cached functions below) and, while
+    it runs, show a bar with what it is doing, the time elapsed and an estimate
+    of the time left. Returns its result; re-raises its exception."""
+    from streamlit.runtime.scriptrunner import add_script_run_ctx
+    state = {"frac": 0.0, "text": "", "result": None, "error": None, "done": False}
+
+    def work():
+        _PROGRESS[threading.get_ident()] = state
+        try:
+            state["result"] = fn(*args, **kwargs)
+        except BaseException as e:            # noqa: BLE001 — re-raised on the page thread
+            state["error"] = e
+        finally:
+            _PROGRESS.pop(threading.get_ident(), None)
+            state["done"] = True
+
+    th = threading.Thread(target=work, daemon=True)
+    add_script_run_ctx(th)
+    th.start()
+    th.join(0.3)                              # a cache hit is back before a bar is worth drawing
+    bar, t0 = None, time.time()
+    while not state["done"]:
+        if bar is None:
+            bar = st.progress(0.0, text=label)
+        frac, el = min(state["frac"], 1.0), time.time() - t0
+        eta = f" · about {_fmt_secs(el / frac - el)} left" if frac > 0.03 else ""
+        what = f" — {state['text']}" if state["text"] else ""
+        bar.progress(frac, text=f"{label}{what} · {_fmt_secs(el)} elapsed{eta}")
+        th.join(0.5)
+    if bar is not None:
+        bar.empty()
+    if state["error"] is not None:
+        raise state["error"]
+    return state["result"]
 
 
 def pick_player(rosters: pd.DataFrame, positions: list[str], key: str = "pick",
@@ -268,8 +332,9 @@ def engine_picker(key: str = "engine") -> str:
     """Drive engine (default) or the play-level engine, on the pages that
     simulate whole games. The play engine builds its tables on first use
     (~2-3 minutes once per app process) and runs ~10x slower per game."""
+    opts = ["Drive", "Play-level"]
     lbl = st.sidebar.radio(
-        "Game engine", ["Drive (default)", "Play-level (beta)"], horizontal=True, key=f"{key}_engine",
+        "Game engine", opts, index=1 if DEFAULT_ENGINE == "play" else 0, horizontal=True, key=f"{key}_engine",
         help="**Drive**: one draw per possession; the engine every page was built on.  \n"
              "**Play-level**: every snap simulated from ten seasons of play-by-play — "
              "volume comes from the clock and the score, so a quarterback's yards move "
@@ -291,11 +356,24 @@ def engine_picker(key: str = "engine") -> str:
 # arguments the warm-up used — DEFAULTS is the single source of those.
 
 DEFAULTS = dict(
-    n_sims_game=20000,      # page 7, one fixture
-    n_sims_slate=10000,     # page 8 fantasy, page 9 pick'em
+    n_sims_game=20000,        # page 7, one fixture
+    n_sims_slate=10000,       # page 8 fantasy, page 9 pick'em, drive engine
+    n_sims_slate_play=5000,   # the same slates on the play engine (~7 s a game; the
+                              # Monte-Carlo error on a player mean is well under a yard)
     use_injuries=True,
     scoring="PPR",
 )
+DEFAULT_ENGINE = "drive"      # the engine every page opens on — one line to flip (see ROADMAP §16)
+
+
+def sims_picker(engine: str, key: str) -> int:
+    """Simulations per game for a slate, with the engine's own default so the
+    warm-up's cache is what the page opens on."""
+    if engine == "play":
+        return int(st.sidebar.select_slider("Simulations per game", [2000, 5000, 10000],
+                                            value=DEFAULTS["n_sims_slate_play"], key=f"{key}_sims_play"))
+    return int(st.sidebar.select_slider("Simulations per game", [4000, 10000, 20000],
+                                        value=DEFAULTS["n_sims_slate"], key=f"{key}_sims_drive"))
 
 
 def default_priors() -> tuple:
@@ -318,16 +396,17 @@ def cached_history() -> pd.DataFrame:
     return MK.load_history()
 
 
-@st.cache_resource(show_spinner="Building the play-level engine (ten seasons of plays, once per session)…")
+@st.cache_resource(show_spinner=False)
 def cached_play_engine(latest_season: int) -> dict:
     """The play engine's tables, sensitivities and team tendencies, built once
-    per process and shared with `game.run_game` through the module registry."""
+    per process (from disk when this code version has built them before) and
+    shared with `game.run_game` through the module registry."""
     from . import playengine as PE
-    PE.attach({"depth_seasons": (int(latest_season),)})
+    PE.attach({"depth_seasons": (int(latest_season),)}, progress=report)
     return PE._ENGINE
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner="Simulating the game…")
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
 def _cached_game(seasons: tuple, recency, home: str, away: str, n_sims: int, neutral: bool,
                 use_injuries: bool, wind: float, roof: str, engine: str) -> dict:
     from . import game as G
@@ -338,10 +417,10 @@ def _cached_game(seasons: tuple, recency, home: str, away: str, n_sims: int, neu
     r_away = G.roster_for(ctx, away, use_injuries=use_injuries)
     return G.run_game(ctx, r_home, r_away, home, away, n_sims=int(n_sims), seed=11,
                       home=None if neutral else "a", avail=ctx.get("avail"),
-                      wind=wind, roof=roof, engine=engine)
+                      wind=wind, roof=roof, engine=engine, progress=report)
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner="Simulating every game this week…")
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
 def _cached_week(seasons: tuple, recency, week: int, rules_items: tuple, n_sims: int,
                 use_injuries: bool, engine: str):
     from . import fantasy as F
@@ -351,10 +430,10 @@ def _cached_week(seasons: tuple, recency, week: int, rules_items: tuple, n_sims:
     sched = cached_schedule(int(ctx["depth_seasons"][-1]))
     games = sched[sched["week"] == int(week)]
     return F.week_projections(ctx, games, dict(rules_items), n_sims=int(n_sims),
-                              use_injuries=use_injuries, engine=engine)
+                              use_injuries=use_injuries, engine=engine, progress=report)
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner="Simulating every game this week…")
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
 def _cached_slate(seasons: tuple, recency, week: int, n_sims: int, use_injuries: bool, engine: str) -> dict:
     from . import pickem as P
     ctx = cached_context(seasons, recency)
@@ -362,7 +441,7 @@ def _cached_slate(seasons: tuple, recency, week: int, n_sims: int, use_injuries:
         cached_play_engine(int(ctx["depth_seasons"][-1]))
     sched = cached_schedule(int(ctx["depth_seasons"][-1]))
     games = sched[sched["week"] == int(week)]
-    return P.simulate_slate(ctx, games, n_sims=int(n_sims), use_injuries=use_injuries, engine=engine)
+    return P.simulate_slate(ctx, games, n_sims=int(n_sims), use_injuries=use_injuries, engine=engine, progress=report)
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner="Refitting the model week by week for past games…")
@@ -383,7 +462,7 @@ def warm_up(progress=None, engines=("drive", "play")) -> list[str]:
         t = time.time()
         if progress:
             progress(label)
-        fn()
+        run_with_progress(label, fn)
         log.append(f"{label} — {time.time() - t:.0f}s")
 
     step("Priors, ratings, depth charts and injuries", lambda: cached_context(seasons, recency))
@@ -408,12 +487,14 @@ def warm_up(progress=None, engines=("drive", "play")) -> list[str]:
          lambda: cached_game(seasons, recency, g["home_team"], g["away_team"], DEFAULTS["n_sims_game"],
                              False, DEFAULTS["use_injuries"], wind, roof, "drive"))
     if "play" in engines:
-        step("Play-level engine tables (ten seasons of plays)", lambda: cached_play_engine(season))
+        step("Play-level engine tables (from disk after the first build)", lambda: cached_play_engine(season))
         step(f"{g['away_team']} @ {g['home_team']}, play engine",
              lambda: cached_game(seasons, recency, g["home_team"], g["away_team"], DEFAULTS["n_sims_game"],
                                  False, DEFAULTS["use_injuries"], wind, roof, "play"))
-        step(f"Week {week} fantasy projections, play engine (the slow one)",
-             lambda: cached_week(seasons, recency, week, rules, DEFAULTS["n_sims_slate"], DEFAULTS["use_injuries"], "play"))
+        step(f"Week {week} slate, play engine (pick'em)",
+             lambda: cached_slate(seasons, recency, week, DEFAULTS["n_sims_slate_play"], DEFAULTS["use_injuries"], "play"))
+        step(f"Week {week} fantasy projections, play engine",
+             lambda: cached_week(seasons, recency, week, rules, DEFAULTS["n_sims_slate_play"], DEFAULTS["use_injuries"], "play"))
     return log
 
 

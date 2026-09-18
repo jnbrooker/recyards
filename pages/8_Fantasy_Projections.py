@@ -51,8 +51,8 @@ with st.sidebar.expander("Edit scoring rules"):
                                      step=0.05 if "yd" in key else 0.5, format="%.2f",
                                      key=f"rule_{key}")
 use_inj = st.sidebar.toggle("Drop players ruled out", value=True)
-n_sims = st.sidebar.select_slider("Simulations per game", [4000, 10000, 20000], value=UI.DEFAULTS["n_sims_slate"])
 engine = UI.engine_picker("p8")
+n_sims = UI.sims_picker(engine, "p8")
 
 st.sidebar.divider()
 positions = st.sidebar.multiselect("Positions", ["QB", "RB", "WR", "TE", "FB"],
@@ -61,8 +61,9 @@ team_filter = st.sidebar.multiselect("Teams (blank = all)", sorted(ctx["ratings"
 min_proj = st.sidebar.slider("Hide players projected under", 0.0, 10.0, 2.0, 0.5)
 
 # --- run --------------------------------------------------------------------
-table, samples, summaries = get_week(tuple(seasons), recency, int(week),
-                                     tuple(sorted(rules.items())), int(n_sims), use_inj, engine)
+table, samples, summaries = UI.run_with_progress(
+    f"Simulating week {week} on the {'play' if engine == 'play' else 'drive'} engine",
+    get_week, tuple(seasons), recency, int(week), tuple(sorted(rules.items())), int(n_sims), use_inj, engine)
 
 st.title("🏈 Fantasy Projections")
 ok = [g for g in summaries if g["ok"]]

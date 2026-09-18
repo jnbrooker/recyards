@@ -57,7 +57,7 @@ plays, tables, sens = get_engine(ctx["depth_seasons"][-1])
 st.title("🏈 Play Engine")
 st.caption(f"Ten seasons of play-by-play ({len(plays):,} plays, {plays['game_id'].nunique():,} games) "
            f"→ {len(tables['outcome_sampler'].cells):,} outcome cells, "
-           f"{len(tables['call_early'].cells) + len(tables['call_fourth'].cells):,} decision cells. "
+           f"{len(tables['pass_base'].cells) + len(tables['special_early'].cells) + len(tables['fourth_base'].cells):,} decision cells. "
            "The drive engine on every other page is untouched.")
 
 # --- 1. league gate -------------------------------------------------------------

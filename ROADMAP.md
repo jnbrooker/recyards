@@ -884,25 +884,140 @@ rating if the box-score yardage needs its own anchor.*
 
 16. **Play engine in the props ledger.** *(2026-09-17.)* The 2025 replay
     (§12) could only say the engines were level on players; the ledger can say
-    it on the lines that matter. Every ledger row now freezes a second
-    projection beside the Game view — `play_mean`, `play_median`,
-    `play_p_over` — from one play-engine simulation of the fixture (10,000
-    games, ~15 s; `props.PLAY_SIMS`) with the player read off the box score,
-    same active roster, same rule that nothing is projected after kickoff.
-    Rows recorded before this have blank play columns (the week-1 lines);
-    week 2's were frozen on 17 Sep before the Thursday game (at 5,000 sims,
-    the first setting). The page grades
-    either engine (a *Projection graded* radio drives Edge, Pick and the
-    charts), shows both engines' medians and P(over) per line, and once lines
+    it on the lines that matter. Every ledger row now freezes projections
+    beside the Game view — `play_*` (and from §17, `drive_*`) — from one
+    engine simulation of the fixture with the player read off the box score,
+    same active roster, same rule that nothing is projected after kickoff. The
+    page grades any of them (a *Projection graded* radio drives Edge, Pick and
+    the charts), shows each one's median and P(over) per line, and once lines
     settle compares them head to head on the SAME lines
-    (`props.compare_engines`: only rows with both projections count). The
-    week-2 freeze already shows the shape difference the replay found — the
-    play engine's median sits 0.78 of its mean against the Game view's 0.72,
-    it favours the over on 24% of receiving lines (Game view 16%) and 38% of
-    rushing (28%) — and the two take opposite sides of the line on 18% of
-    lines, mostly running backs' receiving yards (the play engine allocates
-    them more of the team's targets). One week is noise; the comparison table
-    is the thing to read when it has a few hundred settled lines.
+    (`props.compare_engines`). Week 1's lines have blank engine columns; week
+    2's were frozen on 17 Sep before the Thursday game.
+
+    *Week 1 in hindsight (a replay, never written to the ledger).* Both engines
+    on the 225 week-1 consensus lines with everything as of kickoff: median-side
+    hit 50.9% (frozen Game view, old shape) / 52.9% (drive) / 56.9% (play);
+    picks at ≥3% edge 50.5 / 53.6 / 57.3%, and the play engine held ~57% at
+    every edge threshold while the drive engine faded to 53.8% at ≥10%. On the
+    41 lines where the engines took opposite sides, the play engine's side hit
+    61%. The mean beat the median as a pick centre for the Game view and the
+    drive engine (+3.6 / +4.4 points) and not for the play engine (−1.3): a
+    calibrated model can only be picked on its median, so the mean "winning" is
+    a diagnostic that the median is biased low (actuals above the median 62% /
+    57% / 54%), not a reason to switch.
+
+17. **Play engine rebuilt against a state-conditioned gate; timeouts; the
+    ledger on `run_game`.** *(2026-09-18.)* The stage-4 gate was rebuilt as
+    code (`playengine.box_gate`, `python -m nflsim.playengine --gate`): a
+    *dispersed* league (matchups steered to margins drawn N(0, 6), so time
+    spent trailing or leading big is comparable) scored against the last three
+    seasons on snaps, pass rate and drive length **by live score state**,
+    drive-ending events, down shares and the key numbers, with written
+    tolerances. The first run localised everything: snaps and downs right;
+    pass rate damped by 3-4 pp in both directions; trailing drives too short
+    (5.5 vs 6.1 snaps) because the hierarchical tables dropped the score key
+    first whenever a cell was thin — which is precisely the late, lopsided
+    cells — so a trailing team punted like an average one (real fourth-down
+    go rates trailing 9+ in the second half: 52-83%; even: 15-44%).
+
+    **What changed, in order of effect on props.**
+    - *Decisions as a dense physical table plus additive clock-and-score
+      shifts* (`ShiftTable`, the PROE idea applied to the situation), fitted
+      with recency weights (pass rate 0.60 → 0.57 and fourth-down go 0.13 →
+      0.23 over 2016-25 had made the pooled tables 1.5 pp too pass-happy and
+      8 pp too timid) and shrinkage n/(n+25) toward the parent instead of a
+      40-play cutoff. Fourth down keys on a *need* class (a kick ties or wins /
+      one score / two scores…) and a field-position zone, because late and
+      trailing the rule is "kick if in range, otherwise go" — a uniform shift
+      predicted 24% punts for a team down 1-3 in the last two minutes (real
+      1.4%). Kneels, spikes and early-down kicks have their own
+      clock-and-score-first table. Calibrated on real fourth downs in every
+      score state.
+    - *Timeouts as a resource* (3 a half, 2 in overtime), called at the data's
+      rate by situation among teams that have one (`timeout_off/def`, from
+      timeout rows charged to the play whose clock window holds them), clock
+      pools split by whether a timeout followed the play, the two-minute
+      warning, and the victory formation as a rule: a leading team kneels out
+      only when the clock it can burn covers the time left. Used 3.7 a
+      team-game (real 3.65). This was the missing mass at 3: in a one-score
+      game at 2:00 the trailing team got 5.9 snaps and 0.34 field-goal
+      attempts against 7.25 and 0.67 real.
+    - *Hurry-up outcomes*: the last two minutes of a half are a different
+      pool (deep shots, sideline throws — fewer completions, more clock stops,
+      more chunk gains), so outcomes carry a hurry flag ahead of field
+      position. Within-team score effects on yards in normal time (a trailing
+      team's runs +0.18, its passes −0.15; overtime passes +0.44) as a shrunk
+      mean shift — measured after removing team-season means so the strength
+      shifts are not double-counted (the raw conditional pools would have
+      imported "trailing teams are worse").
+    - *Game-level variance*: play-level noise under-disperses games (neutral
+      margin sd 12.0 vs the 12.8 residual the harness calibrated to; total sd
+      12.0 vs 13.4). Each side draws a yards-per-play shift for the day plus a
+      factor common to both (it moves the total, not the margin); both sds are
+      solved in `sensitivity` so the neutral engine lands on the targets. This
+      is what the shape gate's "hair worse" cover log-loss was: over-confidence.
+    - *Overtime under the current rule* (both teams possess, then sudden
+      death; a matching field goal does not end it — the first cut declared
+      a tie there) and the last two minutes of OT mapped onto the late bins,
+      since they are the last two minutes of a tied game. Ties per OT 21% →
+      14% (real ~7%).
+    - *Pace*: clock pools thinned toward recent seasons (63.5 snaps a
+      team-game in 2016, 61.5 in 2023-25); a definition mismatch fixed
+      (turnovers were "clock stops" in the outcome table but not in the clock
+      table, so they drew from the short pool — a snap a team-game); the own
+      1-5 split off as its own field-position bin (safeties 0.18 → 0.12 a
+      game, real 0.054); drives counted at their first real play, as the
+      reference counts them.
+    - *Shares*: both engines now allocate with the roster's conditional ("if
+      he plays") share for active players (`roster.sim_shares`), the quantity
+      the single-stat pages already used; the unconditional share fills the
+      roster's slots but under-projects a player who missed games and is now
+      in. And the play engine's rescale to the team's totals is robust: a
+      near-cancelling rushing sum had multiplied one back's yards by 10¹⁶.
+
+    **Gate after (engine vs 2023-25, gap):** snaps +0.9, pass attempts +0.7,
+    rush +0.35, gross pass yards +0.3, rush yards +0.2, pass rate by state
+    within 0.8 pp, snap share by state within 1 pp, every drive-ending event
+    within 0.1 a team-game, down shares within 0.3 pp, P(7) exact. **Known
+    gaps** (reported, not failed): mass at 3 (9.3% vs 14.2% — the halftime
+    distribution matches; the drift is second-half accumulation of 1/4/6-point
+    margins, TD-versus-two-FG offsets, not the end-game any more), margin sd
+    −0.8, safeties 2×, ties 0.6% vs 0.4%.
+
+    **Players (2025 weeks 2-18, 5 games a week, both engines on identical
+    as-of inputs):** receiving MAE / CRPS 18.82 / 13.02 (drive) vs 18.75 /
+    12.95 (play); rushing 20.26 / 14.14 vs **19.76 / 13.87**, bias −1.4 vs
+    −0.65 (the run lean); 60+ yard receivers' median beaten 59% vs 53%;
+    receptions a hair worse (1.442 / 0.999 vs 1.450 / 1.008). The play engine
+    now leads on both yardage markets where before it was a dead heat.
+
+    **The ledger's primary projection is now `run_game` on the default
+    engine.** Three projections per line: `drive_*` (the drive engine's own
+    box score — what pages 7-9 ship), `play_*`, and the single-stat Game view
+    (`pred_*`) kept as the third. `ui.DEFAULT_ENGINE` (one line, "drive") is
+    what the page grades by default and what `engine_picker` opens on. The
+    **promotion gate** is written down and scored on the page
+    (`props.promotion_gate`): ≥600 settled lines with both engines frozen,
+    play ≤ drive on Brier and median MAE, actuals above the play median in
+    0.47-0.53 on both yardage markets, play within 2 points of drive in every
+    line tier. When every row is met, flip the constant.
+
+    **App.** Long computations report a fraction into a per-thread slot; the
+    page thread draws one bar with what is being simulated, the time elapsed
+    and an estimate of what is left (`ui.run_with_progress`) — cached
+    functions never draw, so nothing is replayed on a cache hit. The built
+    engine (tables, sensitivities, game-level sds) is pickled in `cache/`
+    keyed on this file's hash, so a process starts from disk; the play
+    engine's slates run at 5,000 sims (`DEFAULTS["n_sims_slate_play"]`, ~7 s a
+    game), with the sims slider per engine so the warm-up's cache is what the
+    page opens on.
+
+    **Open, in order:** the second-half drift away from 3 (joint TD/FG
+    differential structure); safeties; the 14% OT tie rate under one season of
+    the new rule; drive length while trailing still −0.35 snaps (real trailing
+    drives are the longest; penalties in the two-minute drill are 0.59 a game
+    real, 0.32 engine — pass interference on deep shots is not in the outcome
+    pool as a separate event).
 
 ## 9. Maintenance
 

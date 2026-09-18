@@ -250,12 +250,14 @@ MAX_DRIVES = 16
 
 def run_game(ctx: dict, roster_a: pd.DataFrame, roster_b: pd.DataFrame, team_a: str, team_b: str,
              n_sims: int = 20000, seed: int | None = None, home: str | None = "a",
-             avail=None, wind=None, roof=None, engine: str = "drive") -> dict:
+             avail=None, wind=None, roof=None, engine: str = "drive", progress=None) -> dict:
     """Simulate one game with either engine; identical output shape.
 
     'drive' — this module's drive engine (default everywhere).
     'play'  — `playengine.simulate_game_players`: the play-level engine with
               the same depth charts on top. Builds its tables on first use.
+    `progress(fraction, text)` is called as the play engine's games finish
+    (the drive engine is too quick to need it).
     """
     if engine == "play":
         from . import playengine as PE
@@ -263,7 +265,8 @@ def run_game(ctx: dict, roster_a: pd.DataFrame, roster_b: pd.DataFrame, team_a: 
             PE.attach(ctx)
         tables, sens = ctx["play_engine"]
         return PE.simulate_game_players(tables, sens, ctx, roster_a, roster_b, team_a, team_b,
-                                        n=n_sims, seed=seed, avail=avail, wind=wind, roof=roof, home=home)
+                                        n=n_sims, seed=seed, avail=avail, wind=wind, roof=roof, home=home,
+                                        progress=progress)
     return simulate_game(ctx["ratings"], ctx["wk"], roster_a, roster_b, team_a, team_b,
                          ctx["pass_vol"], ctx["rush_vol"], ctx["rush_def"], ctx["lg_pass"],
                          home=home, n_sims=n_sims, seed=seed, avail=avail, wind=wind, roof=roof,
@@ -387,9 +390,9 @@ def _side_box(rng, wk, roster, team, opponent, drives, score, margin,
     attempts = np.clip(dropbacks - sacks, 0, None)
 
     # --- split targets and carries across the depth chart ------------------
-    tgt_w = rng.dirichlet(np.clip(roster["target_share"].values, 1e-4, None)
+    tgt_w = rng.dirichlet(np.clip(RO.sim_shares(roster, "target_share"), 1e-4, None)
                           * TARGET_CONCENTRATION, size=n)
-    car_w = rng.dirichlet(np.clip(roster["carry_share"].values, 1e-4, None)
+    car_w = rng.dirichlet(np.clip(RO.sim_shares(roster, "carry_share"), 1e-4, None)
                           * CARRY_CONCENTRATION, size=n)
     targeted = rng.binomial(attempts, float(np.clip(target_rate, 0.8, 1.0)))
     targets = _split_counts(targeted, tgt_w)
