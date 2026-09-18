@@ -227,8 +227,9 @@ if not cmp_.empty:
                    "week 2 on (bar the Thursday game); before that the app's shipped projection "
                    "is the Game view).")
         gate = P.promotion_gate(d, use=use, edge=edge)
-        st.markdown(f"**Promotion gate** — the play engine becomes the default (`ui.DEFAULT_ENGINE`, "
-                    f"now *{P.ENGINE_LABELS[UI.DEFAULT_ENGINE]}*) when every line below is met:")
+        st.markdown(f"**Default-engine gate** — the app's default is *{P.ENGINE_LABELS[UI.DEFAULT_ENGINE]}* "
+                    f"(`ui.DEFAULT_ENGINE`). The play engine keeps the default while every line below is "
+                    f"met on the lines both engines projected; a failed line is the signal to look again:")
         st.dataframe(gate.assign(met=np.where(gate["met"], "✅", "—"))
                          .rename(columns={"criterion": "Criterion", "drive": "Drive", "play": "Play", "met": "Met"})
                          .style.format({"Drive": "{:.3f}", "Play": "{:.3f}"}, na_rep="—"),

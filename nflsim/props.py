@@ -614,11 +614,12 @@ PROMOTION_TIER_SLACK = 0.02        # play may trail drive by this much in any li
 
 
 def promotion_gate(d: pd.DataFrame, use: str = "median", edge: float = 0.03) -> pd.DataFrame:
-    """The rule written down before the weeks came in (ROADMAP §16): the play
-    engine replaces the drive engine as the default when, on the same settled
-    lines, it is at least as good on Brier and MAE, its median is calibrated
-    on both yardage markets, and it is not worse in any line tier. One row per
-    criterion with the numbers and whether it is met."""
+    """The rule written down before the weeks came in (ROADMAP §17-18): the
+    play engine holds the default while, on the same settled lines, it is at
+    least as good as the drive engine on Brier and MAE, its median is
+    calibrated on both yardage markets, and it is not worse in any line tier.
+    One row per criterion with the numbers and whether it is met; a failed row
+    is the tripwire to revisit `ui.DEFAULT_ENGINE`."""
     both = d[d["drive_p_over"].notna() & d["play_p_over"].notna() & d["result"].isin(["over", "under"])]
     rows = []
     n = len(both)

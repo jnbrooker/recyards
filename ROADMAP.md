@@ -1028,6 +1028,51 @@ rating if the box-score yardage needs its own anchor.*
     real, 0.32 engine — pass interference on deep shots is not in the outcome
     pool as a separate event).
 
+18. **Play engine the default; kickers in the fantasy projections.**
+    *(2026-09-18.)* `ui.DEFAULT_ENGINE = "play"`. The decision, on the
+    evidence: equal on single-player lines (§17's paired replay), better on
+    games (state-conditioned volumes, timeouts, calibrated variance), and the
+    only engine that can score kickers and defences honestly. The props page's
+    gate is now a *tripwire* rather than a promotion test: the play engine
+    holds the default while it is at least as good as the drive engine on the
+    lines both projected (Brier, median MAE, calibration on both yardage
+    markets, every line tier); a failed row is the signal to revisit. Cost:
+    a play-engine slate is ~80 s against 6 s; the warm-up absorbs it.
+
+    **Kickers.** Every field goal in the play engine already has a distance
+    and a make probability; the fantasy line is a read-off, correlated with
+    the game the way it should be (a red-zone stall is an attempt, a blowout
+    fewer). Added: attempts and makes by the fantasy bands (to 39 / 40-49 /
+    50+) per simulation; per-kicker accuracy as shrunk logit shifts on the
+    league curve by band and on the extra point (`fit_kickers`, from every
+    attempt 2016-25 with a recency weight, 40 attempts to full weight —
+    Dicker, Folk, Aubrey at the top, Moody, Rosas at the bottom); the league
+    curve and the XP rate recency-weighted too (kicking improved: 83% pooled,
+    85% recent); each team's kicker taken from whoever took its most recent
+    kicks in the play feed (the depth-chart and weekly feeds are
+    offence-only). The drive engine gets the same rows from its made field
+    goals and touchdowns per simulation — bands by the league's split of
+    makes, misses by band, the same kicker shifts — so the toggle stays
+    symmetric. `fantasy.KICKER_RULES` (3/4/5, 0 for a miss, 1 an XP) in every
+    preset; K in page 8's positions, pool and breakdown. **League level:**
+    7.95 kicker points a team-game against 8.26 real (2023-25); FG made 1.66
+    vs 1.70, XP 2.08 vs 2.16 — the residual is the engine's known −0.1
+    offensive touchdowns a game, not the kicking.
+
+    **Next: defence / special teams** (two to three days). Points-allowed
+    tiers, sacks, interceptions, fumbles lost, defensive touchdowns and
+    safeties are already per-simulation counters in the play engine, and they
+    are the *opponent's* offensive counters — a defence's interceptions are
+    the opposing quarterback's, which is the joint structure the drive engine
+    cannot give. To add: return touchdowns split from defensive ones (a
+    counter; kickoff-return TDs are already drawn), blocked kicks (in the punt
+    table as `punt_blocked`, unused), defensive strength on sack and INT
+    rates (the `qb.py` profiles the drive engine already uses, as shifts),
+    D/ST scoring rules and rows, drive-engine parity (its defensive TDs are a
+    rate, not tied to the opponent's turnover draws), and a 2023-25 backtest
+    of D/ST points per team-game (derivable from the play feed). Then the
+    same markets in the props ledger.
+
 ## 9. Maintenance
 
 Several constants are fitted on out-of-sample residuals and rest on two

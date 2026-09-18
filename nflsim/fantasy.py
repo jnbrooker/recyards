@@ -26,22 +26,39 @@ from . import data as D
 from . import game as G
 
 # Points per unit. Keys are the breakdown components shown on the page.
+_K = dict(fg_0_39=3.0, fg_40_49=4.0, fg_50=5.0, fg_miss=0.0, xp=1.0)     # kicker scoring, every preset
 PRESETS = {
     "PPR": dict(rec=1.0, rec_yd=0.1, rec_td=6.0, rush_yd=0.1, rush_td=6.0,
-                pass_yd=0.04, pass_td=4.0, int=-2.0),
+                pass_yd=0.04, pass_td=4.0, int=-2.0, **_K),
     "Half PPR": dict(rec=0.5, rec_yd=0.1, rec_td=6.0, rush_yd=0.1, rush_td=6.0,
-                     pass_yd=0.04, pass_td=4.0, int=-2.0),
+                     pass_yd=0.04, pass_td=4.0, int=-2.0, **_K),
     "Standard": dict(rec=0.0, rec_yd=0.1, rec_td=6.0, rush_yd=0.1, rush_td=6.0,
-                     pass_yd=0.04, pass_td=4.0, int=-2.0),
+                     pass_yd=0.04, pass_td=4.0, int=-2.0, **_K),
     "PPR, 6-pt pass TD": dict(rec=1.0, rec_yd=0.1, rec_td=6.0, rush_yd=0.1, rush_td=6.0,
-                              pass_yd=0.04, pass_td=6.0, int=-2.0),
+                              pass_yd=0.04, pass_td=6.0, int=-2.0, **_K),
 }
 
 COMPONENT_LABELS = {
     "rec": "Receptions", "rec_yd": "Rec yards", "rec_td": "Rec TD",
     "rush_yd": "Rush yards", "rush_td": "Rush TD",
     "pass_yd": "Pass yards", "pass_td": "Pass TD", "int": "INT",
+    "fg_0_39": "FG 0-39", "fg_40_49": "FG 40-49", "fg_50": "FG 50+", "fg_miss": "FG missed", "xp": "XP",
 }
+KICKER_RULES = dict(fg_0_39=3.0, fg_40_49=4.0, fg_50=5.0, fg_miss=0.0, xp=1.0)
+
+
+def kicker_points(kick: dict, rules: dict) -> tuple[np.ndarray, dict]:
+    """Per-simulation points for one team's kicker from his made / attempted
+    field goals by band and extra points."""
+    r = {k: rules.get(k, KICKER_RULES[k]) for k in KICKER_RULES}
+    comp = {
+        "fg_0_39": r["fg_0_39"] * kick["fg_made"][:, 0],
+        "fg_40_49": r["fg_40_49"] * kick["fg_made"][:, 1],
+        "fg_50": r["fg_50"] * kick["fg_made"][:, 2],
+        "fg_miss": r["fg_miss"] * (kick["fg_att"] - kick["fg_made"]).sum(axis=1),
+        "xp": r["xp"] * kick["xp_made"],
+    }
+    return sum(comp.values()).astype(float), comp
 
 
 def side_points(side: dict, rules: dict) -> tuple[np.ndarray, dict]:
@@ -113,6 +130,22 @@ def game_projections(sim: dict, rules: dict, game_id: str = "",
                 row["INT"] = float(side["ints"].mean())
             rows.append(row)
             samples[pl["player_id"]] = p.astype(np.float32)
+    # the kickers, one per team, from the game's field goals and tries
+    for team, opp, kick in ((sim["team_a"], sim["team_b"], sim.get("kick_a")),
+                            (sim["team_b"], sim["team_a"], sim.get("kick_b"))):
+        if not kick or kick.get("player_id") is None:
+            continue
+        p, comp = kicker_points(kick, rules)
+        row = dict(player_id=kick["player_id"], Player=kick["name"], Team=team, Opp=opp, Pos="K", Depth=1,
+                   Proj=float(p.mean()), Floor=float(np.percentile(p, 10)), Median=float(np.median(p)),
+                   Ceiling=float(np.percentile(p, 90)), P20=float((p >= 20).mean()), Source="kicks",
+                   game_id=game_id, week=week,
+                   FGA=float(kick["fg_att"].sum(axis=1).mean()), FGM=float(kick["fg_made"].sum(axis=1).mean()),
+                   FG50=float(kick["fg_made"][:, 2].mean()), XP=float(kick["xp_made"].mean()))
+        for key, arr in comp.items():
+            row[f"pts_{key}"] = float(arr.mean())
+        rows.append(row)
+        samples[kick["player_id"]] = p.astype(np.float32)
     return pd.DataFrame(rows), samples
 
 
@@ -179,6 +212,14 @@ def breakdown_table(row: pd.Series) -> pd.DataFrame:
             ("Passing yards", row.get("PassYds", 0.0), "pass_yd", ""),
             ("Passing TD", row.get("PassTD", 0.0), "pass_td", ""),
             ("Interceptions", row.get("INT", 0.0), "int", ""),
+        ]
+    if row.get("Pos") == "K":
+        items = [
+            ("FG made, to 39", row.get("pts_fg_0_39", 0.0) / 3.0 if row.get("pts_fg_0_39") else 0.0, "fg_0_39", ""),
+            ("FG made, 40-49", row.get("pts_fg_40_49", 0.0) / 4.0 if row.get("pts_fg_40_49") else 0.0, "fg_40_49", ""),
+            ("FG made, 50+", row.get("FG50", 0.0), "fg_50", ""),
+            ("FG missed", row.get("FGA", 0.0) - row.get("FGM", 0.0), "fg_miss", ""),
+            ("Extra points", row.get("XP", 0.0), "xp", ""),
         ]
     out = pd.DataFrame([dict(Stat=name, Projected=float(val),
                              Points=float(row.get(f"pts_{key}", 0.0)))

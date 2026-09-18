@@ -363,7 +363,7 @@ DEFAULTS = dict(
     use_injuries=True,
     scoring="PPR",
 )
-DEFAULT_ENGINE = "drive"      # the engine every page opens on — one line to flip (see ROADMAP §16)
+DEFAULT_ENGINE = "play"       # the engine every page opens on — one line to flip; the props page's gate is the tripwire (ROADMAP §18)
 
 
 def sims_picker(engine: str, key: str) -> int:

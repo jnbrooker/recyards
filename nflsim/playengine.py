@@ -64,6 +64,9 @@ CLOCK_DECAY = 0.70                           # per season, thinning the clock po
 # side) plus a factor common to both (tempo, weather, officiating — it moves
 # the total, not the margin). Both sds are solved in `sensitivity` so the
 # neutral engine's margin and total sds land on the harness's residuals.
+FG_BANDS = (39, 49)                          # 0-39 · 40-49 · 50+ (the fantasy bands)
+KICKER_K = 40                                # attempts behind a full-weight kicker shift
+KICKER_DECAY = 0.8                           # per season, on a kicker's history
 TARGET_MARGIN_SD = 12.8                      # backtest.MARGIN_SD: residual around the ratings' expected margin
 TARGET_TOTAL_SD = 13.4                       # the normal the shape gate uses for totals
 CALL_CODE = {"pass": 0, "run": 1, "kneel": 2, "spike": 3}   # integer keys for the samplers
@@ -77,7 +80,8 @@ COLS = ["game_id", "play_id", "season", "week", "season_type", "posteam", "defte
         "kick_distance", "penalty", "penalty_yards", "penalty_team", "first_down",
         "out_of_bounds", "timeout", "two_point_attempt", "two_point_conv_result",
         "extra_point_result", "touchback", "qb_kneel", "qb_spike", "aborted_play",
-        "punt_blocked", "epa", "pass", "rush", "timeout_team", "defteam_timeouts_remaining"]
+        "punt_blocked", "epa", "pass", "rush", "timeout_team", "defteam_timeouts_remaining",
+        "kicker_player_id", "kicker_player_name"]
 
 
 # ---------------------------------------------------------------------------
@@ -491,9 +495,11 @@ def build_tables(plays: pd.DataFrame) -> dict:
     fg = d[(d["play_type"] == "field_goal") & d["field_goal_result"].notna()].copy()
     fg["dist"] = (fg["yardline_100"] + 17).clip(18, 70)
     fg["made"] = (fg["field_goal_result"] == "made").astype(int)
-    # logistic fit of make probability on distance
+    # logistic fit of make probability on distance, recent seasons weighted
+    # (kicking improved over the decade: 83% pooled, 85% in 2023-25)
     x, y = fg["dist"].to_numpy(float), fg["made"].to_numpy(float)
-    tables["fg_coef"] = _logit_fit(x, y)
+    w_k = (KICKER_DECAY ** (latest - fg["season"].astype(int))).to_numpy(float)
+    tables["fg_coef"] = _logit_fit(x, y, w=w_k)
     pu = d[(d["play_type"] == "punt") & d["next_yl"].notna() & (d["next_pos"] != d["posteam"])].copy()
     pu["yl_b"] = yl_bin(pu["yardline_100"])
     pu["res_yl"] = pu["next_yl"]                          # receiving team's yard line to go
@@ -508,7 +514,8 @@ def build_tables(plays: pd.DataFrame) -> dict:
     tables["kickoff_td_rate"] = float(d[(d["play_type"] == "kickoff") & d["season"].isin(KICKOFF_SEASONS)]
                                       ["return_touchdown"].mean())
     xp = d[d["extra_point_result"].notna()]
-    tables["xp_rate"] = float((xp["extra_point_result"] == "good").mean())
+    w_x = KICKER_DECAY ** (latest - xp["season"].astype(int))
+    tables["xp_rate"] = float(np.average(xp["extra_point_result"] == "good", weights=w_x))
     tp = d[d["two_point_attempt"] == 1]
     tables["two_pt_rate"] = float((tp["two_point_conv_result"] == "success").mean())
     # go-for-two decision: the try's row carries the score with the six points
@@ -518,25 +525,73 @@ def build_tables(plays: pd.DataFrame) -> dict:
     tries["sd_b"] = sd_bin(tries["score_differential"].fillna(0))
     tries["t_b"] = time_bin(tries["game_half"], tries["half_seconds_remaining"].fillna(900))
     tables["try_call"] = Table(["sd_b", "t_b"], ["one", "two"]).fit(tries, "try")
+    tables["kickers"] = fit_kickers(d, tables["fg_coef"], tables["xp_rate"])
     return tables
 
 
-def _logit_fit(x, y, iters=200, lr=0.05):
-    """Tiny logistic regression P(y=1) = sigmoid(a + b·x), gradient descent on
-    standardised x — no dependency."""
+def _logit_fit(x, y, iters=200, lr=0.05, w=None):
+    """Tiny weighted logistic regression P(y=1) = sigmoid(a + b·x), gradient
+    descent on standardised x — no dependency."""
+    w = np.ones(len(x)) if w is None else np.asarray(w, float) / np.mean(w)
     mu, sd = x.mean(), x.std()
     z = (x - mu) / sd
     a, b = 0.0, 0.0
     for _ in range(iters):
         p = 1 / (1 + np.exp(-(a + b * z)))
-        a -= lr * (p - y).mean() * 4
-        b -= lr * ((p - y) * z).mean() * 4
+        a -= lr * (w * (p - y)).mean() * 4
+        b -= lr * (w * (p - y) * z).mean() * 4
     return dict(a=a, b=b, mu=mu, sd=sd)
 
 
 def fg_make_prob(coef: dict, dist):
     z = (np.asarray(dist, float) - coef["mu"]) / coef["sd"]
     return 1 / (1 + np.exp(-(coef["a"] + coef["b"] * z)))
+
+
+def fg_band(dist):
+    """0 short (to 39), 1 mid (40-49), 2 long (50+)."""
+    d = np.asarray(dist, float)
+    return np.where(d <= FG_BANDS[0], 0, np.where(d <= FG_BANDS[1], 1, 2))
+
+
+def fit_kickers(plays: pd.DataFrame, coef: dict, xp_rate: float) -> dict:
+    """Per-kicker accuracy: logit shifts on the league make curve by distance
+    band (shrunk toward the kicker's overall shift, then toward zero) and on
+    the extra point, from every attempt with a recency weight."""
+    latest = int(plays["season"].max())
+    fg = plays[(plays["play_type"] == "field_goal") & plays["field_goal_result"].notna() & plays["kicker_player_id"].notna()].copy()
+    fg["dist"] = (fg["yardline_100"] + 17).clip(18, 70)
+    fg["band"] = fg_band(fg["dist"]); fg["kicker"] = fg["kicker_player_id"]
+    w = KICKER_DECAY ** (latest - fg["season"].astype(int))
+    fg_shift = ShiftTable(["kicker", "band"], k=KICKER_K).fit(fg, fg["field_goal_result"] == "made", fg_make_prob(coef, fg["dist"]), w)
+    xp = plays[plays["extra_point_result"].notna() & plays["kicker_player_id"].notna()].copy()
+    xp["kicker"] = xp["kicker_player_id"]
+    wx = KICKER_DECAY ** (latest - xp["season"].astype(int))
+    xp_shift = ShiftTable(["kicker"], k=KICKER_K).fit(xp, xp["extra_point_result"] == "good", np.full(len(xp), xp_rate), wx)
+    names = (pd.concat([fg[["kicker", "kicker_player_name", "season"]], xp[["kicker", "kicker_player_name", "season"]]])
+               .sort_values("season").groupby("kicker")["kicker_player_name"].last().to_dict())
+    n_att = fg.groupby("kicker").size().to_dict()
+    return dict(fg=fg_shift, xp=xp_shift, names=names, attempts=n_att)
+
+
+def team_kickers(plays: pd.DataFrame) -> dict:
+    """team -> (kicker id, name): whoever took the team's most recent kicks."""
+    k = plays[plays["play_type"].isin(["field_goal", "extra_point"]) & plays["kicker_player_id"].notna()]
+    k = k.sort_values(["season", "week", "play_id"])
+    out = {}
+    for team, q in k.groupby("posteam"):
+        last = q.iloc[-1]
+        out[team] = (str(last["kicker_player_id"]), str(last["kicker_player_name"]))
+    return out
+
+
+def kick_shift_for(kickers: dict | None, kicker_id: str | None) -> dict:
+    """The per-side shifts `simulate` takes: three band shifts and one for the
+    extra point; zeros for an unknown kicker."""
+    if kickers is None or kicker_id is None:
+        return dict(fg=np.zeros(3), xp=0.0)
+    return dict(fg=np.array([kickers["fg"].shift((kicker_id, b)) for b in range(3)]),
+                xp=float(kickers["xp"].shift((kicker_id,))))
 
 
 # ---------------------------------------------------------------------------
@@ -562,7 +617,8 @@ STAT_COLS = ["plays", "pass_att", "comp", "pass_yds", "rush_att", "rush_yds", "s
              # the last two minutes of the second half (the end-game gate)
              "late_snaps", "late_pass", "late_fga", "late_punts", "late_to", "late_yds", "late_secs",
              "late_kneels", "late_spikes", "late_pen", "late_pass_yds", "late_sacks", "late_comp", "timeouts_used", "ot_snaps", "ot_punts", "ot_fga", "ot_secs", "ot_yds", "ot_fd",
-             "xp_att", "xp_made", "two_att", "two_made", "safeties"] + [f"snaps_tb{k}" for k in range(8)] + ["secs_tb0", "stops_tb0", "pen_tb0", "kick_secs"]
+             "xp_att", "xp_made", "two_att", "two_made", "safeties",
+             "fg_att_b0", "fg_att_b1", "fg_att_b2", "fg_made_b0", "fg_made_b1", "fg_made_b2"] + [f"snaps_tb{k}" for k in range(8)] + ["secs_tb0", "stops_tb0", "pen_tb0", "kick_secs"]
 LEAD_NAMES = {-1: "trail", 0: "even", 1: "lead"}
 # pass_att excludes sacks (a sack is a dropback, not an attempt); pass_yds is
 # GROSS (sack yardage in sack_yds), so it equals the sum of the receivers' yards
@@ -686,7 +742,7 @@ class _Arrays:
 def simulate(tables: dict, n: int = 10000, seed: int | None = None,
              shift: dict | None = None, home_receives_first: float = 0.5,
              tendency: dict | None = None, game_shift: tuple | None = None,
-             progress=None) -> dict:
+             progress=None, kick_shift: tuple | None = None) -> dict:
     """Play `n` games. `shift` (stage 3) is a per-team yards-per-play shift:
     {'pass': (home, away), 'run': (home, away)} applied to non-penalty gains,
     with the defence's allowance folded in by the caller. `game_shift` is
@@ -701,6 +757,10 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
     if game_shift is None:
         game_shift = tables.get("game_shift", (0.0, 0.0))
     gs = rng.normal(0, game_shift[0], (n, 2)) + rng.normal(0, game_shift[1], (n, 1))
+    # each side's kicker: logit shifts on the league make curve by band, and on the XP
+    ks = kick_shift or (kick_shift_for(None, None), kick_shift_for(None, None))
+    kfg = np.array([ks[0]["fg"], ks[1]["fg"]], float)          # (2, 3)
+    kxp = np.array([ks[0]["xp"], ks[1]["xp"]], float)
     # team tendencies: a logit shift on the pass call (pass rate over expectation)
     # and a multiplier on the clock a play consumes (tempo), per side
     tendency = tendency or {}
@@ -792,7 +852,8 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
             sd = score[idx, pos[idx]] - score[idx, opp(pos[idx])]
             keys = np.c_[sd_bin(sd), time_bin(half[idx], secs[idx])]
             two = _draw_table(rng, tables["try_call"], keys) == 1
-            made1 = (~two) & (rng.random(len(idx)) < tables["xp_rate"])
+            p_xp = _sigmoid(_logit(tables["xp_rate"]) + kxp[pos[idx]])
+            made1 = (~two) & (rng.random(len(idx)) < p_xp)
             made2 = two & (rng.random(len(idx)) < tables["two_pt_rate"])
             score[idx[made1], pos[idx[made1]]] += 1
             score[idx[made2], pos[idx[made2]]] += 2
@@ -1041,9 +1102,15 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
         if fg.any():
             j = np.where(fg)[0]
             dist = yl[idx][j] + 17
-            made = rng.random(len(j)) < fg_make_prob(tables["fg_coef"], dist)
+            band = fg_band(dist)
+            p_fg = _sigmoid(_logit(fg_make_prob(tables["fg_coef"], dist)) + kfg[me[j], band])
+            made = rng.random(len(j)) < p_fg
             stats["fg_att"][idx[j], me[j]] += 1
             stats["fg_made"][idx[j][made], me[j][made]] += 1
+            for b in range(3):
+                mb = band == b
+                stats[f"fg_att_b{b}"][idx[j][mb], me[j][mb]] += 1
+                stats[f"fg_made_b{b}"][idx[j][mb & made], me[j][mb & made]] += 1
             lf = (tb[j] >= 5) & (tb[j] <= 6)
             stats["late_fga"][idx[j][lf], me[j][lf]] += 1
             of = half[idx][j] == 3
@@ -1294,13 +1361,13 @@ def shifts_for(sens: dict, margin: float, total: float) -> dict:
 def simulate_matchup(tables: dict, sens: dict, ratings: dict, home: str, away: str,
                      n: int = 10000, seed: int | None = None, avail=None, wind=None,
                      roof=None, neutral_site: bool = False, tendency: dict | None = None,
-                     progress=None) -> dict:
+                     progress=None, kick_shift: tuple | None = None) -> dict:
     """The engine steered to the ratings' expected margin and total for one game."""
     from . import teams as T
     e = T.expected_points(ratings, home, away, home=None if neutral_site else "a",
                           avail=avail, wind=wind, roof=roof)
     sh = shifts_for(sens, e["margin"], e["total"])
-    sim = simulate(tables, n, seed=seed, shift=sh, tendency=tendency, progress=progress)
+    sim = simulate(tables, n, seed=seed, shift=sh, tendency=tendency, progress=progress, kick_shift=kick_shift)
     sim.update(target_margin=float(e["margin"]), target_total=float(e["total"]),
                shift=sh, home=home, away=away,
                win_home=float((sim["margin"] > 0).mean() + 0.5 * (sim["margin"] == 0).mean()))
@@ -1522,17 +1589,28 @@ def simulate_game_players(tables: dict, sens: dict, ctx: dict,
     rng = np.random.default_rng(seed)
     tend = ctx.get("play_tendencies")
     tendency = tendency_for(tend, team_a, team_b) if tend is not None else None
+    kmap = ctx.get("play_kickers") or {}
+    ka, kb = kmap.get(team_a, (None, None)), kmap.get(team_b, (None, None))
+    kshift = (kick_shift_for(tables.get("kickers"), ka[0]), kick_shift_for(tables.get("kickers"), kb[0]))
     sim = simulate_matchup(tables, sens, ctx["ratings"], team_a, team_b, n=n, seed=seed,
                            avail=avail, wind=wind, roof=roof, neutral_site=(home is None),
-                           tendency=tendency, progress=progress)
+                           tendency=tendency, progress=progress, kick_shift=kshift)
     box_a = allocate_players(rng, ctx, roster_a, team_a, team_b, sim["stats"], 0)
     box_b = allocate_players(rng, ctx, roster_b, team_b, team_a, sim["stats"], 1)
+    st = sim["stats"]
+
+    def kick(side, who):
+        return dict(player_id=who[0], name=who[1], team=(team_a, team_b)[side],
+                    fg_made=np.stack([st[f"fg_made_b{b}"][:, side] for b in range(3)], axis=1),
+                    fg_att=np.stack([st[f"fg_att_b{b}"][:, side] for b in range(3)], axis=1),
+                    xp_made=st["xp_made"][:, side], xp_att=st["xp_att"][:, side])
     return dict(
         team_a=team_a, team_b=team_b, points_a=sim["points_home"], points_b=sim["points_away"],
         drives_a=sim["stats"]["drives"][:, 0], drives_b=sim["stats"]["drives"][:, 1],
         box_a=box_a, box_b=box_b, pace=dict(mean=float(sim["stats"]["drives"].mean())),
         n_sims=n, home=home, engine="play", team_stats=sim["stats"],
         target_margin=sim["target_margin"], target_total=sim["target_total"],
+        kick_a=kick(0, ka), kick_b=kick(1, kb),
     )
 
 
@@ -1593,8 +1671,10 @@ def attach(ctx: dict, progress=None) -> dict:
         except Exception:
             recent, latest = load_plays(), None
         _ENGINE["tendencies"] = team_tendencies(_ENGINE["tables"], recent, latest)
+        _ENGINE["kickers"] = team_kickers(recent)
     ctx["play_engine"] = (_ENGINE["tables"], _ENGINE["sens"])
     ctx["play_tendencies"] = _ENGINE["tendencies"]
+    ctx["play_kickers"] = _ENGINE["kickers"]
     return ctx
 
 

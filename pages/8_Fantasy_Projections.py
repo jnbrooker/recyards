@@ -55,8 +55,8 @@ engine = UI.engine_picker("p8")
 n_sims = UI.sims_picker(engine, "p8")
 
 st.sidebar.divider()
-positions = st.sidebar.multiselect("Positions", ["QB", "RB", "WR", "TE", "FB"],
-                                   default=["QB", "RB", "WR", "TE"])
+positions = st.sidebar.multiselect("Positions", ["QB", "RB", "WR", "TE", "FB", "K"],
+                                   default=["QB", "RB", "WR", "TE", "K"])
 team_filter = st.sidebar.multiselect("Teams (blank = all)", sorted(ctx["ratings"]["off"].index))
 min_proj = st.sidebar.slider("Hide players projected under", 0.0, 10.0, 2.0, 0.5)
 
@@ -156,7 +156,7 @@ st.caption("Pick the starters on each side from this week's slate. Totals are su
            "chance is not just a comparison of two projections. Players on bye are "
            "not listed. Kickers and defenses are not modelled: add them as a constant.")
 
-pool = table[table["Pos"].isin(["QB", "RB", "WR", "TE", "FB"])].reset_index(drop=True)
+pool = table[table["Pos"].isin(["QB", "RB", "WR", "TE", "FB", "K"])].reset_index(drop=True)
 pool_labels = (pool["Player"] + " — " + pool["Team"] + " " + pool["Pos"]
                + " (" + pool["Proj"].map("{:.1f}".format) + ")").tolist()
 label_to_id = dict(zip(pool_labels, pool["player_id"]))
@@ -165,11 +165,11 @@ ca, cb = st.columns(2)
 with ca:
     name_a = st.text_input("Team A name", "Team A")
     picks_a = st.multiselect("Team A starters", pool_labels, key="h2h_a")
-    extra_a = st.number_input("Team A other points (K, DST, …)", value=0.0, step=0.5, key="h2h_xa")
+    extra_a = st.number_input("Team A other points (DST, …)", value=0.0, step=0.5, key="h2h_xa")
 with cb:
     name_b = st.text_input("Team B name", "Team B")
     picks_b = st.multiselect("Team B starters", pool_labels, key="h2h_b")
-    extra_b = st.number_input("Team B other points (K, DST, …)", value=0.0, step=0.5, key="h2h_xb")
+    extra_b = st.number_input("Team B other points (DST, …)", value=0.0, step=0.5, key="h2h_xb")
 
 ids_a = [label_to_id[l] for l in picks_a]
 ids_b = [label_to_id[l] for l in picks_b]

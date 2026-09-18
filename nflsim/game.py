@@ -228,6 +228,7 @@ def simulate_game(ratings: dict, wk: pd.DataFrame,
         mix_a=mix_a, mix_b=mix_b, pace=pace, n_sims=n, home=home,
         avail=avail, avail_shift_a=float(shift_a), avail_shift_b=float(shift_b),
         weather_shift=float(2 * wx), wind=wind, roof=roof,
+        fg_a=sa["n_fg"], fg_b=sb["n_fg"], td_a=sa["n_td"], td_b=sb["n_td"],
     )
 
 
@@ -267,10 +268,50 @@ def run_game(ctx: dict, roster_a: pd.DataFrame, roster_b: pd.DataFrame, team_a: 
         return PE.simulate_game_players(tables, sens, ctx, roster_a, roster_b, team_a, team_b,
                                         n=n_sims, seed=seed, avail=avail, wind=wind, roof=roof, home=home,
                                         progress=progress)
-    return simulate_game(ctx["ratings"], ctx["wk"], roster_a, roster_b, team_a, team_b,
-                         ctx["pass_vol"], ctx["rush_vol"], ctx["rush_def"], ctx["lg_pass"],
-                         home=home, n_sims=n_sims, seed=seed, avail=avail, wind=wind, roof=roof,
-                         target_rate=ctx.get("target_rate"))
+    sim = simulate_game(ctx["ratings"], ctx["wk"], roster_a, roster_b, team_a, team_b,
+                        ctx["pass_vol"], ctx["rush_vol"], ctx["rush_def"], ctx["lg_pass"],
+                        home=home, n_sims=n_sims, seed=seed, avail=avail, wind=wind, roof=roof,
+                        target_rate=ctx.get("target_rate"))
+    sim["kick_a"], sim["kick_b"] = kicker_lines(ctx, sim, seed)
+    return sim
+
+
+# The drive engine scores field goals without distances: made kicks are
+# split into the fantasy bands by the league's split of makes, and misses
+# drawn from each band's miss-to-make ratio (2023-25). The play engine has the
+# real distance of every attempt; this keeps the two engines' kicker rows on
+# the same footing.
+FG_BAND_SHARE = (0.53, 0.28, 0.19)        # attempts: to 39 · 40-49 · 50+
+FG_BAND_MAKE = (0.95, 0.84, 0.69)
+
+
+def kicker_lines(ctx: dict, sim: dict, seed: int | None) -> tuple[dict, dict]:
+    """Kicker rows for the drive engine, from its made field goals and
+    touchdowns per simulation, with the same per-kicker accuracy shifts."""
+    from . import playengine as PE
+    if "play_kickers" not in ctx:
+        try:
+            PE.attach(ctx)
+        except Exception:
+            ctx["play_kickers"] = {}
+    kmap = ctx.get("play_kickers") or {}
+    tables = ctx.get("play_engine", (None,))[0]
+    kickers = tables.get("kickers") if tables else None
+    rng = np.random.default_rng(None if seed is None else seed + 101)
+    share = np.array(FG_BAND_SHARE); base = np.array(FG_BAND_MAKE)
+    out = []
+    for team, made, td in ((sim["team_a"], sim["fg_a"], sim["td_a"]), (sim["team_b"], sim["fg_b"], sim["td_b"])):
+        who = kmap.get(team, (None, None))
+        ks = PE.kick_shift_for(kickers, who[0])
+        p_make = 1 / (1 + np.exp(-(np.log(base / (1 - base)) + ks["fg"])))
+        p_band = share * p_make / (share * p_make).sum()             # P(band | made)
+        fg_made = rng.multinomial(made.astype(int), p_band) if len(made) else np.zeros((0, 3), int)
+        misses = rng.binomial(fg_made, ((1 - p_make) / p_make)[None, :].clip(0, 1))
+        p_xp = 1 / (1 + np.exp(-(np.log(XP_RATE / (1 - XP_RATE)) + ks["xp"])))
+        xp_att = td.astype(int)
+        out.append(dict(player_id=who[0], name=who[1], team=team, fg_made=fg_made, fg_att=fg_made + misses,
+                        xp_made=rng.binomial(xp_att, p_xp), xp_att=xp_att))
+    return out[0], out[1]
 
 
 def _score_sides(rng, drives_a: np.ndarray, drives_b: np.ndarray, mix_a: dict, mix_b: dict,
