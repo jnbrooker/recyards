@@ -27,15 +27,18 @@ from . import game as G
 
 # Points per unit. Keys are the breakdown components shown on the page.
 _K = dict(fg_0_39=3.0, fg_40_49=4.0, fg_50=5.0, fg_miss=0.0, xp=1.0)     # kicker scoring, every preset
+_D = dict(dst_sack=1.0, dst_int=2.0, dst_fum=2.0, dst_td=6.0, dst_safety=2.0, dst_block=2.0)   # D/ST events
+# points allowed, the standard tiers: (up to, points)
+DST_PA_TIERS = ((0, 10.0), (6, 7.0), (13, 4.0), (20, 1.0), (27, 0.0), (34, -1.0), (999, -4.0))
 PRESETS = {
     "PPR": dict(rec=1.0, rec_yd=0.1, rec_td=6.0, rush_yd=0.1, rush_td=6.0,
-                pass_yd=0.04, pass_td=4.0, int=-2.0, **_K),
+                pass_yd=0.04, pass_td=4.0, int=-2.0, **_K, **_D),
     "Half PPR": dict(rec=0.5, rec_yd=0.1, rec_td=6.0, rush_yd=0.1, rush_td=6.0,
-                     pass_yd=0.04, pass_td=4.0, int=-2.0, **_K),
+                     pass_yd=0.04, pass_td=4.0, int=-2.0, **_K, **_D),
     "Standard": dict(rec=0.0, rec_yd=0.1, rec_td=6.0, rush_yd=0.1, rush_td=6.0,
-                     pass_yd=0.04, pass_td=4.0, int=-2.0, **_K),
+                     pass_yd=0.04, pass_td=4.0, int=-2.0, **_K, **_D),
     "PPR, 6-pt pass TD": dict(rec=1.0, rec_yd=0.1, rec_td=6.0, rush_yd=0.1, rush_td=6.0,
-                              pass_yd=0.04, pass_td=6.0, int=-2.0, **_K),
+                              pass_yd=0.04, pass_td=6.0, int=-2.0, **_K, **_D),
 }
 
 COMPONENT_LABELS = {
@@ -43,7 +46,31 @@ COMPONENT_LABELS = {
     "rush_yd": "Rush yards", "rush_td": "Rush TD",
     "pass_yd": "Pass yards", "pass_td": "Pass TD", "int": "INT",
     "fg_0_39": "FG 0-39", "fg_40_49": "FG 40-49", "fg_50": "FG 50+", "fg_miss": "FG missed", "xp": "XP",
+    "dst_sack": "D/ST sack", "dst_int": "D/ST INT", "dst_fum": "D/ST fumble rec", "dst_td": "D/ST TD",
+    "dst_safety": "D/ST safety", "dst_block": "D/ST blocked kick", "dst_pa": "D/ST points allowed",
 }
+KICKER_KEYS = ("fg_0_39", "fg_40_49", "fg_50", "fg_miss", "xp")
+DST_KEYS = ("dst_sack", "dst_int", "dst_fum", "dst_td", "dst_safety", "dst_block")
+
+
+def pa_points(pa: np.ndarray) -> np.ndarray:
+    """Points-allowed tier points for an array of points allowed."""
+    out = np.full(len(pa), DST_PA_TIERS[-1][1])
+    for upto, pts in reversed(DST_PA_TIERS):
+        out = np.where(pa <= upto, pts, out)
+    return out
+
+
+def dst_points(dst: dict, rules: dict) -> tuple[np.ndarray, dict]:
+    """Per-simulation points for one team's defence / special teams."""
+    r = {k: rules.get(k, _D[k]) for k in _D}
+    comp = {
+        "dst_sack": r["dst_sack"] * dst["sacks"], "dst_int": r["dst_int"] * dst["ints"],
+        "dst_fum": r["dst_fum"] * dst["fum"], "dst_td": r["dst_td"] * dst["td"],
+        "dst_safety": r["dst_safety"] * dst["safeties"], "dst_block": r["dst_block"] * dst["blocks"],
+        "dst_pa": pa_points(np.asarray(dst["pa"])),
+    }
+    return sum(comp.values()).astype(float), comp
 KICKER_RULES = dict(fg_0_39=3.0, fg_40_49=4.0, fg_50=5.0, fg_miss=0.0, xp=1.0)
 
 
@@ -146,6 +173,24 @@ def game_projections(sim: dict, rules: dict, game_id: str = "",
             row[f"pts_{key}"] = float(arr.mean())
         rows.append(row)
         samples[kick["player_id"]] = p.astype(np.float32)
+    # the defences, one per team
+    for team, opp, dst in ((sim["team_a"], sim["team_b"], sim.get("dst_a")),
+                           (sim["team_b"], sim["team_a"], sim.get("dst_b"))):
+        if not dst:
+            continue
+        p, comp = dst_points(dst, rules)
+        pid = f"DST_{team}"
+        row = dict(player_id=pid, Player=f"{team} D/ST", Team=team, Opp=opp, Pos="DST", Depth=1,
+                   Proj=float(p.mean()), Floor=float(np.percentile(p, 10)), Median=float(np.median(p)),
+                   Ceiling=float(np.percentile(p, 90)), P20=float((p >= 20).mean()), Source="game",
+                   game_id=game_id, week=week,
+                   Sacks=float(np.mean(dst["sacks"])), INTs=float(np.mean(dst["ints"])), FumRec=float(np.mean(dst["fum"])),
+                   DefTD=float(np.mean(dst["td"])), Safeties=float(np.mean(dst["safeties"])), Blocks=float(np.mean(dst["blocks"])),
+                   PA=float(np.mean(dst["pa"])))
+        for key, arr in comp.items():
+            row[f"pts_{key}"] = float(arr.mean())
+        rows.append(row)
+        samples[pid] = p.astype(np.float32)
     return pd.DataFrame(rows), samples
 
 
@@ -212,6 +257,13 @@ def breakdown_table(row: pd.Series) -> pd.DataFrame:
             ("Passing yards", row.get("PassYds", 0.0), "pass_yd", ""),
             ("Passing TD", row.get("PassTD", 0.0), "pass_td", ""),
             ("Interceptions", row.get("INT", 0.0), "int", ""),
+        ]
+    if row.get("Pos") == "DST":
+        items = [
+            ("Sacks", row.get("Sacks", 0.0), "dst_sack", ""), ("Interceptions", row.get("INTs", 0.0), "dst_int", ""),
+            ("Fumbles recovered", row.get("FumRec", 0.0), "dst_fum", ""), ("Defensive / return TD", row.get("DefTD", 0.0), "dst_td", ""),
+            ("Safeties", row.get("Safeties", 0.0), "dst_safety", ""), ("Blocked kicks", row.get("Blocks", 0.0), "dst_block", ""),
+            ("Points allowed", row.get("PA", 0.0), "dst_pa", ""),
         ]
     if row.get("Pos") == "K":
         items = [

@@ -229,6 +229,7 @@ def simulate_game(ratings: dict, wk: pd.DataFrame,
         avail=avail, avail_shift_a=float(shift_a), avail_shift_b=float(shift_b),
         weather_shift=float(2 * wx), wind=wind, roof=roof,
         fg_a=sa["n_fg"], fg_b=sb["n_fg"], td_a=sa["n_td"], td_b=sb["n_td"],
+        to_a=sa["n_to"], to_b=sb["n_to"], def_td_a=sa["n_def_td"], def_td_b=sb["n_def_td"],
     )
 
 
@@ -273,7 +274,30 @@ def run_game(ctx: dict, roster_a: pd.DataFrame, roster_b: pd.DataFrame, team_a: 
                         home=home, n_sims=n_sims, seed=seed, avail=avail, wind=wind, roof=roof,
                         target_rate=ctx.get("target_rate"))
     sim["kick_a"], sim["kick_b"] = kicker_lines(ctx, sim, seed)
+    sim["dst_a"], sim["dst_b"] = dst_lines(sim, seed)
     return sim
+
+
+# Defence / special teams from the drive engine: the opponent's sacks and
+# interceptions (the QB models), fumbles as the rest of its turnovers, the
+# defensive touchdowns it drew, points allowed; safeties and blocked kicks at
+# league rates (it has no mechanism for either).
+LG_SAFETY_RATE = 0.027                    # per team-game, 2023-25
+LG_BLOCK_RATE = 0.06                      # blocked punts and field goals per team-game
+
+
+def dst_lines(sim: dict, seed: int | None) -> tuple[dict, dict]:
+    rng = np.random.default_rng(None if seed is None else seed + 202)
+    n = len(sim["points_a"])
+    out = []
+    for team, box_opp, to_opp, def_td, pa in ((sim["team_a"], sim["box_b"], sim["to_b"], sim["def_td_a"], sim["points_b"]),
+                                              (sim["team_b"], sim["box_a"], sim["to_a"], sim["def_td_b"], sim["points_a"])):
+        ints = box_opp["ints"].astype(int)
+        out.append(dict(team=team, sacks=box_opp["sacks"].astype(int), ints=ints,
+                        fum=np.clip(to_opp.astype(int) - ints, 0, None), td=def_td.astype(int),
+                        safeties=rng.poisson(LG_SAFETY_RATE, n), blocks=rng.poisson(LG_BLOCK_RATE, n),
+                        pa=pa.astype(int)))
+    return out[0], out[1]
 
 
 # The drive engine scores field goals without distances: made kicks are
@@ -378,9 +402,31 @@ def _score_sides(rng, drives_a: np.ndarray, drives_b: np.ndarray, mix_a: dict, m
         n_other = rng.poisson(np.full(n, max(r.get("lg_other_ppg", 0.0), 0.0) / 7.0))
         take = n_def_td + n_other
         takeaway_points = 6 * take + rng.binomial(take, XP_RATE)
-        out.append(dict(n_td=s["n_td"], n_fg=s["n_fg"], n_to=s["n_to"],
+        out.append(dict(n_td=s["n_td"], n_fg=s["n_fg"], n_to=s["n_to"], n_def_td=n_def_td,
                         off_points=s["pts"], takeaway_points=takeaway_points))
     return out[0], out[1]
+
+
+def pass_disruption_rates(wk, roster, opponent, ratings, lg_pass):
+    """This offence's sack rate per dropback and interception rate per
+    attempt against this defence: the QB1's own rates (Phase 4 priors, time
+    to throw) moved by the defence's league-relative log-odds, shrunk. Both
+    engines price sacks and interceptions from this. Returns (qb_priors,
+    sack_rate, int_rate); (None, league, league) without a quarterback."""
+    qb_row = roster[roster["position"] == "QB"]
+    if not len(qb_row) or lg_pass is None:
+        return None, float(lg_pass["sack"]) if lg_pass else 0.065, float(lg_pass["intr"]) if lg_pass else 0.023
+    try:
+        qb_priors = Q.qb_priors(wk, qb_row.iloc[0]["player_id"], lg_pass)
+    except Exception:
+        return None, float(lg_pass["sack"]), float(lg_pass["intr"])
+    dprof = (ratings.get("pass_def") or {}).get(opponent)
+    s_rate = (D.combine_rate_logodds(qb_priors["p_sack"] * qb_priors["ttt_mult"],
+                                     dprof["r_sack"], lg_pass["sack"], Q.DEFAULT_SACK_DEF_SHRINK)
+              if dprof else qb_priors["p_sack"] * qb_priors["ttt_mult"])
+    i_rate = (D.combine_rate_logodds(qb_priors["p_int"], dprof["r_int"], lg_pass["intr"], Q.DEFAULT_INT_DEF_SHRINK)
+              if dprof else qb_priors["p_int"])
+    return qb_priors, float(s_rate), float(i_rate)
 
 
 def _side_box(rng, wk, roster, team, opponent, drives, score, margin,
@@ -408,26 +454,13 @@ def _side_box(rng, wk, roster, team, opponent, drives, score, margin,
     carries = np.round(plays * (1 - pass_frac)).astype(int)
 
     # --- sacks & INTs (Phase 4 models) ------------------------------------
-    qb_row = roster[roster["position"] == "QB"]
     sacks = np.zeros(n, dtype=int)
     ints = np.zeros(n, dtype=int)
-    qb_priors = None
-    if len(qb_row) and lg_pass is not None:
-        try:
-            qb_priors = Q.qb_priors(wk, qb_row.iloc[0]["player_id"], lg_pass)
-            dprof = (ratings.get("pass_def") or {}).get(opponent)
-            s_rate = (D.combine_rate_logodds(qb_priors["p_sack"] * qb_priors["ttt_mult"],
-                                             dprof["r_sack"], lg_pass["sack"],
-                                             Q.DEFAULT_SACK_DEF_SHRINK)
-                      if dprof else qb_priors["p_sack"] * qb_priors["ttt_mult"])
-            i_rate = (D.combine_rate_logodds(qb_priors["p_int"], dprof["r_int"],
-                                             lg_pass["intr"], Q.DEFAULT_INT_DEF_SHRINK)
-                      if dprof else qb_priors["p_int"])
-            sacks = rng.binomial(dropbacks, float(np.clip(s_rate, 1e-4, 0.5)))
-            attempts = np.clip(dropbacks - sacks, 0, None)
-            ints = rng.binomial(attempts, float(np.clip(i_rate, 1e-4, 0.4)))
-        except Exception:
-            qb_priors = None
+    qb_priors, s_rate, i_rate = pass_disruption_rates(wk, roster, opponent, ratings, lg_pass)
+    if qb_priors is not None:
+        sacks = rng.binomial(dropbacks, float(np.clip(s_rate, 1e-4, 0.5)))
+        attempts = np.clip(dropbacks - sacks, 0, None)
+        ints = rng.binomial(attempts, float(np.clip(i_rate, 1e-4, 0.4)))
     attempts = np.clip(dropbacks - sacks, 0, None)
 
     # --- split targets and carries across the depth chart ------------------

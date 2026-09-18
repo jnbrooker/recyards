@@ -352,8 +352,8 @@ class Sampler:
         self.keys = keys
         self.cells: dict[tuple, np.ndarray] = {}
 
-    def fit(self, df: pd.DataFrame):
-        idx = np.arange(len(df))
+    def fit(self, df: pd.DataFrame, idx=None):
+        idx = np.arange(len(df)) if idx is None else np.asarray(idx)
         for depth in range(len(self.keys), 0, -1):
             ks = self.keys[:depth]
             g = pd.DataFrame({k: df[k].to_numpy() for k in ks}).assign(_i=idx)
@@ -466,6 +466,19 @@ def build_tables(plays: pd.DataFrame) -> dict:
                               "ret_td", "clock_stop", "auto_fd", "safety", "sack", "complete_pass",
                               "to_yl", "epa"]].copy()
     tables["outcome_sampler"] = Sampler(["call", "hurry", "down_i", "ytg_b", "yl_b"]).fit(tables["outcomes"])
+    # pools for pricing a matchup's sacks and interceptions: a sampled pass
+    # play is swapped for a sack (or a sack for a clean dropback) at the rate
+    # that moves this offence-against-this-defence to its own rate; likewise
+    # interceptions among non-sack attempts
+    o = tables["outcomes"]; keys5 = ["call", "hurry", "down_i", "ytg_b", "yl_b"]
+    pas = o[(o["call"] == 0) & (o["is_pen"] == 0)]
+    tables["sack_sampler"] = Sampler(keys5).fit(pas[pas["sack"] == 1], pas.index[pas["sack"] == 1].to_numpy())
+    tables["nosack_sampler"] = Sampler(keys5).fit(pas[pas["sack"] == 0], pas.index[pas["sack"] == 0].to_numpy())
+    att = pas[pas["sack"] == 0]
+    tables["int_sampler"] = Sampler(keys5).fit(att[att["to_int"] == 1], att.index[att["to_int"] == 1].to_numpy())
+    tables["noint_sampler"] = Sampler(keys5).fit(att[att["to_int"] == 0], att.index[att["to_int"] == 0].to_numpy())
+    tables["lg_sack"] = float(pas["sack"].mean())            # per dropback
+    tables["lg_int"] = float(att["to_int"].mean())           # per attempt
 
     # --- clock: seconds to the next play, by kind of play and part of game --
     ck = scrim[scrim["call"].isin(["pass", "run", "kneel", "spike"])].copy()
@@ -503,8 +516,9 @@ def build_tables(plays: pd.DataFrame) -> dict:
     pu = d[(d["play_type"] == "punt") & d["next_yl"].notna() & (d["next_pos"] != d["posteam"])].copy()
     pu["yl_b"] = yl_bin(pu["yardline_100"])
     pu["res_yl"] = pu["next_yl"]                          # receiving team's yard line to go
+    pu["ret_td"] = pu["return_touchdown"].fillna(0).astype(int)
     pu = pu.reset_index(drop=True)
-    tables["punts"] = pu[["yl_b", "res_yl", "punt_blocked"]].copy()
+    tables["punts"] = pu[["yl_b", "res_yl", "punt_blocked", "ret_td"]].copy()
     tables["punt_sampler"] = Sampler(["yl_b"]).fit(tables["punts"])
     # on a kickoff the feed's `posteam` is the RECEIVING team, so the next play
     # (their first snap) has the same posteam
@@ -618,7 +632,8 @@ STAT_COLS = ["plays", "pass_att", "comp", "pass_yds", "rush_att", "rush_yds", "s
              "late_snaps", "late_pass", "late_fga", "late_punts", "late_to", "late_yds", "late_secs",
              "late_kneels", "late_spikes", "late_pen", "late_pass_yds", "late_sacks", "late_comp", "timeouts_used", "ot_snaps", "ot_punts", "ot_fga", "ot_secs", "ot_yds", "ot_fd",
              "xp_att", "xp_made", "two_att", "two_made", "safeties",
-             "fg_att_b0", "fg_att_b1", "fg_att_b2", "fg_made_b0", "fg_made_b1", "fg_made_b2"] + [f"snaps_tb{k}" for k in range(8)] + ["secs_tb0", "stops_tb0", "pen_tb0", "kick_secs"]
+             "fg_att_b0", "fg_att_b1", "fg_att_b2", "fg_made_b0", "fg_made_b1", "fg_made_b2",
+             "blocks"] + [f"snaps_tb{k}" for k in range(8)] + ["secs_tb0", "stops_tb0", "pen_tb0", "kick_secs"]
 LEAD_NAMES = {-1: "trail", 0: "even", 1: "lead"}
 # pass_att excludes sacks (a sack is a dropback, not an attempt); pass_yds is
 # GROSS (sack yardage in sack_yds), so it equals the sum of the receivers' yards
@@ -737,12 +752,14 @@ class _Arrays:
         self.to_yl = o["to_yl"].to_numpy(float)
         self.dt = tables["clock"]["dt"].to_numpy(float)
         self.punt_yl = tables["punts"]["res_yl"].to_numpy(float)
+        self.punt_blocked = tables["punts"]["punt_blocked"].to_numpy(int)
+        self.punt_ret_td = tables["punts"]["ret_td"].to_numpy(int)
 
 
 def simulate(tables: dict, n: int = 10000, seed: int | None = None,
              shift: dict | None = None, home_receives_first: float = 0.5,
              tendency: dict | None = None, game_shift: tuple | None = None,
-             progress=None, kick_shift: tuple | None = None) -> dict:
+             progress=None, kick_shift: tuple | None = None, disrupt: dict | None = None) -> dict:
     """Play `n` games. `shift` (stage 3) is a per-team yards-per-play shift:
     {'pass': (home, away), 'run': (home, away)} applied to non-penalty gains,
     with the defence's allowance folded in by the caller. `game_shift` is
@@ -761,6 +778,10 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
     ks = kick_shift or (kick_shift_for(None, None), kick_shift_for(None, None))
     kfg = np.array([ks[0]["fg"], ks[1]["fg"]], float)          # (2, 3)
     kxp = np.array([ks[0]["xp"], ks[1]["xp"]], float)
+    # each offence's sack rate per dropback and INT rate per attempt against
+    # this defence (game.pass_disruption_rates); None = the league's pools as they are
+    s_rate = np.array(disrupt["sack"], float) if disrupt else None
+    i_rate = np.array(disrupt["int"], float) if disrupt else None
     # team tendencies: a logit shift on the pass call (pass rate over expectation)
     # and a multiplier on the clock a play consumes (tempo), per side
     tendency = tendency or {}
@@ -928,6 +949,32 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
             hurry = np.isin(tb[j], (1, 5, 6)).astype(int)
             keys = np.c_[cname, hurry, np.minimum(down[idx][j], 4), gb[j], yb[j]].astype(int)
             rows = _draw_rows(rng, tables["outcome_sampler"], keys)
+            if s_rate is not None:
+                # move this side's sacks from the pool's rate to its own: thin
+                # sampled sacks below it, convert clean dropbacks above it
+                ip = (cname == 0) & (A.is_pen[rows] == 0)
+                sk = A.sack[rows] == 1
+                tgt = np.clip(s_rate[me[j]], 1e-4, 0.5); base = tables["lg_sack"]
+                keep = np.clip(tgt / base, 0, 1); conv = np.clip((tgt - base) / (1 - base), 0, 1)
+                u = rng.random(len(j))
+                drop = ip & sk & (u >= keep)
+                add = ip & ~sk & (u < conv)
+                if drop.any():
+                    rows[drop] = _draw_rows(rng, tables["nosack_sampler"], keys[drop])
+                if add.any():
+                    rows[add] = _draw_rows(rng, tables["sack_sampler"], keys[add])
+            if i_rate is not None:
+                ip = (cname == 0) & (A.is_pen[rows] == 0) & (A.sack[rows] == 0)
+                it = A.to_int[rows] == 1
+                tgt = np.clip(i_rate[me[j]], 1e-4, 0.4); base = tables["lg_int"]
+                keep = np.clip(tgt / base, 0, 1); conv = np.clip((tgt - base) / (1 - base), 0, 1)
+                u = rng.random(len(j))
+                drop = ip & it & (u >= keep)
+                add = ip & ~it & (u < conv)
+                if drop.any():
+                    rows[drop] = _draw_rows(rng, tables["noint_sampler"], keys[drop])
+                if add.any():
+                    rows[add] = _draw_rows(rng, tables["int_sampler"], keys[add])
             gain = A.gain[rows].copy()
             pen = A.is_pen[rows] == 1
             # downs 2-4: yards relative to the sticks, plus this state's distance
@@ -1022,10 +1069,11 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
             td[j[scored]] = True
             stats["pass_td"][idx[j][scored & is_pass], me[j][scored & is_pass]] += 1
             stats["rush_td"][idx[j][scored & ~is_pass], me[j][scored & ~is_pass]] += 1
-            own_saf = rj & ~scored & (ny >= 100)
-            saf[j[own_saf]] = True
-            adv = rj & ~scored & ~own_saf
-            new_yl[j[adv]] = ny[adv]
+            # a safety is the sampled play's own flag (the pools inside the own
+            # 5 carry it at the real rate); a loss that would cross the goal
+            # line from a row sampled a yard or two further out is not one
+            adv = rj & ~scored
+            new_yl[j[adv]] = np.minimum(ny[adv], 99)
             first = adv & (gain >= ytg[idx][j])
             stats["first_downs"][idx[j][first], me[j][first]] += 1
             stats["ot_fd"][idx[j][first & oth], me[j][first & oth]] += 1
@@ -1091,6 +1139,12 @@ def simulate(tables: dict, n: int = 10000, seed: int | None = None,
             rows = _draw_rows(rng, tables["punt_sampler"], yb[j].reshape(-1, 1))
             flip[j] = True; flip_yl[j] = np.clip(A.punt_yl[rows], 1, 99)
             stats["punts"][idx[j], me[j]] += 1
+            blk = A.punt_blocked[rows] == 1
+            stats["blocks"][idx[j][blk], them[j][blk]] += 1
+            # a punt returned for a touchdown: the receiving team scores and tries
+            prt = A.punt_ret_td[rows] == 1
+            if prt.any():
+                dtd[j[prt]] = True; flip[j[prt]] = False
             lp = (tb[j] >= 5) & (tb[j] <= 6)
             stats["late_punts"][idx[j][lp], me[j][lp]] += 1
             op = half[idx][j] == 3
@@ -1361,13 +1415,13 @@ def shifts_for(sens: dict, margin: float, total: float) -> dict:
 def simulate_matchup(tables: dict, sens: dict, ratings: dict, home: str, away: str,
                      n: int = 10000, seed: int | None = None, avail=None, wind=None,
                      roof=None, neutral_site: bool = False, tendency: dict | None = None,
-                     progress=None, kick_shift: tuple | None = None) -> dict:
+                     progress=None, kick_shift: tuple | None = None, disrupt: dict | None = None) -> dict:
     """The engine steered to the ratings' expected margin and total for one game."""
     from . import teams as T
     e = T.expected_points(ratings, home, away, home=None if neutral_site else "a",
                           avail=avail, wind=wind, roof=roof)
     sh = shifts_for(sens, e["margin"], e["total"])
-    sim = simulate(tables, n, seed=seed, shift=sh, tendency=tendency, progress=progress, kick_shift=kick_shift)
+    sim = simulate(tables, n, seed=seed, shift=sh, tendency=tendency, progress=progress, kick_shift=kick_shift, disrupt=disrupt)
     sim.update(target_margin=float(e["margin"]), target_total=float(e["total"]),
                shift=sh, home=home, away=away,
                win_home=float((sim["margin"] > 0).mean() + 0.5 * (sim["margin"] == 0).mean()))
@@ -1592,9 +1646,14 @@ def simulate_game_players(tables: dict, sens: dict, ctx: dict,
     kmap = ctx.get("play_kickers") or {}
     ka, kb = kmap.get(team_a, (None, None)), kmap.get(team_b, (None, None))
     kshift = (kick_shift_for(tables.get("kickers"), ka[0]), kick_shift_for(tables.get("kickers"), kb[0]))
+    # each offence's sack and interception rates against the other's defence
+    from . import game as G
+    _, sa_, ia_ = G.pass_disruption_rates(ctx["wk"], roster_a, team_b, ctx["ratings"], ctx.get("lg_pass"))
+    _, sb_, ib_ = G.pass_disruption_rates(ctx["wk"], roster_b, team_a, ctx["ratings"], ctx.get("lg_pass"))
+    disrupt = dict(sack=(sa_, sb_), int=(ia_, ib_))
     sim = simulate_matchup(tables, sens, ctx["ratings"], team_a, team_b, n=n, seed=seed,
                            avail=avail, wind=wind, roof=roof, neutral_site=(home is None),
-                           tendency=tendency, progress=progress, kick_shift=kshift)
+                           tendency=tendency, progress=progress, kick_shift=kshift, disrupt=disrupt)
     box_a = allocate_players(rng, ctx, roster_a, team_a, team_b, sim["stats"], 0)
     box_b = allocate_players(rng, ctx, roster_b, team_b, team_a, sim["stats"], 1)
     st = sim["stats"]
@@ -1604,13 +1663,21 @@ def simulate_game_players(tables: dict, sens: dict, ctx: dict,
                     fg_made=np.stack([st[f"fg_made_b{b}"][:, side] for b in range(3)], axis=1),
                     fg_att=np.stack([st[f"fg_att_b{b}"][:, side] for b in range(3)], axis=1),
                     xp_made=st["xp_made"][:, side], xp_att=st["xp_att"][:, side])
+
+    def dst(side):
+        # a defence's sacks, interceptions and fumbles are the opponent's
+        # offensive counters; its touchdowns, safeties and blocks its own
+        opp = 1 - side
+        return dict(team=(team_a, team_b)[side], sacks=st["sacks"][:, opp], ints=st["ints"][:, opp],
+                    fum=st["fum_lost"][:, opp], td=st["def_td"][:, side], safeties=st["safeties"][:, side],
+                    blocks=st["blocks"][:, side], pa=(sim["points_away"], sim["points_home"])[side])
     return dict(
         team_a=team_a, team_b=team_b, points_a=sim["points_home"], points_b=sim["points_away"],
         drives_a=sim["stats"]["drives"][:, 0], drives_b=sim["stats"]["drives"][:, 1],
         box_a=box_a, box_b=box_b, pace=dict(mean=float(sim["stats"]["drives"].mean())),
         n_sims=n, home=home, engine="play", team_stats=sim["stats"],
         target_margin=sim["target_margin"], target_total=sim["target_total"],
-        kick_a=kick(0, ka), kick_b=kick(1, kb),
+        kick_a=kick(0, ka), kick_b=kick(1, kb), dst_a=dst(0), dst_b=dst(1),
     )
 
 

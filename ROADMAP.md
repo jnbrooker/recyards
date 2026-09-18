@@ -1059,19 +1059,34 @@ rating if the box-score yardage needs its own anchor.*
     vs 1.70, XP 2.08 vs 2.16 — the residual is the engine's known −0.1
     offensive touchdowns a game, not the kicking.
 
-    **Next: defence / special teams** (two to three days). Points-allowed
-    tiers, sacks, interceptions, fumbles lost, defensive touchdowns and
-    safeties are already per-simulation counters in the play engine, and they
-    are the *opponent's* offensive counters — a defence's interceptions are
-    the opposing quarterback's, which is the joint structure the drive engine
-    cannot give. To add: return touchdowns split from defensive ones (a
-    counter; kickoff-return TDs are already drawn), blocked kicks (in the punt
-    table as `punt_blocked`, unused), defensive strength on sack and INT
-    rates (the `qb.py` profiles the drive engine already uses, as shifts),
-    D/ST scoring rules and rows, drive-engine parity (its defensive TDs are a
-    rate, not tied to the opponent's turnover draws), and a 2023-25 backtest
-    of D/ST points per team-game (derivable from the play feed). Then the
-    same markets in the props ledger.
+    **Defence / special teams — built the same afternoon.** Every event a
+    D/ST scores is a per-simulation counter, and the defence's sacks,
+    interceptions and fumbles ARE the opposing offence's — Mahomes' 0.77
+    interceptions in a fixture are DEN D/ST's 0.77, by identity, which is the
+    joint structure the drive engine cannot give. Added to the play engine:
+    each offence's sack rate per dropback and interception rate per attempt
+    against this defence, from the same QB-priors × defence-profile
+    combination the drive engine has always used (`game.pass_disruption_rates`,
+    now shared), applied by swapping sampled pass plays for sacks (or sacks
+    for clean dropbacks) and attempts for interceptions at the rate that moves
+    the pool to the matchup's own — the swapped-in rows come from sack-only /
+    interception-only pools keyed on the same state, so yards, clock and field
+    position stay real; punt-return touchdowns and blocked punts from the punt
+    table; D/ST lines with the game. The drive engine's rows come from the
+    opponent's box (sacks, interceptions, the rest of its turnovers as
+    fumbles), its defensive-touchdown draw, and league-rate safeties and
+    blocks. Scoring: 1 / 2 / 2 / 6 / 2 / 2 for sack / INT / fumble / TD /
+    safety / block, points-allowed tiers 10 / 7 / 4 / 1 / 0 / −1 / −4
+    (`fantasy.DST_PA_TIERS`), the event points editable. **League level
+    (2023-25):** 6.62 D/ST points a team-game against 6.28 real — sacks 2.35
+    vs 2.46, INTs 0.78 vs 0.73, fumbles 0.47 vs 0.44, touchdowns 0.13 vs 0.12,
+    points-allowed tiers within 2 pp — and the check found the safety excess:
+    the engine flagged a safety both from the sampled play's own flag and
+    from a loss crossing the goal line, so a row sampled from the own 4 and
+    applied at the own 2 made one twice over; the pool's flag alone gives
+    0.022 a team-game (real 0.027). Not modelled: blocked field goals (blocks
+    0.02 vs 0.05). Page 8 shows K and D/ST by default; both are in the
+    head-to-head pool. Next for both: the same markets in the props ledger.
 
 ## 9. Maintenance
 

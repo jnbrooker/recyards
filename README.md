@@ -23,7 +23,7 @@ numbers below are what the harness says, not what the fit said.
 | Interceptions | INTs thrown per attempt, heavily regressed, vs the opponent's secondary |
 | Team Strength | opponent-adjusted points per drive, pace, home field — the base of the game model |
 | Game Simulation | a real fixture: score distribution, win probability, box score, availability, wind |
-| Fantasy Projections | the whole slate scored per simulation (PPR / half / standard), floor and ceiling, kickers included |
+| Fantasy Projections | the whole slate scored per simulation (PPR / half / standard), floor and ceiling, kickers and D/ST included |
 | Pick'em | a 20-slot confidence card graded from the simulated margins and totals |
 | Backtest | every model scored week by week out of sample, vs the closing line and a trailing average |
 | Prop Evaluation | this week's player-prop lines (The Odds API, on request) beside three frozen projections (drive engine, play engine, Game view), settled automatically, graded against the book and against each other, with the play engine's promotion gate |
