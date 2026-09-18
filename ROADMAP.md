@@ -984,12 +984,21 @@ rating if the box-score yardage needs its own anchor.*
     margins, TD-versus-two-FG offsets, not the end-game any more), margin sd
     −0.8, safeties 2×, ties 0.6% vs 0.4%.
 
-    **Players (2025 weeks 2-18, 5 games a week, both engines on identical
-    as-of inputs):** receiving MAE / CRPS 18.82 / 13.02 (drive) vs 18.75 /
-    12.95 (play); rushing 20.26 / 14.14 vs **19.76 / 13.87**, bias −1.4 vs
-    −0.65 (the run lean); 60+ yard receivers' median beaten 59% vs 53%;
-    receptions a hair worse (1.442 / 0.999 vs 1.450 / 1.008). The play engine
-    now leads on both yardage markets where before it was a dead heat.
+    **Players (2025 weeks 2-18, 5 games a week, 5,552 player-games paired
+    old code vs new on identical as-of inputs).** The engine rebuild is
+    NEUTRAL on single-player marginals: play engine receiving CRPS +0.01
+    (se 0.01), rushing 0.00 (se 0.03) before the share change — the ratings
+    steer each game's mean volume, and the rebuild changed *when* volume
+    arrives, which is joint structure (game scripts, correlated markets, live
+    pricing), not a player's marginal. The **conditional-share change is a
+    measured gain for both engines**: receiving CRPS 13.09 → 12.92 (drive,
+    t −2.3) and 12.98 → 12.82 (play, t −2.2), MAE −0.26 / −0.22, the mean
+    bias closing (−0.22 → −0.01 drive); rushing unchanged. Play vs drive on
+    the final code: receiving 12.82 vs 12.92, rushing 13.76 vs 14.19 — the
+    play engine's rushing lead was already there on this sample with the old
+    code, so it is sample variation against §12's run, not the rebuild. Verdict
+    unchanged from §12: as good on single lines, with a better-behaved team
+    layer; the ledger decides.
 
     **The ledger's primary projection is now `run_game` on the default
     engine.** Three projections per line: `drive_*` (the drive engine's own
