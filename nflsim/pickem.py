@@ -291,6 +291,39 @@ def save_pool_lines(lines: pd.DataFrame, season: int, week: int,
     return d
 
 
+def check_lines(lines: pd.DataFrame, max_gap: float = 3.0) -> pd.DataFrame:
+    """Sanity-check hand-entered pool lines. One row per problem found.
+
+    A mistyped spread sign is the dangerous error: it does not look wrong, it
+    looks like a huge edge (a flipped 6.5 against a market of −7 reads as a
+    13-point gift and a 94% pick). Two independent checks catch it — the
+    pool's own moneylines disagree with its spread about who is favoured, and
+    the pool's number is implausibly far from the market's.
+    """
+    out = []
+    for _, r in lines.iterrows():
+        g = f"{r['away']} @ {r['home']}"
+        sp, mh, ma = float(r["spread_home"]), float(r["ml_home"]), float(r["ml_away"])
+        # who each field says is favoured (shorter price / positive home spread)
+        if sp != 0 and mh != ma:
+            spread_says = "home" if sp > 0 else "away"
+            ml_says = "home" if mh < ma else "away"
+            if spread_says != ml_says:
+                out.append(dict(game=g, problem="spread and moneylines disagree on the favourite",
+                                detail=f"spread_home {sp:+g} says {spread_says}, "
+                                       f"ML {mh:+.0f}/{ma:+.0f} says {ml_says}"))
+        msp = r.get("mkt_spread_home")
+        if pd.notna(msp) and abs(sp - float(msp)) > max_gap:
+            out.append(dict(game=g, problem=f"pool spread is {abs(sp - float(msp)):.1f} pts from the market",
+                            detail=f"pool {sp:+g} vs market {float(msp):+g}"
+                                   + (" — sign flipped?" if sp * float(msp) < 0 else "")))
+        mt = r.get("mkt_total")
+        if pd.notna(mt) and abs(float(r["total"]) - float(mt)) > max_gap:
+            out.append(dict(game=g, problem=f"pool total is {abs(float(r['total']) - float(mt)):.1f} pts from the market",
+                            detail=f"pool {float(r['total']):g} vs market {float(mt):g}"))
+    return pd.DataFrame(out, columns=["game", "problem", "detail"])
+
+
 def apply_pool(lines: pd.DataFrame, saved: pd.DataFrame, season: int, week: int) -> pd.DataFrame:
     """Overwrite the POOL columns of the page's lines frame from the saved
     file for this week; games not in the file keep the seed. Market columns
