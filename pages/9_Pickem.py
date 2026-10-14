@@ -180,6 +180,12 @@ lines = seed_lines.copy()
 for c in ("spread_home", "total", "ml_home", "ml_away",
           "mkt_spread_home", "mkt_total", "mkt_ml_home", "mkt_ml_away"):
     lines[c] = edited[c].values
+problems = P.check_lines(lines)
+if not problems.empty:
+    st.error("These pool lines look mistyped — a flipped spread sign shows up as a huge edge, "
+             "not as an obvious error. Fix them above before trusting the card.")
+    st.dataframe(problems, hide_index=True, width="stretch")
+
 hist = get_history() if source == "market" else None
 n_number_edges = int(((lines["spread_home"] != lines["mkt_spread_home"])
                       | (lines["total"] != lines["mkt_total"])).sum())
