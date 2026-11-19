@@ -109,12 +109,23 @@ sims = UI.run_with_progress(f"Simulating week {week} on the {'play' if game_engi
                             get_slate, tuple(seasons), recency, int(week), int(n_sims), use_inj, game_engine)
 games = sched[sched["week"] == int(week)].copy()
 games = games[games["game_id"].isin(sims.keys())]
+# once a week's pool lines are saved, they ARE the slate: a scheduled game the
+# pool leaves off its sheet is not on the card (and does not take a slot)
+_saved = P.load_pool_lines()
+_season = int(games["season"].iloc[0]) if len(games) else int(ctx["depth_seasons"][-1])
+_pool_ids = set(_saved.loc[(_saved["season"] == _season) & (_saved["week"] == int(week)), "game_id"])
+not_in_pool = []
+if _pool_ids:
+    not_in_pool = (games.loc[~games["game_id"].isin(_pool_ids), "away_team"] + " @ "
+                   + games.loc[~games["game_id"].isin(_pool_ids), "home_team"]).tolist()
+    games = games[games["game_id"].isin(_pool_ids)]
 if exclude_played:
     games = games[~games["played"]]
 
 st.title("🏈 Pick'em Card")
 st.caption(f"Week {week} · {len(games)} games in play · {n_sims:,} simulations each · "
-           f"scoring: {mode} · lines below are graded, never learned from")
+           f"scoring: {mode} · lines below are graded, never learned from"
+           + (f" · not in the pool this week: {', '.join(not_in_pool)}" if not_in_pool else ""))
 if games.empty:
     st.info("No games left to pick this week."); st.stop()
 
